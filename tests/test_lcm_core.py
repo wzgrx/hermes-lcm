@@ -694,6 +694,7 @@ class TestConfig:
         assert c.fresh_tail_max_tokens == 0
         assert c.leaf_chunk_tokens == 20_000
         assert c.context_threshold == 0.35
+        assert c.subthreshold_preflight_enabled is True
         assert c.incremental_max_depth == 3
         assert c.condensation_fanin == 4
         assert c.dynamic_leaf_chunk_enabled is False
@@ -737,6 +738,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
         monkeypatch.setenv("LCM_FRESH_TAIL_MAX_TOKENS", "12000")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
+        monkeypatch.setenv("LCM_SUBTHRESHOLD_PREFLIGHT_ENABLED", "false")
         monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
         monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
         monkeypatch.setenv(
@@ -773,6 +775,7 @@ class TestConfig:
         assert c.fresh_tail_count == 32
         assert c.fresh_tail_max_tokens == 12_000
         assert c.context_threshold == 0.80
+        assert c.subthreshold_preflight_enabled is False
         assert c.ignore_session_patterns == ["cron:*", "subagent:**"]
         assert c.stateless_session_patterns == ["telegram:*", "cli:debug"]
         assert c.ignore_message_patterns == [

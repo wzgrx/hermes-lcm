@@ -1939,6 +1939,37 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_preflight_policy_can_defer_leaf_maintenance_until_context_threshold(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_threshold_only.db"),
+            fresh_tail_count=4,
+            leaf_chunk_tokens=20,
+            subthreshold_preflight_enabled=False,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "x" * 200},
+            {"role": "assistant", "content": "old answer " + "y" * 200},
+            {"role": "user", "content": "fresh " + "a" * 200},
+            {"role": "assistant", "content": "fresh " + "b" * 200},
+            {"role": "user", "content": "fresh " + "c" * 200},
+        ]
+        rough = count_messages_tokens(messages)
+        try:
+            eligible, _reason = instance._leaf_compaction_candidate_status(messages)
+            assert eligible is True
+
+            instance.threshold_tokens = rough + 10_000
+            assert instance.should_compress_preflight(messages) is False
+            assert instance._store.get_session_count("test-session") == len(messages)
+
+            instance.threshold_tokens = rough
+            assert instance.should_compress_preflight(messages) is True
+        finally:
+            instance.shutdown()
+
     @staticmethod
     def _oversized_bypass_messages():
         return [
