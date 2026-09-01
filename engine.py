@@ -387,6 +387,7 @@ class _EngineShutdownGroup:
     def __init__(self) -> None:
         self._condition = threading.Condition(threading.RLock())
         self._engines = weakref.WeakSet()
+        self._retired_background: set[tuple[object, threading.Event]] = set()
         self._closed = False
         self._clones_in_flight = 0
 
@@ -436,6 +437,50 @@ class _EngineShutdownGroup:
         with self._condition:
             self._engines.discard(engine)
 
+    def retire(
+        self,
+        engine: "LCMEngine",
+        rollup_owner: object,
+        assertion_idle: threading.Event,
+        *,
+        background_pending: bool,
+    ) -> None:
+        """Remove a closed engine while keeping its outstanding work visible."""
+        record = (rollup_owner, assertion_idle)
+        start_waiter = False
+        with self._condition:
+            if background_pending and record not in self._retired_background:
+                self._retired_background.add(record)
+                start_waiter = True
+            self._engines.discard(engine)
+        if not start_waiter:
+            return
+        waiter = threading.Thread(
+            target=self._drain_retired_background,
+            args=(record,),
+            name="lcm-retired-background-drain",
+            daemon=True,
+        )
+        try:
+            waiter.start()
+        except Exception:
+            # Keep the record for shutdown_all(); failure to start a cleanup
+            # waiter must not make accepted work invisible to plugin unload.
+            logger.warning("LCM could not start retired background drain", exc_info=True)
+
+    def _drain_retired_background(
+        self,
+        record: tuple[object, threading.Event],
+    ) -> None:
+        rollup_owner, assertion_idle = record
+        try:
+            _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(rollup_owner)
+            assertion_idle.wait()
+        finally:
+            with self._condition:
+                self._retired_background.discard(record)
+                self._condition.notify_all()
+
     def shutdown_all(self) -> None:
         with self._condition:
             self._closed = True
@@ -450,6 +495,10 @@ class _EngineShutdownGroup:
                 logger.exception("LCM engine shutdown failed during plugin unload")
                 if first_error is None:
                     first_error = exc
+        with self._condition:
+            retired_background = list(self._retired_background)
+        for record in retired_background:
+            self._drain_retired_background(record)
         if first_error is not None:
             raise first_error
 
@@ -534,6 +583,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._background_work_condition = threading.Condition(threading.RLock())
         self._background_schedules_in_flight = 0
         self._background_shutdown_started = False
+        self._shutdown_lock = threading.RLock()
+        self._primary_shutdown_complete = False
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -7445,9 +7496,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._assertion_extraction_idle.wait()
 
     def shutdown(self, *, wait_for_background_work: bool = False):
-        self._stop_background_work(wait=wait_for_background_work)
-        self._shutdown_group.discard(self)
-        self._unregister_active_engine_binding()
-        with self._storage_lock:
-            self._storage_shutdown = True
-            self._close_storage()
+        shutdown_group = self._shutdown_group
+        with self._shutdown_lock:
+            self._stop_background_work(wait=wait_for_background_work)
+            if not self._primary_shutdown_complete:
+                self._unregister_active_engine_binding()
+                with self._storage_lock:
+                    self._storage_shutdown = True
+                    self._close_storage()
+                self._primary_shutdown_complete = True
+            if wait_for_background_work:
+                shutdown_group.discard(self)
+                return
+            rollup_pending = not self.drain_rollup_maintenance(timeout=0)
+            assertion_pending = not self._assertion_extraction_idle.is_set()
+            shutdown_group.retire(
+                self,
+                self._rollup_maintenance_owner,
+                self._assertion_extraction_idle,
+                background_pending=rollup_pending or assertion_pending,
+            )
