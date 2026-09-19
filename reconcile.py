@@ -44,6 +44,7 @@ from .ingest_protection import (
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
+from .store import _normalize_observed_at
 
 import logging
 
@@ -187,13 +188,61 @@ def _tail_tagless(identities: list[tuple[str, str, str, str]]) -> list[tuple[str
     Reconcile paths compare LIVE identities (list/dict-tagged structured
     content) against STORED identities (string-tagged text); the tag is a
     live-vs-claim distinction, not part of the row content identity
-    (Bugbot 4041497059)."""
+    ."""
     return [
         (role, _strip_replay_identity_shape_tag(content), tool_call_id, tool_calls)
         for role, content, tool_call_id, tool_calls in identities
     ]
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+
+
+_POST_INGEST_MUTATED_TOOL_ROLE_PREFIXES = (
+    # Post-ingest rewrites that DESTROY the original tool payload: retry
+    # recovery is impossible for these, so a replayed original aligns on
+    # role + tool_call_id. The threshold-externalizer forms are deliberately
+    # ABSENT: the store's dedupe-replay guard exempts them (_dedupe_replay_applies)
+    # because retry semantics live above the store — a replayed raw tool
+    # result against an externalized row must re-append, never collapse.
+    "[Old tool output cleared to save context space]",
+    "[LCM active replay placeholder:",
+    "[GC'd externalized payload:",
+    "[GC'd externalized tool output:",
+)
+
+_POST_INGEST_MUTATED_ANY_ROLE_PREFIXES = (
+    "[Old tool output cleared to save context space]",
+    "[LCM sensitive redaction:",
+    "[LCM active replay placeholder:",
+)
+
+
+def _stored_row_content_post_ingest_mutated(content: str, *, role: str = "") -> bool:
+    """True when a stored row's content is a known post-ingest rewrite.
+
+    Host-side pruning clears tool outputs to a fixed placeholder, sensitive
+    redaction and active-replay placeholder rewrites replace payload-bearing
+    text with placeholder forms. For those rows the replayed original can
+    never byte-match the stored copy, so the alignment falls back to the
+    surviving role + tool_call_id pair.
+
+    Role-specific: for tool rows only the payload-DESTROYING rewrites count
+    (cleared outputs, GC'd externalized payloads). The threshold-externalizer
+    forms are deliberately excluded — the store's dedupe-replay guard exempts
+    them (``_dedupe_replay_applies``) because retry semantics live above the
+    store: a replayed raw tool result against an externalized row must
+    re-append, never collapse.
+    """
+    if not content:
+        return False
+    if role == "tool":
+        prefixes = _POST_INGEST_MUTATED_TOOL_ROLE_PREFIXES
+    else:
+        prefixes = _POST_INGEST_MUTATED_ANY_ROLE_PREFIXES
+    for prefix in prefixes:
+        if content.startswith(prefix):
+            return True
+    return False
 
 
 class ReconcileMixin:
@@ -540,7 +589,7 @@ class ReconcileMixin:
                 transformed_candidate.append(self._persisted_output_durable_wildcard_identity(candidate_identity))
                 transformed_stored.append(self._persisted_output_durable_wildcard_identity(stored_identity))
                 continue
-            # Shape-tag agnostic (Bugbot 4041497059): content-identity comparison
+            # Shape-tag agnostic : content-identity comparison
             # across the live/stored boundary must ignore the shape tag.
             def _tagless1(identity: tuple[str, str, str, str]) -> tuple[str, str, str, str]:
                 return (
@@ -565,7 +614,7 @@ class ReconcileMixin:
         a durable assistant row could be absent from sanitized active context.
         The identity's shape tag (round-8 finding 4029411030) is stripped before
         decoding so the tagged content component does not defeat the JSON parse.
-        ``content_is_tagged=False`` (Bugbot 4041497061): the caller already
+        ``content_is_tagged=False`` : the caller already
         supplies a TAGLESS content component (the store-id map strips tags on
         both sides); peeling again would eat the first character of assistant
         content that merely starts with s/l/d/n/o (e.g. "null hypothesis").
@@ -616,7 +665,7 @@ class ReconcileMixin:
         # Re-derive the shape tag from the cleaned value's RAW shape (round-8
         # finding 4029411030): active cleanup preserves list/dict shapes, so
         # the cleaned variant must stay comparable with live identities.
-        # Tagless callers (Bugbot 4041497061) get tagless output back — the
+        # Tagless callers  get tagless output back — the
         # store-id map's comparisons are content-only by design.
         cleaned_content = cleaned.get("content")
         cleaned_normalized = normalize_content_value(cleaned_content) or ""
@@ -1051,7 +1100,7 @@ class ReconcileMixin:
             return False
         if not stored_tail or len(incoming_identities) >= len(stored_tail):
             return False
-        # Shape-tag agnostic (Bugbot 4041497059): stored rows are string-tagged
+        # Shape-tag agnostic : stored rows are string-tagged
         # while live structured content is list/dict-tagged; staleness matching
         # is a CONTENT question, so compare tagless.
         def _tagless_identities(identities: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, str]]:
@@ -1066,8 +1115,362 @@ class ReconcileMixin:
             return False
         return _tagless_identities(stored_head)[: len(tagless_incoming)] == tagless_incoming
 
+    def _align_replayed_batch_against_stored_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_rows: List[Dict[str, Any]],
+    ) -> tuple[int, int, list[bool], bool]:
+        """Mutation-tolerant replay alignment for the ambiguous-delta fallback.
+
+        Reconcile's exact-match machinery needs byte identity between the
+        replayed transcript and the CURRENT stored rows (the reconcile-duplication defect). When the
+        stored tail was legitimately mutated post-ingest - host-side
+        ``[Old tool output cleared to save context space]`` pruning,
+        sensitive-redaction placeholders, externalization rewrites - that
+        match fails and reconcile lands at cursor 0, and the per-turn
+        whole-transcript replay re-persists the ENTIRE transcript every
+        inbound message (the whole-transcript re-ingest defect's duplication, re-created through the
+        reconcile-lands-at-0 path).
+
+        This pass asks a weaker, mutation-stable question: is the incoming
+        batch a REPLAY of (a superset of) the stored tail, or does it carry
+        new durable turns? It walks TURN-level subsequence coverage: stored
+        rows are grouped into turns — ``(role, tool_call_id)`` when the row
+        carries a tool_call_id, ``(role, content)`` otherwise — and each
+        turn, in first-occurrence order, must be carried by the incoming
+        batch at-or-after the running floor: by the exact identity of ANY of
+        its stored copies, or — when a copy's content was DESTROYED by a
+        known post-ingest rewrite (cleared outputs, redaction /
+        active-replay placeholders, GC'd externalized payloads) — by its
+        surviving ``(role, tool_call_id)`` pair alone. Duplicate copies of
+        an already-covered turn neither consume incoming occurrences nor
+        count as coverage slots, so damage from earlier buggy bursts cannot
+        starve the match (review finding).
+
+        Limitation, by design: rows WITHOUT a tool_call_id whose content was
+        rewritten (content IS those rows' only stable handle) cannot be
+        aligned across the rewrite and fall back to the ambiguous append.
+
+        Returns ``(covered, total, replay_mask, order_consistent)`` where
+        ``covered`` counts the stored TURNS the batch carries, ``total`` is
+        the turn count within the batch's replay SPAN (the window region
+        from the oldest covered turn's copies onward - turns older than the
+        batch's replay span are outside the verdict), ``replay_mask`` is a
+        per-incoming-message boolean list marking the messages that replay
+        a stored turn (source-time consistent), and ``order_consistent``
+        reports whether the covered turns' first-occurrence positions are
+        non-decreasing in stored-turn order (a reordered batch carrying the
+        same identities is a fresh reordered batch, not a replay).
+        """
+        turn_keys: list[tuple[str, str]] = []
+        turn_copy_positions: dict[tuple[str, str], list[int]] = {}
+        turn_mutated: set[tuple[str, str]] = set()
+        # Identity = (role, tool_call_id, tool_calls, content-presence,
+        # content) — the store dedupe contract's own dimensions .
+        stored_row_identities: list[tuple[str, str, str, str, str, str]] = []
+        for row_idx, stored_row in enumerate(stored_rows):
+            role = str(stored_row.get("role") or "unknown")
+            tool_call_id = str(stored_row.get("tool_call_id") or "")
+            content = normalize_content_value(stored_row.get("content")) or ""
+            tool_calls_identity = self._stable_tool_calls_identity(
+                stored_row.get("tool_calls")
+            )
+            tool_name = str(stored_row.get("tool_name") or "")
+            content_presence = "" if stored_row.get("content") is None else "-"
+            stored_row_identities.append(
+                (role, tool_call_id, tool_calls_identity, tool_name, content_presence, content)
+            )
+            # Turn key = the FULL identity: empty-content assistant
+            # tool-call turns are DISTINCT turns that share (role, '',
+            # content) — collapsing them into one turn key masked only one
+            # of the 967 live empty tool-call turns and left the rest
+            # unmasked (the 51% masked fraction that failed the gate).
+            # Byte-identical duplicate copies (the burst damage from earlier buggy passes
+            # targets) still group correctly under the full identity; the
+            # (role, tool_call_id) mutated fallback below handles copies
+            # whose content was destroyed post-ingest.
+            turn_key = stored_row_identities[-1]
+            if turn_key not in turn_copy_positions:
+                turn_keys.append(turn_key)
+            turn_copy_positions.setdefault(turn_key, []).append(row_idx)
+            if tool_call_id and _stored_row_content_post_ingest_mutated(content, role=role):
+                turn_mutated.add(turn_key)
+
+        incoming_identities = [
+            (
+                str(msg.get("role") or "unknown"),
+                str(msg.get("tool_call_id") or ""),
+                self._stable_tool_calls_identity(msg.get("tool_calls")),
+                str(msg.get("tool_name") or ""),
+                "" if msg.get("content") is None else "-",
+                normalize_content_value(msg.get("content")) or "",
+            )
+            for msg in messages
+        ]
+        incoming_position_buckets: dict[tuple[str, str, str, str, str, str], list[int]] = {}
+        incoming_call_position_buckets: dict[tuple[str, str], list[int]] = {}
+        for msg_idx, identity in enumerate(incoming_identities):
+            incoming_position_buckets.setdefault(identity, []).append(msg_idx)
+            incoming_call_position_buckets.setdefault(
+                (identity[0], identity[1]), []
+            ).append(msg_idx)
+
+        covered = 0
+        covered_turn_keys: set = set()
+        mutated_covered_calls: set[tuple[str, str]] = set()
+        replay_mask = [False] * len(incoming_identities)
+
+        # SURPLUS occurrences of a covered turn (the batch carries more
+        # copies of a turn than the store holds — a damaged in-memory
+        # transcript repeats turns) are masked ONLY when they are
+        # source-time consistent with replay: their observed_at is None
+        # (no source-time evidence at all) or not LATER than the stored
+        # copies' source time. A surplus occurrence carrying a FRESH source
+        # timestamp is a genuinely new turn (or a deliberate repeat) that
+        # happens to reuse an identity — it must never be masked by
+        # identity coincidence alone. The mutated fallback masks ONLY the
+        # occurrence it consumed, never every payload sharing the call id
+        # (a fresh retry with the same tool_call_id but distinct content is
+        # new work).
+        # Source-time lookup keyed by the SAME full identity the turn keys
+        # use (the fresh-timestamp discipline looks turns up by identity;
+        # a stale 2-tuple key would miss every lookup and mask fresh
+        # identity-reuse rows).
+        stored_turn_source_time: dict[tuple[str, str, str, str, str, str], float | None] = {}
+        for row_idx, stored_row in enumerate(stored_rows):
+            source_time = _normalize_observed_at(
+                stored_row.get("observed_at")
+                if stored_row.get("observed_at") is not None
+                else stored_row.get("timestamp")
+            )
+            identity = stored_row_identities[row_idx]
+            existing = stored_turn_source_time.get(identity)
+            if existing is None or (source_time is not None and source_time > existing):
+                stored_turn_source_time[identity] = source_time
+        # Coverage = PURE EXISTENCE per turn key (the reconcile-duplication defect live follow-up):
+        # a turn is covered when the batch carries it at all — by any
+        # stored copy's exact identity, or (content-destroyed copies) by
+        # the surviving (role, tool_call_id) pair. No monotone floor: the
+        # store order of interleaved duplicate blocks does not match the
+        # batch order, and a floor discipline starves legitimate coverage
+        # (validated against the real 2068-row live burst: floor walks
+        # covered 766/1507; existence covers 1507/1507). The replay-vs-
+        # fresh distinction lives in the MASK (source-time consistency)
+        # and the defer bars (coverage ratio, masked fraction, small-batch
+        # and retry-signature stand-downs), not in the walk order.
+        for turn_key in turn_keys:
+            copy_positions = turn_copy_positions.get(turn_key, [])
+            copy_identities = [stored_row_identities[row_idx] for row_idx in copy_positions]
+            turn_source_time = stored_turn_source_time.get(turn_key)
+            covered_here = False
+            # Coverage requires at least one MASKED occurrence: a batch
+            # occurrence whose only source-time evidence says FRESH (later
+            # than the stored copy's) is new work - it neither proves the
+            # turn replayed nor may be masked . Occurrences with no timestamp are
+            # indistinguishable from replay (the incident's majority
+            # class) and mask.
+            # Exact-identity occurrences: any stored copy's identity.
+            for identity in set(copy_identities):
+                for msg_idx in incoming_position_buckets.get(identity, []):
+                    observed = messages[msg_idx].get("timestamp")
+                    candidate_source = _normalize_observed_at(observed)
+                    if (
+                        candidate_source is not None
+                        and turn_source_time is not None
+                        and candidate_source > turn_source_time
+                    ):
+                        continue  # fresh-timestamp repeat: new work
+                    replay_mask[msg_idx] = True
+                    covered_here = True
+            if turn_key in turn_mutated:
+                # Mutated copies: content destroyed post-ingest, so the
+                # surviving (role, tool_call_id) pair is the only handle.
+                # Mask ONE batch occurrence of this call id that is
+                # source-time consistent with replay (the replayed original
+                # whose stored copy was mutated away) - exactly one: the
+                # batch can also carry a genuinely new retry sharing the
+                # call id with NO timestamp (indistinguishable from replay
+                # by time), and masking the whole bucket would silently
+                # drop it (review finding). The retry then satisfies the
+                # store guard's own retry semantics (it stores as new work).
+                call_key = (turn_key[0], turn_key[1])
+                for msg_idx in incoming_call_position_buckets.get(call_key, []):
+                    observed = messages[msg_idx].get("timestamp")
+                    candidate_source = _normalize_observed_at(observed)
+                    if (
+                        candidate_source is not None
+                        and turn_source_time is not None
+                        and candidate_source > turn_source_time
+                    ):
+                        continue
+                    replay_mask[msg_idx] = True
+                    covered_here = True
+                    break
+            if covered_here:
+                covered += 1
+                covered_turn_keys.add(turn_key)
+                if turn_key in turn_mutated:
+                    mutated_covered_calls.add((turn_key[0], turn_key[1]))
+        # Span-relative coverage (review finding): the gate must measure
+        # the turns the batch actually reaches, not the whole window - the
+        # window (4x) includes rows older than the batch's replay span on
+        # long sessions, and counting those turns sinks the coverage ratio.
+        # The span starts at the oldest covered turn's earliest stored copy;
+        # turns whose copies end before that span start are outside it.
+        # The span is the BATCH-SPAN of the window : interleaved duplicate blocks mean every old turn's
+        # copies reach the window's end, so "copies end after span_start"
+        # includes turns the batch never carries. The batch can only replay
+        # turns whose most recent stored copy lies within its own span —
+        # the last len(messages) rows of the window. Those are the turns
+        # the verdict measures.
+        span_start = max(
+            0,
+            len(stored_rows) - len(messages),
+        )
+        # Numerator and denominator must measure the SAME set: turns whose
+        # most recent stored copy lies within the batch-span. `covered`
+        # counts only batch-span turns that the batch carries; turns older
+        # than the span are outside the verdict entirely .
+        span_turns = 0
+        covered = 0
+        for turn_key, copy_positions in turn_copy_positions.items():
+            if not copy_positions or copy_positions[-1] < span_start:
+                continue
+            span_turns += 1
+            if turn_key in covered_turn_keys:
+                covered += 1
+        # Order-consistency evidence (review finding): a batch that
+        # carries the SAME identities as the stored tail but in a DIFFERENT
+        # order is a reordered fresh batch, not a replay - pure existence
+        # would pass the gates and silently discard it. The covered turns'
+        # earliest consistent incoming positions must be non-decreasing in
+        # stored-turn order. Mutated-covered turns contribute no position
+        # (their order is unrecoverable - content destroyed).
+        # Order consistency with a bounded tolerance: a damaged store's key
+        # order diverges from transcript order (compaction assemblies,
+        # ignore-filtered rows shift positions), so an occasional backward
+        # step is historical disorder, not evidence of a reordered batch.
+        # A genuinely REORDERED fresh batch violates pervasively (every
+        # adjacent pair), so the verdict tolerates only a small fraction of
+        # violations relative to the covered turns.
+        violations = 0
+        checks = 0
+        prev_position = -1
+        for tk in turn_keys:
+            # Order evidence only from batch-span turns : covered turns whose last copy predates
+            # span_start are outside the verdict; their stale positions
+            # would distort the check.
+            copy_positions = turn_copy_positions.get(tk, [])
+            if not copy_positions or copy_positions[-1] < span_start:
+                continue
+            if tk not in covered_turn_keys:
+                continue
+            positions = [
+                msg_idx
+                for identity in {
+                    stored_row_identities[ri] for ri in turn_copy_positions[tk]
+                }
+                for msg_idx in incoming_position_buckets.get(identity, [])
+                if replay_mask[msg_idx]
+            ]
+            if not positions:
+                continue
+            checks += 1
+            first_pos = min(positions)
+            if first_pos < prev_position:
+                violations += 1
+            prev_position = first_pos
+        # Tolerance is strictly proportional (review finding): a small
+        # batch's complete reversal (2 violations in 2 checks) must fail,
+        # so the floor is 1 violation, not 2.
+        # Small batches tolerate ZERO inversions: a 3-row store replayed as
+        # A,C,B produces 1 violation in 3 checks, and every reordered row is
+        # untimestamped fresh content the lossless contract must keep
+        # (review finding). Large replays keep the proportional
+        # tolerance: a damaged store's key order diverges from transcript
+        # order (compaction assemblies, ignore-filter shifts), so isolated
+        # backward steps are historical disorder, not reordering.
+        if checks <= 10:
+            order_consistent = violations == 0
+        else:
+            order_consistent = violations <= max(1, checks // 50)
+        # Expose the mutated-covered call keys: turns whose ONLY alignment
+        # handle was the surviving (role, tool_call_id) pair because their
+        # stored content was destroyed post-ingest. The store guard can
+        # NEVER dedupe a replayed original against those rows (the stored
+        # copy's content was rewritten), so the engine must mask-drop them
+        # even when they carry a usable source timestamp.
+        self._deferred_replay_alignment_mutated_calls = mutated_covered_calls
+        return covered, span_turns, replay_mask, order_consistent
+
+    def _replay_alignment_gate(
+        self,
+        messages: List[Dict[str, Any]],
+        covered: int,
+        span_turns: int,
+        replay_mask: list[bool],
+        order_consistent: bool,
+    ) -> bool:
+        """Shared defer-verdict math for the replay alignment.
+
+        Defer (mask authoritative) requires: a multi-row batch (>= 3),
+        near-full coverage of the replay span's turns (>= 90% - a live
+        transcript replays its history plus a small fresh tail), a dominant
+        masked fraction over the effective (non-ignored) incoming rows
+        (>= 75%), order consistency, and the retry-batch stand-down (an
+        unmasked tool persisted-output marker / externalized ref means the
+        batch is deliberate retry traffic - it must append).
+        """
+        # The minimum batch size applies to EFFECTIVE (non-ignored) rows:
+        # an ignored row is discarded before storage and must not inflate a
+        # 2-row deliberate-repeat batch into "multi-row" (review finding).
+        effective_rows = sum(
+            1
+            for msg in messages
+            if not self._matches_ignore_message_patterns(msg)
+        )
+        if effective_rows < 3 or span_turns <= 0:
+            return False
+        if covered < (span_turns * 9 + 9) // 10:
+            return False
+        effective_incoming = sum(
+            1
+            for msg in messages
+            if not self._matches_ignore_message_patterns(msg)
+        )
+        masked_effective = sum(
+            1
+            for msg_idx in range(len(messages))
+            if replay_mask[msg_idx]
+            and not self._matches_ignore_message_patterns(messages[msg_idx])
+        )
+        masked_fraction = (
+            masked_effective / effective_incoming if effective_incoming else 0.0
+        )
+        if masked_fraction < 0.75:
+            return False
+        if not order_consistent:
+            return False
+        for msg_idx in range(len(messages)):
+            if replay_mask[msg_idx]:
+                continue
+            msg = messages[msg_idx]
+            if str(msg.get("role") or "") != "tool":
+                continue
+            content = normalize_content_value(msg.get("content")) or ""
+            if _is_hermes_persisted_output_marker(content) or (
+                extract_externalized_ref(content) is not None
+            ):
+                return False
+        return True
+
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
+        # A previous pass's alignment mask must never leak into this one:
+        # early returns below (empty session, count failure, cursor
+        # advance) do not all recompute it, and a stale mask from another
+        # session's batch would silently drop matching rows here.
+        self._deferred_replay_alignment_mask = []
         if not self._session_id or not messages:
             return 0
 
@@ -1106,6 +1509,14 @@ class ReconcileMixin:
                     return cursor
             return 0
 
+        # The alignment window must match the batch's replay SPAN (the reconcile-duplication defect
+        # The alignment window keeps the 4x factor: it must include ALL
+        # stored copies of the turns the batch replays (a damaged store
+        # holds whole duplicate blocks), while span-relative coverage
+        # measures the gate over the turns the batch actually reaches
+        # (from the oldest covered turn's copies onward), so turns older
+        # than the batch's replay span don't sink the verdict
+        # (review finding).
         tail_limit = min(max(len(messages) * 4, 64), session_count)
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
@@ -1133,6 +1544,79 @@ class ReconcileMixin:
                 if not self._effective_replay_identities(messages[:cursor])
                 else "replayed durable tail"
             )
+            # The cursor advance covers the FIRST copy of each replayed
+            # turn, but a damaged host transcript can repeat turns WITHIN
+            # one batch (live: the affected live session burst carried ~3
+            # copies of every turn + fresh suffix). The copies past the
+            # cursor ride messages[cursor:] into the store with the guard
+            # OFF (reconcile decided), and the guard could not dedupe them
+            # anyway (no observed_at). Compute the alignment mask on EVERY
+            # reconcile pass so the engine can drop those aligned repeats
+            # past the cursor; genuinely new turns stay unmasked.
+            _cov, _turn_total, replay_mask, _order_ok = (
+                self._align_replayed_batch_against_stored_tail(
+                    messages,
+                    stored_tail_rows,
+                )
+            )
+            # The mask is AUTHORITATIVE for drops past the cursor only when
+            # the advance was a full-replay proof ("replayed durable tail"):
+            # then the batch provably replayed the durable session and its
+            # aligned repeats past the cursor are replay copies. A
+            # scaffold-only-prefix skip says nothing about the delta rows —
+            # a delta matching the tail tip is a DELIBERATE append (the
+            # lossless-first contract) and must store, so the mask stands
+            # down there. It ALSO stands down when the past-cursor portion
+            # carries a tool persisted-output marker or externalized ref:
+            # those are the retry signature (the store guard exempts them,
+            # _dedupe_replay_applies — retry semantics live above the
+            # store), so the batch is deliberate retry traffic and
+            # everything past the cursor re-appends (TestIngestExternalization).
+            # The mask is authoritative past the cursor when the advance
+            # was a full-replay proof ("replayed durable tail") OR when the
+            # scaffold-only-prefix advance carries a batch whose POST-CURSOR
+            # region provably replays the durable tail (live 21:56 burst:
+            # reconcile advanced cursor=1 past one scaffold row on a
+            # 2147-row whole-transcript replay, the mask stood down, and
+            # the guard-off append re-persisted everything). Run the shared
+            # gate on the alignment result for the scaffold path too: when
+            # it passes, the mask governs the post-cursor region; when it
+            # fails, the small delta keeps the deliberate-append behavior.
+            # The retry-signature stand-down (markers/externalized refs in
+            # the post-cursor region) applies on both paths.
+            post_cursor = messages[cursor:]
+            retry_signature = any(
+                str(msg.get("role") or "") == "tool"
+                and (
+                    _is_hermes_persisted_output_marker(
+                        normalize_content_value(msg.get("content")) or ""
+                    )
+                    or extract_externalized_ref(
+                        normalize_content_value(msg.get("content")) or ""
+                    )
+                    is not None
+                )
+                for msg in post_cursor
+            )
+            if reason == "replayed durable tail":
+                self._deferred_replay_alignment_mask = (
+                    [] if retry_signature else replay_mask
+                )
+            else:
+                # The gate reads the POST-CURSOR region only: slice the mask
+                # at the cursor so its fraction/retry checks index
+                # post-cursor bits, not the scaffold prefix's .
+                post_cursor_mask = replay_mask[cursor:]
+                if not retry_signature and self._replay_alignment_gate(
+                    post_cursor,
+                    _cov,
+                    _turn_total,
+                    post_cursor_mask,
+                    _order_ok,
+                ):
+                    self._deferred_replay_alignment_mask = replay_mask
+                else:
+                    self._deferred_replay_alignment_mask = []
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,
@@ -1154,9 +1638,14 @@ class ReconcileMixin:
             return cursor
 
         incoming_identities = self._effective_replay_identities(messages)
+        # The stale-snapshot proof keeps the WIDE window (4x): it compares a
+        # short system-leading prefix snapshot against the session HEAD, and
+        # the snapshot-no-overlap bail-out depends on the length guard —
+        # shrinking it with the alignment window broke that proof . Only the replay ALIGNMENT uses the batch-span window.
+        head_window_limit = min(max(len(messages) * 4, 64), session_count)
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
-            limit=tail_limit,
+            limit=head_window_limit,
         )
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
@@ -1198,16 +1687,107 @@ class ReconcileMixin:
             )
             return len(messages)
 
+        # The reconcile-duplication defect trust flip: cursor=0 here means reconcile found NO match -
+        # not even a partial prefix - which is exactly the mutated-tail
+        # signature. The deliberate-append cases that motivated reconcile's
+        # authority all matched a PREFIX and advanced >0; a zero cursor over a
+        # non-empty store is un-decided, so hand the batch to the store-level
+        # dedupe-replay guard instead of re-persisting blindly. Before
+        # standing down, run a mutation-tolerant alignment as a fail-closed
+        # second gate (the host replays whole transcripts whose stored copy
+        # was pruned/redacted post-ingest, which byte-identity matching can
+        # never see): a batch that is a replay of (a superset of) the stored
+        # tail must not be re-persisted even if the guard below were
+        # unavailable. New durable turns (alignment coverage below the
+        # threshold) still append - ambiguity is preserved for genuinely
+        # ambiguous small batches.
+        #
+        # The deliberate-append encodings are the small-batch boundary: a
+        # 1-2 row batch whose content coincides with the tail tip is
+        # indistinguishable from a deliberate repeat of the last turn(s) and
+        # MUST append (reconcile's lossless-first contract). A whole-
+        # transcript replay is a different shape entirely: many incoming
+        # rows covering the stored tail. Defer therefore requires a
+        # multi-row batch (>= 3 incoming rows), NEAR-FULL alignment coverage
+        # of the stored turns (a live transcript replays its whole history
+        # plus a small tail of genuinely new turns, so exact 100% coverage
+        # is the wrong bar — >= 90% of stored turns covered is the replay
+        # shape; the uncovered turns are precisely the new turns, which the
+        # mask leaves alone), AND a dominant masked fraction (>= 75% of the
+        # incoming rows masked — a replay-shaped batch is almost entirely
+        # durable-turn copies; a fresh delta like [A,B,C] over a 1-row tail
+        # covers its one turn but masks only 1/3 and stays ambiguous).
+        # Partial coverage (a retry replay whose exempt tool rows
+        # deliberately do not align, a sanitized-tail delta) fails these
+        # bars and stays with the ambiguous-delta append: the uncovered rows
+        # are exactly the content the lossless contract must keep.
+        ambiguous_unaligned = True
+        if len(stored_tail) > 0 and len(messages) >= 3:
+            covered, stored_total, replay_mask, order_consistent = self._align_replayed_batch_against_stored_tail(
+                messages,
+                stored_tail_rows,
+            )
+            ambiguous_unaligned = not self._replay_alignment_gate(
+                messages,
+                covered,
+                stored_total,
+                replay_mask,
+                order_consistent,
+            )
+            # Retry-batch stand-down (same rule as the cursor-advance
+            # branch): a batch whose UNMASKED rows include a tool
+            # persisted-output marker or externalized ref is deliberate
+            # RETRY traffic — the guard exempts those classes (retry
+            # semantics live above the store), so the whole batch must
+            # append rather than defer-with-a-few-rows-left (e.g. nine
+            # aligned rows + one raw marker whose backing file vanished is
+            # a retry batch, not a replay with leftovers).
+            if not ambiguous_unaligned and any(
+                not replay_mask[msg_idx]
+                and str(messages[msg_idx].get("role") or "") == "tool"
+                and (
+                    _is_hermes_persisted_output_marker(
+                        normalize_content_value(messages[msg_idx].get("content")) or ""
+                    )
+                    or extract_externalized_ref(
+                        normalize_content_value(messages[msg_idx].get("content")) or ""
+                    )
+                    is not None
+                )
+                for msg_idx in range(len(messages))
+            ):
+                ambiguous_unaligned = True
+            # The mask is authoritative ONLY under the defer verdict. An
+            # ambiguous-append decision (below the bars) deliberately keeps
+            # every row — including repeats — so the mask must stand down,
+            # or the engine would drop aligned rows the lossless contract
+            # says to append (TestIngestExternalization retry replays).
+            self._deferred_replay_alignment_mask = (
+                [] if ambiguous_unaligned else replay_mask
+            )
+        else:
+            self._deferred_replay_alignment_mask = []
+        if ambiguous_unaligned:
+            self._record_ingest_reconciliation(
+                action="persisted batch",
+                reason="persisted ambiguous delta",
+                cursor=0,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            return 0
         self._record_ingest_reconciliation(
-            action="persisted batch",
-            reason="persisted ambiguous delta",
+            action="deferred to replay guard",
+            reason="ambiguous zero cursor over non-empty store",
             cursor=0,
             incoming=len(messages),
             session_count=session_count,
             stored_tail_count=len(stored_tail),
             effective_incoming=len(incoming_identities),
         )
-        return 0
+        return None
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

@@ -138,7 +138,7 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
-from .store import MessageStore
+from .store import MessageStore, _normalize_observed_at
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -4554,6 +4554,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
+    def _store_guard_can_dedupe(self, msg: Dict[str, Any], session_id: str) -> bool:
+        """True when the store-level dedupe-replay guard can arbitrate this
+        row by itself (usable source timestamp, non-exempt class, and its
+        guard probe finds a dedupe twin within the source-time window).
+        Probe-only: no counter side effects. Rows the guard cannot dedupe -
+        no observed_at, exempt classes, or a stored copy whose source time
+        is outside the window (legacy pre-migration rows, mutated copies) -
+        must be mask-dropped by the alignment instead.
+        """
+        observed_at = _normalize_observed_at(msg.get("timestamp"))
+        content = normalize_content_value(msg.get("content"))
+        if observed_at is None:
+            return False
+        if not self._store._dedupe_replay_applies(
+            str(msg.get("role") or "unknown"), content
+        ):
+            return False
+        return self._store._is_duplicate_replay(
+            session_id,
+            str(msg.get("role") or "unknown"),
+            content,
+            observed_at,
+            tool_call_id=msg.get("tool_call_id"),
+            tool_name=msg.get("tool_name"),
+            msg_tool_calls=msg.get("tool_calls"),
+            _probe_only=True,
+        )
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -4616,7 +4644,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        reconcile_ran = False
         if self._ingest_cursor_needs_reconcile:
+            reconcile_ran = True
             reconcile_messages = [
                 original_msg
                 if (
@@ -4637,7 +4667,132 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+            reconcile_deferred = self._ingest_cursor is None
+            # The reconcile-stashed mask (computed over the SANITIZED
+            # reconcile_messages) governs the defer and durable-tail
+            # advance paths. The SCAFFOLD-prefix advance recomputes over
+            # the RAW post-cursor region in the unified block below: the
+            # sanitized form's rewrites diverge from the store's copies
+            # and starve the alignment (live 21:56 burst).
+            deferred_replay_alignment_mask = list(
+                getattr(self, "_deferred_replay_alignment_mask", []) or []
+            )
+            if reconcile_deferred:
+                # The reconcile-duplication defect: the reconcile pass could not decide (zero match
+                # against a mutated, non-empty stored tail). Leave the cursor
+                # at 0 for THIS pass so the store-level dedupe-replay guard
+                # can arbitrate the whole batch instead of reconcile
+                # second-guessing itself; the tail re-scan repeats next pass.
+                self._ingest_cursor = 0
+        else:
+            reconcile_deferred = False
+            deferred_replay_alignment_mask: list[bool] = []
+        # Unified replay-alignment mask computation (the reconcile-duplication defect live
+        # follow-up): computed over the RAW host messages on every pass
+        # that could face a whole-transcript replay - reconcile ran (any
+        # verdict; the scaffold-prefix advance's post-cursor region is the
+        # live burst shape), or a no-reconcile cursor=0 pass over a
+        # non-empty store (compaction resets land here). The gate decides;
+        # the mask-drop rules in the kept loop handle the two paths'
+        # different guard semantics (cursor-advance: guard off, drop all
+        # masked; defer: guard on, drop only guard-powerless rows).
+        _scaffold_cursor = self._last_ingest_reconciliation.get("cursor") or 0
+        _alignment_session_count = 0
+        if self._session_id and not self._session_ignored and not self._session_stateless:
+            try:
+                _alignment_session_count = self._store.get_session_count(self._session_id)
+            except Exception:
+                _alignment_session_count = 0
+        _scaffold_advance = (
+            reconcile_ran
+            and not reconcile_deferred
+            and self._last_ingest_reconciliation.get("reason")
+            == "skipped scaffold-only prefix"
+        )
+        _alignment_warranted = (
+            n >= 3
+            and _alignment_session_count > 0
+            and (
+                _scaffold_advance
+                or (
+                    not reconcile_ran
+                    and self._ingest_cursor == 0
+                )
+            )
+        )
+        if _alignment_warranted:
+            # Form per path: the scaffold advance evaluates the RAW
+            # POST-CURSOR region (the scaffold rows are not stored, so the
+            # transcript part is what the store holds; the sanitized form's
+            # rewrites starve the alignment). The no-reconcile path uses
+            # the SANITIZED replay (redaction placeholders in the store
+            # can never match raw sensitive rows).
+            _align_form = (
+                messages[_scaffold_cursor:]
+                if _scaffold_advance
+                else replay_messages
+            )
+            _cov, _span_turns, _align_mask, _order_ok = (
+                self._align_replayed_batch_against_stored_tail(
+                    _align_form,
+                    [
+                        row
+                        for row in self._store.get_session_tail(
+                            self._session_id,
+                            limit=min(max(n * 4, 64), _alignment_session_count),
+                        )
+                        if not self._matches_ignore_message_patterns(
+                            row, stored_row=True
+                        )
+                    ],
+                )
+            )
+            if self._replay_alignment_gate(
+                _align_form,
+                _cov,
+                _span_turns,
+                _align_mask,
+                _order_ok,
+            ):
+                if _scaffold_advance:
+                    # The mask indexes the post-cursor slice; the kept
+                    # loop's absolute_idx spans the full batch, so pad the
+                    # front with False for the scaffold prefix.
+                    deferred_replay_alignment_mask = (
+                        [False] * _scaffold_cursor + list(_align_mask)
+                    )
+                else:
+                    deferred_replay_alignment_mask = list(_align_mask)
+                    if not reconcile_ran:
+                        # The no-reconcile path takes the defer verdict
+                        # too: cursor stays 0 for this pass, the guard
+                        # arbitrates guard-eligible rows, and the mask
+                        # drops the guard-powerless ones.
+                        reconcile_deferred = True
+                        self._record_ingest_reconciliation(
+                            action="deferred to replay guard",
+                            reason="ambiguous zero cursor over non-empty store",
+                            cursor=0,
+                            incoming=n,
+                            session_count=_alignment_session_count,
+                            stored_tail_count=_alignment_session_count,
+                            effective_incoming=n,
+                        )
         cursor = min(max(self._ingest_cursor, 0), n)
+        # If the reconcile path ran THIS pass and REACHED a decision, it
+        # DECIDED what to do with the tail of this batch (advanced the cursor
+        # past a replayed prefix, or recorded the ambiguous delta as a
+        # deliberate append). That decision must not be second-guessed by the
+        # store-level whole-transcript replay guard. Keyed on this invocation,
+        # never on the historical _last_ingest_reconciliation record: stale
+        # actions from a previous pass must not disable the guard. The plain
+        # per-turn / preflight whole-transcript replay path (the incident
+        # mechanism — cursor reset to 0 without reconcile) keeps the guard
+        # active. The reconcile-duplication defect: a reconcile pass that could NOT decide (zero
+        # match against a mutated non-empty stored tail) stays un-decided —
+        # the guard arbitrates the whole batch and the tail re-scan repeats
+        # next pass.
+        dedupe_replay = reconcile_deferred or not reconcile_ran
         recomputed_replay_messages = replay_messages
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
@@ -4667,6 +4822,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            if reconcile_ran and reconcile_deferred:
+                # The reconcile-duplication defect: reconcile deferred this ambiguous replay batch to
+                # the store guard, and the guard deduped EVERY row — nothing
+                # new to persist. The whole-transcript replay is back for
+                # another pass (the batch re-arrives every inbound message),
+                # so the tail re-scan must re-run: leaving
+                # _ingest_cursor_needs_reconcile False would silently
+                # "advance" the cursor to n on this pass and drop the
+                # reconcile from the next one. Nothing was stored and the
+                # active replay is unchanged, so no revision bump, no
+                # sanitation-claim consumption, no placeholder-budget
+                # mutation.
+                return self._remember_active_replay_messages(messages, replay_messages)
             # A replay refresh (persisted-output recovery metadata, sensitive
             # redaction, quarantine/ignore placeholders) can change the active
             # replay for ALREADY-INGESTED messages even when nothing new is
@@ -4878,6 +5046,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     or metadata_replayed_active_placeholder
                 )
                 if (
+                    deferred_replay_alignment_mask
+                    and absolute_idx < len(deferred_replay_alignment_mask)
+                    and deferred_replay_alignment_mask[absolute_idx]
+                    and (
+                        # Cursor-advance path: reconcile already DECIDED
+                        # (full-replay proof) and the guard is OFF for this
+                        # append — every masked row past the cursor is a
+                        # proven replay repeat; drop it regardless of
+                        # guard eligibility.
+                        (reconcile_ran and not reconcile_deferred)
+                        # Defer path: the guard is ON, so only rows the
+                        # guard cannot arbitrate are mask-dropped;
+                        # guard-eligible rows flow to the guard (the ingest dedupe-replay guard
+                        # semantics and its dedupe counter stay intact).
+                        or not self._store_guard_can_dedupe(
+                            replay_msg,
+                            self._session_id,
+                        )
+                    )
+                ):
+                    # The reconcile-duplication defect: this message aligned against a stored row
+                    # under mutation-tolerant matching — it is a replayed
+                    # turn even though the store guard could not dedupe it
+                    # (the stored copy was rewritten post-ingest to a
+                    # cleared/redacted placeholder, or the row carries no
+                    # source timestamp for the guard's window). Skip
+                    # storing; the durable record for that turn already
+                    # exists.
+                    continue
+                if (
                     ignored_original_messages[absolute_idx]
                     or generated_volatile_placeholder
                     or replayed_active_placeholder
@@ -4981,6 +5179,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
+            dedupe_replay=dedupe_replay,
         )
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
