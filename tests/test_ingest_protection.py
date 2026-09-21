@@ -2070,6 +2070,37 @@ def test_externalized_payload_integrity_scan_reports_missing_and_unreferenced_re
     assert "not-counted.json" not in encoded
 
 
+def test_externalized_payload_integrity_scan_preserves_host_state_refs(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "host-only.json").write_text("{}")
+
+    state_db = Path(engine._hermes_home) / "state.db"
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    state_conn = sqlite3.connect(state_db)
+    state_conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, tool_calls TEXT)"
+    )
+    state_conn.execute(
+        "INSERT INTO messages VALUES (1, 'host-session', 'tool', ?, NULL)",
+        ("[Externalized LCM ingest payload: kind=tool_result; field=content; chars=1; bytes=1; ref=host-only.json]",),
+    )
+    state_conn.commit()
+    state_conn.close()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn, engine._config, hermes_home=engine._hermes_home
+    )
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_lcm_refs_total"] == 0
+    assert detail["externalized_payload_host_refs_total"] == 1
+    assert detail["externalized_payload_host_only_refs"] == 1
+    assert detail["externalized_payload_files_unreferenced"] == 0
+    assert detail["externalized_payload_host_scan_error"] == ""
+
+
 def test_externalized_payload_integrity_scan_detects_embedded_content_placeholder_with_trailing_text(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()

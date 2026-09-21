@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import stat
 import tempfile
 from collections import Counter
@@ -1772,6 +1773,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         existing_files = {path.name for path in storage_dir.glob("*.json") if path.is_file()}
 
     referenced_refs: set[str] = set()
+    host_referenced_refs: set[str] = set()
     first_location_by_ref: dict[str, dict[str, Any]] = {}
     for store_id, session_id, source, role, content, tool_calls in conn.execute(
         """
@@ -1799,12 +1801,62 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
                     },
                 )
 
-    missing_refs = sorted(ref for ref in referenced_refs if ref not in existing_files)
-    existing_ref_count = sum(1 for ref in referenced_refs if ref in existing_files)
-    unreferenced_files = sorted(ref for ref in existing_files if ref not in referenced_refs)
+    # A payload can be created while Hermes is assembling the active turn and
+    # remain referenced by state.db even when no LCM row retained that turn.
+    # Such files are host-owned recovery data, not orphan candidates. Keep the
+    # scan read-only and bounded to the two message columns that carry payload
+    # placeholders.
+    state_scan_error = ""
+    state_db = Path(hermes_home) / "state.db" if hermes_home else None
+    if state_db is not None and state_db.is_file():
+        state_conn = None
+        try:
+            state_conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            state_conn.execute("PRAGMA busy_timeout=1000")
+            for message_id, session_id, role, content, tool_calls in state_conn.execute(
+                """
+                SELECT id, session_id, role, content, tool_calls
+                FROM messages
+                WHERE COALESCE(content, '') LIKE '%ref=%]%'
+                   OR COALESCE(tool_calls, '') LIKE '%ref=%]%'
+                ORDER BY id ASC
+                """
+            ).fetchall():
+                for field, value in (("content", content), ("tool_calls", tool_calls)):
+                    if not isinstance(value, str):
+                        continue
+                    for ref in _refs_for_externalized_integrity_scan(
+                        value, role=str(role or ""), field=field
+                    ):
+                        host_referenced_refs.add(ref)
+                        first_location_by_ref.setdefault(
+                            ref,
+                            {
+                                "store_id": int(message_id),
+                                "session_id": session_id,
+                                "source": "hermes-state",
+                                "role": role,
+                                "field": field,
+                                "externalized_ref": ref,
+                            },
+                        )
+        except Exception as exc:
+            state_scan_error = str(exc)
+        finally:
+            if state_conn is not None:
+                state_conn.close()
+
+    all_referenced_refs = referenced_refs | host_referenced_refs
+    missing_refs = sorted(ref for ref in all_referenced_refs if ref not in existing_files)
+    existing_ref_count = sum(1 for ref in all_referenced_refs if ref in existing_files)
+    unreferenced_files = sorted(ref for ref in existing_files if ref not in all_referenced_refs)
 
     return {
-        "externalized_payload_refs_total": len(referenced_refs),
+        "externalized_payload_refs_total": len(all_referenced_refs),
+        "externalized_payload_lcm_refs_total": len(referenced_refs),
+        "externalized_payload_host_refs_total": len(host_referenced_refs),
+        "externalized_payload_host_only_refs": len(host_referenced_refs - referenced_refs),
+        "externalized_payload_host_scan_error": state_scan_error,
         "externalized_payload_refs_existing": existing_ref_count,
         "externalized_payload_refs_missing": len(missing_refs),
         "externalized_payload_files_unreferenced": len(unreferenced_files),
