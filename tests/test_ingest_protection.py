@@ -2084,7 +2084,7 @@ def test_externalized_payload_integrity_scan_preserves_host_state_refs(tmp_path)
     )
     state_conn.execute(
         "INSERT INTO messages VALUES (1, 'host-session', 'tool', ?, NULL)",
-        ("[Externalized LCM ingest payload: kind=tool_result; field=content; chars=1; bytes=1; ref=host-only.json]",),
+        ("transport metadata retained payload basename: host-only.json",),
     )
     state_conn.commit()
     state_conn.close()
