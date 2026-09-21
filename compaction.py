@@ -67,8 +67,16 @@ class CompactionMixin:
         return tokens >= self.threshold_tokens
 
     def should_compress_preflight(self, messages):
-        """Pre-flight check — also ingests messages into the store."""
+        """Pre-flight check — also ingests messages into the store.
+
+        ``subthreshold_preflight_enabled=False`` keeps the durable ingest and
+        deterministic cleanup paths active, while deferring summary-producing
+        leaf maintenance until the configured context threshold is reached.
+        """
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        subthreshold_preflight_enabled = bool(
+            getattr(self._config, "subthreshold_preflight_enabled", True)
+        )
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -144,6 +152,17 @@ class CompactionMixin:
             # summarizer spend.
             if self._compression_boundary_cooldown_active():
                 return False
+            if (
+                not subthreshold_preflight_enabled
+                and not (
+                    self.threshold_tokens > 0
+                    and replay_rough >= self.threshold_tokens
+                )
+            ):
+                self._refresh_raw_backlog_debt(
+                    replay_messages, observed_tokens=replay_rough
+                )
+                return False
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = pre_ingest_noop_reason
@@ -176,6 +195,14 @@ class CompactionMixin:
             return False
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested()
+        if (
+            not subthreshold_preflight_enabled
+            and not (
+                self.threshold_tokens > 0 and rough >= self.threshold_tokens
+            )
+        ):
+            self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
+            return False
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
