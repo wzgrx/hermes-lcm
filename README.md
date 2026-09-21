@@ -249,6 +249,27 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
+#### Test a reviewed pull-request branch
+
+A live checkout may temporarily follow a reviewed branch in a maintained fork.
+Use an ordinary tracking branch so later update checks compare against the same
+remote ref; `hermes plugins install --ref` accepts only an immutable 40-character
+commit SHA, not a branch name.
+
+```bash
+cd ~/.hermes/plugins/hermes-lcm
+git remote get-url origin
+git fetch --no-tags origin docs/reviewed-pr-deployment
+git switch --track -c docs/reviewed-pr-deployment \
+  origin/docs/reviewed-pr-deployment
+```
+
+Pin automation to `origin/docs/reviewed-pr-deployment` for the duration of the
+review. After the pull request is merged, switch the live checkout and its
+updater back to `main`/`origin/main`; do not leave automation comparing the PR
+checkout with a different deployment ref. Record the loaded branch, commit, and
+dirty state from `lcm_status` or `lcm_doctor` before restarting Hermes.
+
 For the `v1.0.0-rc.1` line, take a normal backup of `lcm.db` before updating,
 then update the checkout and restart Hermes. No manual core migration or
 backfill is required: the core schema remains version 5. New assertion,
@@ -630,6 +651,15 @@ dropping data.
 `lcm_doctor` reports SQLite `journal_mode`, `quick_check`, database/WAL sizes,
 largest content/tool-call rows, suspicious inline payload rows, and aggregate
 externalized-payload stats. Doctor output is metadata-only for these scans.
+
+The integrity inventory treats refs found in either `lcm.db` or the host
+`state.db` as live. A payload referenced only by host history is reported as a
+host-only ref and is not classified as unreferenced. If the host scan cannot be
+completed, cleanup stays conservative: matching payload basenames are retained
+and the scan error is reported for inspection. Historical inline-payload
+warnings describe rows that predate the storage guard; they are not evidence
+that current writes are bypassing it. Review those rows and take a backup before
+any cleanup.
 
 This guard is scoped to LCM's own `lcm.db` write boundary. It does not prevent
 Hermes core, or any other host layer, from writing inline payloads to Hermes

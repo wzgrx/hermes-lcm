@@ -667,6 +667,14 @@ base64-looking rows, and aggregate externalized-payload stats.
 Doctor output is metadata-only for these scans; it intentionally does not print
 raw payload previews.
 
+Externalized-payload integrity is state-aware. References in plugin-local
+`lcm.db` and host-owned `state.db` both keep a payload live; doctor reports the
+LCM-ref count, host-ref count, and host-only refs separately. A host scan error
+must fail closed for cleanup: retain conservatively matching basenames and
+inspect the reported error rather than deleting files. Historical suspicious
+inline rows may legitimately predate the storage-boundary guard. They remain an
+inspection or backup-first migration item, not an automatic-delete signal.
+
 `lcm_doctor` JSON includes a top-level `guidance` array for every warning or
 failure. The slash-command text also reports `triage_guidance` for the warning
 and failure classes surfaced in the command output, using the same operator

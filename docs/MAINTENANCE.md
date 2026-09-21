@@ -20,6 +20,28 @@ Never force-push the maintained main branch. Bring upstream changes into a short
 7. Merge only after GitHub Actions and the local validation gate pass.
 8. Update the installed checkout and restart Hermes through its drain-aware gateway command.
 
+## Deploy a pull-request branch for review
+
+Keep the live checkout, the updater comparison ref, and the documented branch
+identity aligned. A branch deployment is review state, not a permanent fork of
+history.
+
+1. Start the review branch from `origin/main`, commit the scoped change, push it,
+   and open a pull request against the maintained fork's `main`.
+2. In the live checkout, fetch that exact branch and switch to a local tracking
+   branch of the same name. Do not rebase or force-push it after deployment.
+3. Temporarily configure the local updater to compare that checkout with
+   `origin/<review-branch>`. Comparing the live PR checkout with `origin/main`
+   creates false ahead/behind results and can replay the wrong commits.
+4. Run the required validation below, Plugin Doctor, and SQLite health checks,
+   then restart Hermes and confirm the reported loaded branch/commit.
+5. After merge, move the checkout and updater together back to
+   `main`/`origin/main`. Preserve a backup ref for rollback.
+
+`hermes plugins install --ref` is suitable for a one-commit immutable pin only:
+its `--ref` value must be a full 40-character commit SHA. Use a Git tracking
+branch when the requirement is to follow an open pull-request branch.
+
 ## Required validation
 
     python scripts/validate_dependency_contract.py --report-environment
