@@ -109,6 +109,8 @@ def test_register_subscribes_to_subagent_hooks(tmp_path, monkeypatch):
 
     assert "subagent_start" in captured
     assert "subagent_stop" in captured
+    assert "pre_llm_call" in captured
+    assert "post_llm_call" in captured
 
     captured["subagent_start"](
         child_session_id="child-h", parent_session_id="parent-h", child_role="reviewer"
