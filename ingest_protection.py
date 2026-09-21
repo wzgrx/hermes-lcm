@@ -1819,15 +1819,19 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
                 FROM messages
                 WHERE COALESCE(content, '') LIKE '%ref=%]%'
                    OR COALESCE(tool_calls, '') LIKE '%ref=%]%'
+                   OR COALESCE(content, '') LIKE '%.json%'
+                   OR COALESCE(tool_calls, '') LIKE '%.json%'
                 ORDER BY id ASC
                 """
             ).fetchall():
                 for field, value in (("content", content), ("tool_calls", tool_calls)):
                     if not isinstance(value, str):
                         continue
-                    for ref in _refs_for_externalized_integrity_scan(
-                        value, role=str(role or ""), field=field
-                    ):
+                    # Be conservative at the host boundary: any exact payload
+                    # basename retained by state.db is enough to keep the file.
+                    # Host rows may wrap the placeholder in transport metadata
+                    # that the stricter LCM-row parser intentionally ignores.
+                    for ref in (candidate for candidate in existing_files if candidate in value):
                         host_referenced_refs.add(ref)
                         first_location_by_ref.setdefault(
                             ref,
