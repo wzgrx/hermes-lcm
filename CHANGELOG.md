@@ -4,8 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Fixed
+
+- Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
+- Align the plugin manifest with the actual registration contract: declare registered hooks and leave LCM tool discovery to the context-engine schema path rather than PluginContext.register_tool.
 - Mutated active tails no longer trigger per-turn whole-transcript re-ingest; replay identity, sanitation claims, and cursor refresh now converge (reviewed integration of upstream PR #613).
-- `lcm_compile_evidence` avoids top-level JSON-Schema combinators rejected by native Anthropic providers while preserving typed runtime proposal validation (upstream PR #618 schema commit).
+- lcm_compile_evidence avoids top-level JSON-Schema combinators rejected by native Anthropic providers while preserving typed runtime proposal validation (upstream PR #618 schema commit).
 - Local provider-independent sanitation tests use larger synthetic payloads so critical-pressure assertions remain stable across supported tokenizer backends.
 
 ## v1.0.0-rc.1 - 2026-09-03
