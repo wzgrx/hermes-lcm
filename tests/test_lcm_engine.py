@@ -27717,3 +27717,20 @@ class TestExtractionDuringCompress:
         result = eng.compress(messages)
         assert result[0]["role"] == "system"
         assert len(eng._dag.get_session_nodes("extract-fail")) > 0
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        (0, None),
+        (-1, None),
+        ("", None),
+        ("not-a-number", None),
+        (1, 1),
+        ("42000", 42000),
+        (7.9, 7),
+    ],
+)
+def test_threshold_tokens_cap_coercion_matches_hermes_host_contract(value, expected):
+    # Hermes live config sync calls this method on the selected context engine.
+    assert LCMEngine._coerce_threshold_tokens_cap(value) == expected
