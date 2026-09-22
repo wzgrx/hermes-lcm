@@ -6,6 +6,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Bound session-end SQLite lock waits by wall clock so a busy writer cannot stall the gateway turn beyond its intended budget.
 - Honor the Hermes host SQLite journal-mode policy for LCM connections, with legacy WAL setup only when the host helper is absent.
 - Use the linear private-key block scanner during ingest, avoiding timeout-clamped quadratic regex stalls while preserving redaction.
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
