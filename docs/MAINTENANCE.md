@@ -20,6 +20,28 @@ Never force-push the maintained main branch. Bring upstream changes into a short
 7. Merge only after GitHub Actions and the local validation gate pass.
 8. Update the installed checkout and restart Hermes through its drain-aware gateway command.
 
+## Deploy a pull-request branch for review
+
+Keep the live checkout, the updater comparison ref, and the documented branch
+identity aligned. A branch deployment is review state, not a permanent fork of
+history.
+
+1. Start the review branch from `origin/main`, commit the scoped change, push it,
+   and open a pull request against the maintained fork's `main`.
+2. In the live checkout, fetch that exact branch and switch to a local tracking
+   branch of the same name. Do not rebase or force-push it after deployment.
+3. Temporarily configure the local updater to compare that checkout with
+   `origin/<review-branch>`. Comparing the live PR checkout with `origin/main`
+   creates false ahead/behind results and can replay the wrong commits.
+4. Run the required validation below, Plugin Doctor, and SQLite health checks,
+   then restart Hermes and confirm the reported loaded branch/commit.
+5. After merge, move the checkout and updater together back to
+   `main`/`origin/main`. Preserve a backup ref for rollback.
+
+`hermes plugins install --ref` is suitable for a one-commit immutable pin only:
+its `--ref` value must be a full 40-character commit SHA. Use a Git tracking
+branch when the requirement is to follow an open pull-request branch.
+
 ## Required validation
 
     python scripts/validate_dependency_contract.py --report-environment
@@ -47,4 +69,10 @@ Every fork-only change must have:
 - a clear retirement condition;
 - an entry in the pull request that introduced or retained it.
 
-Current carried changes cover deferred below-threshold preflight maintenance, SQLite POSIX-lock preservation while enforcing private file modes, and public lifecycle-hook registration for current Hermes hosts.
+Current carried changes cover threshold-aware preflight maintenance, SQLite POSIX-lock preservation while enforcing private file modes, public lifecycle-hook registration for current Hermes hosts, the reviewed mutated-tail replay reconciliation from upstream PR #613, and the native-Anthropic tool-schema compatibility fix from PR #618.
+
+## Existing duplicate rows
+
+The replay repair prevents future whole-transcript re-ingest; it is not a destructive migration for rows already present. Audit the live database read-only and compare counts across new turns before concluding that replay growth continues.
+
+Do not deduplicate `messages` by content alone. Store IDs can be referenced by rollups, assertions, trajectories, FTS tables, and lineage. A cleanup change must create a SQLite backup, build a deterministic old-ID to canonical-ID map, update every reference in one transaction, rebuild FTS, and pass integrity plus replay tests. An identity unique index is not sufficient for legacy rows with NULL `observed_at`, because SQLite permits multiple NULL values in a unique index.
