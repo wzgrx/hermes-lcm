@@ -6,6 +6,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Use the linear private-key block scanner during ingest, avoiding timeout-clamped quadratic regex stalls while preserving redaction.
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
 - Declare all four registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 - Mutated active tails no longer trigger per-turn whole-transcript re-ingest; replay identity, sanitation claims, and cursor refresh now converge (reviewed integration of upstream PR #613).
