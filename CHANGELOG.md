@@ -4,7 +4,9 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+- Mutated active tails no longer trigger per-turn whole-transcript re-ingest; replay identity, sanitation claims, and cursor refresh now converge (reviewed integration of upstream PR #613).
+- `lcm_compile_evidence` avoids top-level JSON-Schema combinators rejected by native Anthropic providers while preserving typed runtime proposal validation (upstream PR #618 schema commit).
+- Local provider-independent sanitation tests use larger synthetic payloads so critical-pressure assertions remain stable across supported tokenizer backends.
 
 ## v1.0.0-rc.1 - 2026-09-03
 

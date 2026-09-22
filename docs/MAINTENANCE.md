@@ -69,4 +69,10 @@ Every fork-only change must have:
 - a clear retirement condition;
 - an entry in the pull request that introduced or retained it.
 
-Current carried changes cover deferred below-threshold preflight maintenance, SQLite POSIX-lock preservation while enforcing private file modes, and public lifecycle-hook registration for current Hermes hosts.
+Current carried changes cover threshold-aware preflight maintenance, SQLite POSIX-lock preservation while enforcing private file modes, public lifecycle-hook registration for current Hermes hosts, the reviewed mutated-tail replay reconciliation from upstream PR #613, and the native-Anthropic tool-schema compatibility fix from PR #618.
+
+## Existing duplicate rows
+
+The replay repair prevents future whole-transcript re-ingest; it is not a destructive migration for rows already present. Audit the live database read-only and compare counts across new turns before concluding that replay growth continues.
+
+Do not deduplicate `messages` by content alone. Store IDs can be referenced by rollups, assertions, trajectories, FTS tables, and lineage. A cleanup change must create a SQLite backup, build a deterministic old-ID to canonical-ID map, update every reference in one transaction, rebuild FTS, and pass integrity plus replay tests. An identity unique index is not sufficient for legacy rows with NULL `observed_at`, because SQLite permits multiple NULL values in a unique index.
