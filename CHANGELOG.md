@@ -4,7 +4,10 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+### Fixed
+
+- Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
+- Align `plugin.yaml` with the actual registration contract: declare the three hooks and leave LCM tool discovery to the context-engine schema path rather than `PluginContext.register_tool`.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
