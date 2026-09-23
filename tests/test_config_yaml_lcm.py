@@ -181,3 +181,17 @@ def test_minimal_yaml_fallback_still_reads_scalar_lcm_keys(tmp_path, monkeypatch
     assert config.fresh_tail_count == 41
     assert config.dynamic_leaf_chunk_enabled is True
     assert config.config_sources["fresh_tail_count"] == "config_yaml:lcm.fresh_tail_count"
+
+
+def test_invalid_host_compression_threshold_does_not_leak_nonfinite_or_boolean(tmp_path, monkeypatch):
+    home = _home(tmp_path, monkeypatch, "compression:\n  threshold: .nan\n")
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    nan_config = LCMConfig.from_env()
+    assert nan_config.context_threshold == LCMConfig().context_threshold
+    assert nan_config.config_sources["context_threshold"] == "default"
+
+    (home / "config.yaml").write_text("compression:\n  threshold: true\n")
+    bool_config = LCMConfig.from_env()
+    assert bool_config.context_threshold == LCMConfig().context_threshold
+    assert bool_config.config_sources["context_threshold"] == "default"

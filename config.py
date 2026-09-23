@@ -250,7 +250,7 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
             return default, "default"
         comp_val = compression.get("threshold")
         if comp_val is not None:
-            return float(comp_val), "config_yaml:compression.threshold"
+            return _coerce_lcm_yaml_scalar(comp_val, float), "config_yaml:compression.threshold"
     except Exception:
         return default, "default"
     return default, "default"
