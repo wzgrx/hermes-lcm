@@ -885,6 +885,14 @@ class CompactionMixin:
             return False, "no eligible raw backlog outside fresh tail"
 
         candidate_raw = messages[leading_anchor_count:fresh_tail_start]
+        # The leaf loop discards leading replayed summaries before selecting
+        # raw input. Count eligibility from that same view: otherwise a large
+        # synthetic summary can mask an older store gap and cause repeated
+        # no-op foreground attempts (especially with fallback token counts).
+        while candidate_raw and self._is_replayed_context_scaffold_message(
+            candidate_raw[0]
+        ):
+            candidate_raw = candidate_raw[1:]
         if not candidate_raw:
             return False, "no eligible raw backlog outside fresh tail"
         generated_placeholder_hashes = self._load_generated_ignored_placeholder_hashes()

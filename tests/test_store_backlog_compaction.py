@@ -485,6 +485,9 @@ def test_subchunk_hidden_gap_cannot_be_skipped_by_newer_active_leaf(tmp_path, mo
 
 
 def test_hidden_store_prefix_keeps_debt_until_all_rows_are_covered(tmp_path, monkeypatch):
+    # CI's minimal Python environments use the character estimator rather
+    # than tiktoken; synthetic summary text must not become a fake raw leaf.
+    monkeypatch.setattr("hermes_lcm.tokens._get_encoder", lambda: None)
     engine = LCMEngine(
         config=LCMConfig(
             database_path=str(tmp_path / "lcm.db"),
