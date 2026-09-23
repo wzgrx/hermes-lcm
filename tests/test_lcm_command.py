@@ -21,7 +21,16 @@ from hermes_lcm.store import build_message_fts_spec
 
 
 @pytest.fixture
-def engine(tmp_path):
+def engine(tmp_path, monkeypatch):
+    # Doctor baseline tests should not inherit unrelated host /proc policy.
+    # The actual cross-process scanner has its own subprocess regressions.
+    clean_handles = {
+        "status": "pass", "scope": "same_uid_accessible_processes", "orphaned": [],
+        "scanned_processes": 1, "inaccessible_processes": 0,
+        "inaccessible_descriptors": 0,
+    }
+    monkeypatch.setattr(command_mod, "inspect_orphaned_sqlite_handles", lambda path: clean_handles)
+    monkeypatch.setattr(lcm_tools, "inspect_orphaned_sqlite_handles", lambda path: clean_handles)
     config = LCMConfig()
     config.database_path = str(tmp_path / "lcm_test.db")
     hermes_home = tmp_path / "hermes_home"
@@ -500,8 +509,8 @@ def test_lcm_doctor_reports_health_checks(engine):
 
 def test_both_doctors_surface_orphaned_wal_even_when_integrity_is_ok(engine, monkeypatch):
     finding = {
-        "status": "fail", "scope": "current_process",
-        "orphaned": [{"fd": 23, "artifact": "wal"}],
+        "status": "fail", "scope": "same_uid_accessible_processes",
+        "orphaned": [{"pid": 42, "fd": 23, "artifact": "wal"}],
     }
     monkeypatch.setattr(command_mod, "inspect_orphaned_sqlite_handles", lambda path: finding)
     monkeypatch.setattr(lcm_tools, "inspect_orphaned_sqlite_handles", lambda path: finding)
@@ -519,6 +528,26 @@ def test_both_doctors_surface_orphaned_wal_even_when_integrity_is_ok(engine, mon
     assert check["detail"] == finding
     guidance = next(item for item in payload["guidance"] if item["check"] == "orphaned_sqlite_handles")
     assert "WAL/SHM" in guidance["operator_action"]
+
+
+def test_both_doctors_report_partial_process_scan_without_clean_claim(engine, monkeypatch):
+    finding = {
+        "status": "partial", "scope": "same_uid_accessible_processes", "orphaned": [],
+        "scanned_processes": 2, "inaccessible_processes": 1,
+        "inaccessible_descriptors": 0,
+    }
+    monkeypatch.setattr(command_mod, "inspect_orphaned_sqlite_handles", lambda path: finding)
+    monkeypatch.setattr(lcm_tools, "inspect_orphaned_sqlite_handles", lambda path: finding)
+
+    text = handle_lcm_command("doctor", engine)
+    assert "orphaned_sqlite_handles: partial" in text
+    assert "status: action-recommended" in text
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    check = next(item for item in payload["checks"] if item["check"] == "orphaned_sqlite_handles")
+    assert check["status"] == "warn"
+    assert check["detail"] == finding
+    assert any(item["check"] == "orphaned_sqlite_handles" for item in payload["guidance"])
 
 
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):

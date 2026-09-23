@@ -6654,12 +6654,16 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         orphaned_handles = inspect_orphaned_sqlite_handles(Path(engine._store.db_path))
     except OSError as exc:
         orphaned_handles = {
-            "status": "unavailable", "scope": "current_process",
+            "status": "unavailable", "scope": "same_uid_accessible_processes",
             "orphaned": [], "error": str(exc),
         }
     checks.append({
         "check": "orphaned_sqlite_handles",
-        "status": "unchecked" if orphaned_handles["status"] == "unavailable" else orphaned_handles["status"],
+        "status": (
+            "unchecked" if orphaned_handles["status"] == "unavailable"
+            else "warn" if orphaned_handles["status"] == "partial"
+            else orphaned_handles["status"]
+        ),
         "detail": orphaned_handles,
     })
 

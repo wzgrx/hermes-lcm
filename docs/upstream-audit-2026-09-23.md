@@ -45,10 +45,12 @@ that the deleted-WAL corruption incident's full root cause is resolved.
 
 2026-09-24 follow-up for [#588](https://github.com/stephenschoettler/hermes-lcm/issues/588)
 and [#601](https://github.com/stephenschoettler/hermes-lcm/issues/601): both
-`/lcm doctor` and `lcm_doctor` now inspect the current Linux process's open
+`/lcm doctor` and `lcm_doctor` now inspect same-UID Linux processes' open
 descriptors for a deleted `lcm.db`, WAL, SHM, or rollback journal. A positive
 finding is a failure even if a fresh SQLite connection's `quick_check` reports
 `ok`; the guidance calls for stopping writes, making a verified backup, and
 closing the affected process's connections before restart. The scan is
-read-only and explicitly scoped to the process running doctor: a clean result
-does not certify other gateway/CLI processes or prove every #601 cause absent.
+read-only, and a partial `/proc` scan is reported rather than described as
+clean. Same-UID scan coverage does not certify other users' processes or prove
+every #601 cause absent. A subprocess regression proves a CLI doctor detects
+an orphaned WAL held by a separate long-running process.

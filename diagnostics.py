@@ -13,15 +13,31 @@ DOCTOR_ACTION_INSPECT = "inspect"
 DOCTOR_ACTION_BACKUP_FIRST_CLEANUP = "backup-first cleanup"
 
 
+def _may_use_lcm_when_fds_are_unreadable(proc_path: str) -> bool:
+    """Avoid treating an unrelated private service as an LCM scan failure.
+
+    An inaccessible Hermes/Python/SQLite process remains inconclusive. An
+    unreadable command line is also inconclusive rather than presumed safe.
+    Accessible processes are scanned regardless of their command line.
+    """
+    try:
+        with open(f"{proc_path}/cmdline", "rb") as command_file:
+            command = command_file.read(4096).lower()
+    except OSError:
+        return True
+    return any(marker in command for marker in (b"hermes", b"python", b"sqlite"))
+
+
 def inspect_orphaned_sqlite_handles(db_path: Path) -> dict[str, Any]:
-    """Find this process's open SQLite artifacts whose directory entry vanished.
+    """Find same-user processes holding unlinked SQLite artifacts on Linux.
 
     A connection holding a deleted WAL/SHM may disagree with a fresh connection
-    even when the latter's quick_check succeeds. This is a read-only Linux
-    diagnostic, scoped explicitly to the process running doctor; it makes no
-    claim about other processes that may share the database.
+    even when the latter's quick_check succeeds. A CLI doctor process must
+    inspect the long-running gateway too, not merely its own descriptors.
+    Only same-UID, accessible processes are certified by a clean result.
+    Inaccessible processes plausibly running LCM make the result partial.
     """
-    scope = "current_process"
+    scope = "same_uid_accessible_processes"
     if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
         return {"status": "unavailable", "scope": scope, "orphaned": []}
 
@@ -33,29 +49,62 @@ def inspect_orphaned_sqlite_handles(db_path: Path) -> dict[str, Any]:
         base + "-journal": "journal",
     }
     orphaned: list[dict[str, Any]] = []
+    scanned_processes = 0
+    inaccessible_processes = 0
+    inaccessible_descriptors = 0
     try:
-        descriptors = os.listdir("/proc/self/fd")
+        processes = os.scandir("/proc")
     except OSError:
         return {"status": "unavailable", "scope": scope, "orphaned": []}
-    for descriptor in descriptors:
-        if not descriptor.isdecimal():
-            continue
-        try:
-            target = os.readlink(f"/proc/self/fd/{descriptor}")
-        except OSError:
-            # A descriptor may close while the read-only scan is in progress.
-            continue
-        suffix = " (deleted)"
-        if not target.endswith(suffix):
-            continue
-        artifact = artifacts.get(target[: -len(suffix)])
-        if artifact:
-            orphaned.append({"fd": int(descriptor), "artifact": artifact})
-    orphaned.sort(key=lambda item: item["fd"])
+    with processes:
+        for process in processes:
+            if not process.name.isdecimal():
+                continue
+            try:
+                if process.stat(follow_symlinks=False).st_uid != os.geteuid():
+                    continue
+                descriptors = os.listdir(f"{process.path}/fd")
+            except FileNotFoundError:
+                # Short-lived process exited during enumeration.
+                continue
+            except OSError:
+                if _may_use_lcm_when_fds_are_unreadable(process.path):
+                    inaccessible_processes += 1
+                continue
+            scanned_processes += 1
+            for descriptor in descriptors:
+                if not descriptor.isdecimal():
+                    continue
+                try:
+                    target = os.readlink(f"{process.path}/fd/{descriptor}")
+                except FileNotFoundError:
+                    # A descriptor closed during the read-only scan.
+                    continue
+                except OSError:
+                    if _may_use_lcm_when_fds_are_unreadable(process.path):
+                        inaccessible_descriptors += 1
+                    continue
+                suffix = " (deleted)"
+                if not target.endswith(suffix):
+                    continue
+                artifact = artifacts.get(target[: -len(suffix)])
+                if artifact:
+                    orphaned.append({
+                        "pid": int(process.name), "fd": int(descriptor),
+                        "artifact": artifact,
+                    })
+    orphaned.sort(key=lambda item: (item["pid"], item["fd"]))
     return {
-        "status": "fail" if orphaned else "pass",
+        "status": (
+            "fail" if orphaned else
+            "partial" if inaccessible_processes or inaccessible_descriptors else
+            "pass" if scanned_processes else "unavailable"
+        ),
         "scope": scope,
         "orphaned": orphaned,
+        "scanned_processes": scanned_processes,
+        "inaccessible_processes": inaccessible_processes,
+        "inaccessible_descriptors": inaccessible_descriptors,
     }
 
 
@@ -128,15 +177,19 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     if name == "database_integrity":
         command = "stop and inspect the SQLite database path; restore from backup if integrity_check is not ok"
     elif name == "orphaned_sqlite_handles":
-        command = (
-            "stop writes from the affected process, take a verified SQLite backup, "
-            "then close all its database connections before restarting it; "
-            "do not remove live WAL/SHM files"
-        )
-        rationale = (
-            "a deleted SQLite database/WAL/SHM handle can make a live connection "
-            "disagree with newly opened connections even if quick_check reports ok"
-        )
+        if status == "warn":
+            command = "rerun doctor inside the gateway or inspect the inaccessible same-user processes before trusting a clean WAL result"
+            rationale = "the Linux process scan was partial; absence of deleted handles was not established"
+        else:
+            command = (
+                "stop writes from the affected process, take a verified SQLite backup, "
+                "then close all its database connections before restarting it; "
+                "do not remove live WAL/SHM files"
+            )
+            rationale = (
+                "a deleted SQLite database/WAL/SHM handle can make a live connection "
+                "disagree with newly opened connections even if quick_check reports ok"
+            )
     elif name == "schema_core_tables":
         command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
     elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
