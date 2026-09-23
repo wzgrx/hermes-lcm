@@ -604,6 +604,11 @@ def _deterministic_truncate(text: str, max_tokens: int) -> str:
     return best
 
 
+def _summary_fits_budget(result: str, *, source_tokens: int, budget: int) -> bool:
+    result_tokens = count_tokens(result)
+    return result_tokens < source_tokens and result_tokens <= budget
+
+
 def summarize_with_escalation(
     text: str,
     source_tokens: int,
@@ -622,13 +627,14 @@ def summarize_with_escalation(
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
-    Level 3 is deterministic and never exceeds the source-token estimate.
+    Accepted model output respects both the requested budget and the source
+    estimate. Level 3 is deterministic and obeys the same limits.
     """
     # A tiny leaf has too little room to benefit from a model round-trip.
     # Skipping it also avoids spending two full fallback chains on a source
     # whose token estimate is smaller than a useful summary.
     if source_tokens <= 10:
-        tiny_budget = max(0, min(source_tokens, l3_truncate_tokens))
+        tiny_budget = max(0, min(source_tokens, token_budget, l3_truncate_tokens))
         result = _deterministic_truncate(text, tiny_budget) if tiny_budget else ""
         return result, 3
 
@@ -650,7 +656,9 @@ def summarize_with_escalation(
         timeout=timeout,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+        accepts_result=lambda result: _summary_fits_budget(
+            result, source_tokens=source_tokens, budget=token_budget,
+        ),
     )
 
     if l1_result:
@@ -676,7 +684,9 @@ def summarize_with_escalation(
         timeout=timeout,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+        accepts_result=lambda result: _summary_fits_budget(
+            result, source_tokens=source_tokens, budget=l2_budget,
+        ),
     )
 
     if l2_result:
@@ -684,7 +694,7 @@ def summarize_with_escalation(
         return l2_result, 2
 
     # Level 3: deterministic truncation — guaranteed convergence
-    l3_budget = max(0, min(source_tokens, l3_truncate_tokens))
+    l3_budget = max(0, min(source_tokens, token_budget, l3_truncate_tokens))
     l3_result = _deterministic_truncate(text, l3_budget) if l3_budget else ""
     logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
     return l3_result, 3

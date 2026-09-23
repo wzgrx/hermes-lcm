@@ -7,6 +7,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 ### Fixed
 
 - Skip model calls for tiny leaf chunks, cap deterministic fallback to the source-token estimate, and keep valid non-compressing summaries from opening healthy provider circuits (upstream issue #614).
+- Enforce L1/L2 summary token budgets as well as source reduction; bound deterministic L3 by the same caller budget so source echoes do not inflate context (upstream issue #562).
 - Raise mathematically unsatisfiable compaction thresholds above the protected fresh-tail floor on shorter fallback routes, preventing repeated no-progress preflights.
 - Bound session-end SQLite lock waits by wall clock so a busy writer cannot stall the gateway turn beyond its intended budget.
 - Honor the Hermes host SQLite journal-mode policy for LCM connections, with legacy WAL setup only when the host helper is absent.

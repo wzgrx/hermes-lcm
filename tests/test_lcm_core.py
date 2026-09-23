@@ -396,6 +396,50 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["provider"] == "lcpp"
         assert seen["model"] == "4B-Qwen3-2507-compressor"
 
+    def test_summary_rejects_l1_over_budget_and_accepts_l2_within_budget(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return "echo " * 100
+            return "concise " * 8
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+        source = "durable source content " * 500
+        summary, level = escalation.summarize_with_escalation(
+            source,
+            source_tokens=count_tokens(source),
+            token_budget=40,
+        )
+
+        assert level == 2
+        assert len(calls) == 2
+        assert count_tokens(summary) <= 20
+
+    def test_summary_over_budget_at_both_levels_uses_bounded_l3(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(*args, **kwargs):
+            calls.append(kwargs)
+            return "echo " * 100
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+        source = "durable source content " * 500
+        summary, level = escalation.summarize_with_escalation(
+            source,
+            source_tokens=count_tokens(source),
+            token_budget=40,
+        )
+
+        assert level == 3
+        assert len(calls) == 2
+        assert count_tokens(summary) <= 40
+
     def test_summary_fallback_chain_uses_next_model_after_primary_failure(self, monkeypatch):
         from hermes_lcm import escalation
 
