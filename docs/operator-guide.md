@@ -700,6 +700,12 @@ reports an offline permission-repair error. Stop all processes using the
 database, tighten the named artifact to `0600`, then restart. This preserves
 SQLite advisory locks; the plugin does not use a regular open/close merely to
 change permissions on a live database.
+Optional background temporal-rollup maintenance performs read-only partial
+integrity checks of the metadata and migration-state tables before opening its
+write-capable DAG. A failed check defers background rollup work for five
+minutes and logs a diagnostic; use `/lcm doctor` for a full database check and
+inspect a verified backup before repair. These targeted checks do not certify
+other tables or the entire WAL generation.
 
 Externalized-payload integrity is state-aware. References in plugin-local
 `lcm.db` and host-owned `state.db` both keep a payload live; doctor reports the

@@ -784,6 +784,60 @@ def test_rollup_background_failure_is_logged_without_breaking_bind(
         engine.shutdown()
 
 
+def test_rollup_worker_skips_writes_when_integrity_preflight_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollup-integrity-gate.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path), temporal_rollups_enabled=True))
+    calls: list[str] = []
+    monkeypatch.setattr(engine_module, "_rollup_integrity_preflight", lambda path: False, raising=False)
+    monkeypatch.setattr(
+        engine_module, "SummaryDAG",
+        lambda *_args, **_kwargs: calls.append("opened write-capable DAG"),
+    )
+    monkeypatch.setattr(
+        engine_module, "run_rollup_maintenance",
+        lambda *_args, **_kwargs: calls.append("wrote"),
+    )
+    try:
+        engine.on_session_start("rollup-integrity-session", conversation_id="rollup-integrity-conversation")
+        assert engine.drain_rollup_maintenance(timeout=2)
+        assert calls == []
+    finally:
+        engine.shutdown()
+
+
+def test_rollup_integrity_preflight_checks_metadata_and_bounds_retries(tmp_path, monkeypatch, caplog):
+    db_path = tmp_path / "rollup-preflight.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE lcm_migration_state (step_name TEXT PRIMARY KEY)")
+    assert engine_module._rollup_integrity_preflight(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE metadata")
+    caplog.set_level("ERROR", logger="hermes_lcm.engine")
+    assert not engine_module._rollup_integrity_preflight(db_path)
+    assert "targeted SQLite integrity preflight failed" in caplog.text
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    assert not engine_module._rollup_integrity_preflight(db_path)
+    assert caplog.text.count("targeted SQLite integrity preflight failed") == 1
+
+    monkeypatch.setitem(engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL, str(db_path), time.monotonic() - 1)
+    assert engine_module._rollup_integrity_preflight(db_path)
+
+
+def test_rollup_integrity_preflight_does_not_cache_transient_lock(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollup-locked.db"
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(engine_module.sqlite3, "connect", locked)
+    assert not engine_module._rollup_integrity_preflight(db_path)
+    assert str(db_path) not in engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL
+
+
 def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(
     tmp_path,
     monkeypatch,

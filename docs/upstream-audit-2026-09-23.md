@@ -66,3 +66,16 @@ requirement; already-private artifacts remain usable. O_PATH-enabled Linux
 continues to tighten modes online with identity-pinned descriptors. Tests cover
 both a loose database file and a loose WAL sidecar while a connection is live.
 This does not establish that every #601 corruption mechanism is resolved.
+
+2026-09-24 additional [#601](https://github.com/stephenschoettler/hermes-lcm/issues/601)
+guard: before opening a private writable DAG for optional background temporal
+rollups, the worker opens the database read-only and runs partial
+`PRAGMA integrity_check('metadata')` and
+`PRAGMA integrity_check('lcm_migration_state')`. The first covers the metadata
+autoindex implicated in the incident; on this deployment's ~649 MB DB both
+checks completed in under 1 ms. A failed result or read error defers later
+background rollup passes for five minutes, with one operator-visible error;
+a transient SQLite lock skips only that pass. Regression tests cover the
+write gate, targeted check, bounded retries, and lock behavior. Partial checks
+are not a whole-database integrity certification, and the broader WAL unlink
+root cause remains under investigation.

@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from contextlib import closing
 import uuid
 import weakref
 from pathlib import Path
@@ -147,6 +148,53 @@ from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
+
+_ROLLUP_INTEGRITY_RETRY_SECONDS = 300.0
+_ROLLUP_INTEGRITY_RETRY_UNTIL: dict[str, float] = {}
+_ROLLUP_INTEGRITY_RETRY_LOCK = threading.Lock()
+
+
+def _rollup_integrity_preflight(database_path: Path) -> bool:
+    """Check incident-critical SQLite tables before optional background writes.
+
+    A partial integrity check is fast on a large message corpus while covering
+    the metadata autoindex damaged in upstream #601. Failure defers repeated
+    background passes for five minutes; foreground use and explicit doctor
+    remain independent.
+    """
+    key = str(database_path)
+    now = time.monotonic()
+    with _ROLLUP_INTEGRITY_RETRY_LOCK:
+        if _ROLLUP_INTEGRITY_RETRY_UNTIL.get(key, 0.0) > now:
+            return False
+        _ROLLUP_INTEGRITY_RETRY_UNTIL.pop(key, None)
+    try:
+        with closing(sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True, timeout=3.0)) as conn:
+            for table in ("metadata", "lcm_migration_state"):
+                result = conn.execute(f"PRAGMA integrity_check('{table}')").fetchone()
+                if result is None or result[0] != "ok":
+                    raise sqlite3.DatabaseError(f"{table} integrity check failed")
+    except (OSError, sqlite3.Error) as exc:
+        if isinstance(exc, sqlite3.Error) and _is_sqlite_locked_error(exc):
+            logger.debug("LCM rollup integrity preflight deferred by a transient SQLite lock")
+            return False
+        with _ROLLUP_INTEGRITY_RETRY_LOCK:
+            if len(_ROLLUP_INTEGRITY_RETRY_UNTIL) >= 256:
+                expired = [item for item, until in _ROLLUP_INTEGRITY_RETRY_UNTIL.items() if until <= now]
+                for item in expired:
+                    _ROLLUP_INTEGRITY_RETRY_UNTIL.pop(item, None)
+            if len(_ROLLUP_INTEGRITY_RETRY_UNTIL) >= 256:
+                oldest = min(_ROLLUP_INTEGRITY_RETRY_UNTIL, key=_ROLLUP_INTEGRITY_RETRY_UNTIL.get)
+                _ROLLUP_INTEGRITY_RETRY_UNTIL.pop(oldest, None)
+            _ROLLUP_INTEGRITY_RETRY_UNTIL[key] = now + _ROLLUP_INTEGRITY_RETRY_SECONDS
+        logger.error(
+            "LCM background rollup maintenance deferred for %.0fs: targeted SQLite integrity preflight failed "
+            "(%s); inspect with /lcm doctor before further maintenance",
+            _ROLLUP_INTEGRITY_RETRY_SECONDS,
+            type(exc).__name__,
+        )
+        return False
+    return True
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
 
@@ -2278,6 +2326,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             spend_guard = self._summary_spend_guard
 
             def maintain() -> None:
+                if not _rollup_integrity_preflight(database_path):
+                    return
                 private_dag = SummaryDAG(database_path)
                 try:
                     run_rollup_maintenance(
