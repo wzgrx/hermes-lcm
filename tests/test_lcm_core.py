@@ -1592,6 +1592,23 @@ class TestMessageStore:
         }
         assert store.get_session_count("sess1") == 3
 
+    def test_store_backlog_page_excludes_active_boundary_and_other_sessions(self, store):
+        first = store.append("sess1", {"role": "user", "content": "first"})
+        store.append("other", {"role": "user", "content": "other"})
+        second = store.append("sess1", {"role": "user", "content": "second"})
+        active = store.append("sess1", {"role": "user", "content": "active"})
+
+        page = store.get_session_messages_between(
+            "sess1", after_store_id=0, before_store_id=active, limit=1,
+        )
+        assert [row["store_id"] for row in page] == [first]
+        assert [row["store_id"] for row in store.get_session_messages_between(
+            "sess1", after_store_id=first, before_store_id=active,
+        )] == [second]
+        assert store.get_session_messages_between(
+            "sess1", after_store_id=active, before_store_id=active,
+        ) == []
+
     def test_append_batch(self, store):
         msgs = [
             {"role": "user", "content": "one"},

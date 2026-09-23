@@ -1195,6 +1195,31 @@ class MessageStore:
         )
         return [self._row_to_dict(r) for r in rows]
 
+    def get_session_messages_between(
+        self,
+        session_id: str,
+        *,
+        after_store_id: int,
+        before_store_id: int,
+        limit: int = 512,
+    ) -> List[Dict[str, Any]]:
+        """Read one bounded, ordered page strictly between two store cursors.
+
+        The upper bound lets a store-backed compaction pass stop before the
+        first active raw row or protected fresh tail. It does not decide
+        whether these rows are eligible or already represented by a DAG node.
+        """
+        page_limit = min(512, max(0, int(limit)))
+        if page_limit == 0 or before_store_id <= after_store_id:
+            return []
+        rows = self._fetchall(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                WHERE session_id = ? AND store_id > ? AND store_id < ?
+                ORDER BY store_id LIMIT ?""",
+            (session_id, int(after_store_id), int(before_store_id), page_limit),
+        )
+        return [self._row_to_dict(row) for row in rows]
+
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
