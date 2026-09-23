@@ -498,6 +498,29 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "triage_guidance:\n- none" in result
 
 
+def test_both_doctors_surface_orphaned_wal_even_when_integrity_is_ok(engine, monkeypatch):
+    finding = {
+        "status": "fail", "scope": "current_process",
+        "orphaned": [{"fd": 23, "artifact": "wal"}],
+    }
+    monkeypatch.setattr(command_mod, "inspect_orphaned_sqlite_handles", lambda path: finding)
+    monkeypatch.setattr(lcm_tools, "inspect_orphaned_sqlite_handles", lambda path: finding)
+
+    text = handle_lcm_command("doctor", engine)
+    assert "sqlite_integrity: ok" in text
+    assert "status: issues-found" in text
+    assert "orphaned_sqlite_handles: fail" in text
+    assert "orphaned_sqlite_handles: inspect" in text
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    assert payload["overall"] == "unhealthy"
+    check = next(item for item in payload["checks"] if item["check"] == "orphaned_sqlite_handles")
+    assert check["status"] == "fail"
+    assert check["detail"] == finding
+    guidance = next(item for item in payload["guidance"] if item["check"] == "orphaned_sqlite_handles")
+    assert "WAL/SHM" in guidance["operator_action"]
+
+
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):
     engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
     engine._store.append("heartbeat-session", {"role": "user", "content": "Still working..."}, token_estimate=2)
@@ -580,7 +603,10 @@ def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
     storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
     storage_dir.mkdir(parents=True)
     (storage_dir / "referenced.json").write_text(json.dumps({"content": "stored", "content_chars": 6}))
-    (storage_dir / "unreferenced.json").write_text(json.dumps({"content": "orphaned", "content_chars": 8}))
+    private_payload = "orphaned-payload-secret-marker"
+    (storage_dir / "unreferenced.json").write_text(json.dumps({
+        "content": private_payload, "content_chars": len(private_payload),
+    }))
     engine._store.append(
         "externalized-integrity-session",
         {
@@ -605,7 +631,7 @@ def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
     assert "missing.json" in result
     assert "inspect missing externalized payload refs and restore from backups if needed" in result
     assert "stored" not in result
-    assert "orphaned" not in result
+    assert private_payload not in result
 
 
 def test_lcm_doctor_finds_heartbeat_noise_after_many_short_nonmatches(engine):

@@ -42,3 +42,13 @@ read-only equality check, and `test_current_schema_reopen_does_not_rewrite_metad
 verifies a second migration pass adds no row changes or open write transaction.
 This removes one source of WAL frames/lock pressure; it is **not** evidence
 that the deleted-WAL corruption incident's full root cause is resolved.
+
+2026-09-24 follow-up for [#588](https://github.com/stephenschoettler/hermes-lcm/issues/588)
+and [#601](https://github.com/stephenschoettler/hermes-lcm/issues/601): both
+`/lcm doctor` and `lcm_doctor` now inspect the current Linux process's open
+descriptors for a deleted `lcm.db`, WAL, SHM, or rollback journal. A positive
+finding is a failure even if a fresh SQLite connection's `quick_check` reports
+`ok`; the guidance calls for stopping writes, making a verified backup, and
+closing the affected process's connections before restart. The scan is
+read-only and explicitly scoped to the process running doctor: a clean result
+does not certify other gateway/CLI processes or prove every #601 cause absent.

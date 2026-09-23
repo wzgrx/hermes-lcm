@@ -4,12 +4,59 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 
 DOCTOR_ACTION_SAFE_IGNORE = "safe/ignore"
 DOCTOR_ACTION_INSPECT = "inspect"
 DOCTOR_ACTION_BACKUP_FIRST_CLEANUP = "backup-first cleanup"
+
+
+def inspect_orphaned_sqlite_handles(db_path: Path) -> dict[str, Any]:
+    """Find this process's open SQLite artifacts whose directory entry vanished.
+
+    A connection holding a deleted WAL/SHM may disagree with a fresh connection
+    even when the latter's quick_check succeeds. This is a read-only Linux
+    diagnostic, scoped explicitly to the process running doctor; it makes no
+    claim about other processes that may share the database.
+    """
+    scope = "current_process"
+    if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+        return {"status": "unavailable", "scope": scope, "orphaned": []}
+
+    base = str(Path(db_path).expanduser().resolve())
+    artifacts = {
+        base: "database",
+        base + "-wal": "wal",
+        base + "-shm": "shm",
+        base + "-journal": "journal",
+    }
+    orphaned: list[dict[str, Any]] = []
+    try:
+        descriptors = os.listdir("/proc/self/fd")
+    except OSError:
+        return {"status": "unavailable", "scope": scope, "orphaned": []}
+    for descriptor in descriptors:
+        if not descriptor.isdecimal():
+            continue
+        try:
+            target = os.readlink(f"/proc/self/fd/{descriptor}")
+        except OSError:
+            # A descriptor may close while the read-only scan is in progress.
+            continue
+        suffix = " (deleted)"
+        if not target.endswith(suffix):
+            continue
+        artifact = artifacts.get(target[: -len(suffix)])
+        if artifact:
+            orphaned.append({"fd": int(descriptor), "artifact": artifact})
+    orphaned.sort(key=lambda item: item["fd"])
+    return {
+        "status": "fail" if orphaned else "pass",
+        "scope": scope,
+        "orphaned": orphaned,
+    }
 
 
 def _enforce_state_db_containment(path: Path, *, description: str) -> Path:
@@ -80,6 +127,16 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
 
     if name == "database_integrity":
         command = "stop and inspect the SQLite database path; restore from backup if integrity_check is not ok"
+    elif name == "orphaned_sqlite_handles":
+        command = (
+            "stop writes from the affected process, take a verified SQLite backup, "
+            "then close all its database connections before restarting it; "
+            "do not remove live WAL/SHM files"
+        )
+        rationale = (
+            "a deleted SQLite database/WAL/SHM handle can make a live connection "
+            "disagree with newly opened connections even if quick_check reports ok"
+        )
     elif name == "schema_core_tables":
         command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
     elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:

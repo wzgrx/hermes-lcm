@@ -29,6 +29,7 @@ from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
+    inspect_orphaned_sqlite_handles,
 )
 from .ingest_protection import (
     externalized_payload_stats,
@@ -1382,6 +1383,15 @@ def _doctor_text(engine) -> str:
     wal_path = Path(str(db_path) + "-wal")
     wal_size = wal_path.stat().st_size if wal_path.exists() else 0
     try:
+        orphaned_handles = inspect_orphaned_sqlite_handles(db_path)
+    except OSError as exc:  # pragma: no cover - diagnostic must remain read-only
+        orphaned_handles = {"status": "unavailable", "scope": "current_process", "orphaned": [], "error": str(exc)}
+    if orphaned_handles["status"] == "fail":
+        issues.append("orphaned_sqlite_handles")
+        recommended_actions.append(
+            "stop writes, take a verified SQLite backup, then close the affected process's database connections; do not remove live WAL/SHM files"
+        )
+    try:
         journal_row = store_conn.execute("PRAGMA journal_mode").fetchone()
         journal_mode = str(journal_row[0]) if journal_row else "unknown"
     except Exception as exc:  # pragma: no cover - defensive
@@ -1630,6 +1640,8 @@ def _doctor_text(engine) -> str:
     triage_checks: list[dict[str, Any]] = []
     if integrity != "ok":
         triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
+    if orphaned_handles["status"] == "fail":
+        triage_checks.append({"check": "orphaned_sqlite_handles", "status": "fail", "detail": orphaned_handles})
     if schema_health.get("error") or schema_missing_tables:
         triage_checks.append({"check": "schema_core_tables", "status": "fail", "detail": schema_health})
     if store_fts != "ok":
@@ -1699,6 +1711,7 @@ def _doctor_text(engine) -> str:
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
         f"wal_size: {_fmt_size(wal_size)}",
+        f"orphaned_sqlite_handles: {orphaned_handles['status']} (scope: {orphaned_handles['scope']}; artifacts: {orphaned_handles['orphaned']})",
         f"schema_core_tables: {schema_core_status}",
         f"schema_missing_tables: {', '.join(schema_missing_tables) or '(none)'}",
         f"schema_existing_tables: {', '.join(schema_existing_tables) or '(none)'}",

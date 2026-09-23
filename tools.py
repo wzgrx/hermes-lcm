@@ -28,6 +28,7 @@ from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
     doctor_guidance_for_checks,
+    inspect_orphaned_sqlite_handles,
 )
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
@@ -6648,6 +6649,19 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "status": "fail",
             "detail": str(e),
         })
+
+    try:
+        orphaned_handles = inspect_orphaned_sqlite_handles(Path(engine._store.db_path))
+    except OSError as exc:
+        orphaned_handles = {
+            "status": "unavailable", "scope": "current_process",
+            "orphaned": [], "error": str(exc),
+        }
+    checks.append({
+        "check": "orphaned_sqlite_handles",
+        "status": "unchecked" if orphaned_handles["status"] == "unavailable" else orphaned_handles["status"],
+        "detail": orphaned_handles,
+    })
 
     # Ingest health: a swallowed persistence error means turns were not
     # durably stored, silently breaking the lossless guarantee. Surface it.
