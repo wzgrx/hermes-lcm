@@ -274,6 +274,24 @@ class LifecycleStateStore:
         # conversation's carry source, especially after an explicit /new.
         if session_id not in (state.current_session_id, state.last_finalized_session_id):
             return state
+        if int(frontier_store_id or 0) == 0 and not self._session_has_lcm_data(session_id):
+            # A short-lived clone with no durable context is not a carry source.
+            # Still release its current slot; simply returning the old state
+            # would leave an ended session advertised as active indefinitely.
+            if state.current_session_id == session_id:
+                self._conn.execute(
+                    """
+                    UPDATE lcm_lifecycle_state
+                    SET current_session_id = NULL,
+                        current_frontier_store_id = 0,
+                        updated_at = ?
+                    WHERE conversation_id = ? AND current_session_id = ?
+                    """,
+                    (time.time(), state.conversation_id, session_id),
+                )
+                self._conn.commit()
+                return self.get_by_conversation(state.conversation_id)
+            return state
         now = time.time()
         current_session_id = state.current_session_id
         current_frontier = state.current_frontier_store_id
@@ -312,6 +330,27 @@ class LifecycleStateStore:
         )
         self._conn.commit()
         return self.get_by_conversation(state.conversation_id)
+
+    def _session_has_lcm_data(self, session_id: str) -> bool:
+        """Treat uncertain storage reads as non-empty rather than losing carry."""
+        for table in ("messages", "summary_nodes"):
+            try:
+                row = self._conn.execute(
+                    f"SELECT 1 FROM {table} WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                # A standalone lifecycle store can precede creation of the
+                # message/DAG tables. Other database errors should keep the
+                # previous finalization behavior instead of discarding carry.
+                if "no such table" in str(exc).lower():
+                    continue
+                return True
+            except sqlite3.Error:
+                return True
+            if row is not None:
+                return True
+        return False
 
     @_synchronized
     def record_rollover(
