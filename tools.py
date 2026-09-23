@@ -157,9 +157,22 @@ def _get_externalized_payload(
     if payload is None:
         return None
     payload_session_id = payload.get("session_id") or ""
-    allowed = allowed_session_ids or {engine.current_session_id}
-    if payload_session_id and payload_session_id not in allowed:
-        return None
+    if payload_session_id:
+        if allowed_session_ids is not None:
+            if payload_session_id not in allowed_session_ids:
+                return None
+        elif payload_session_id != engine.current_session_id:
+            conversation_id = engine.current_conversation_id
+            if not conversation_id:
+                return None
+            try:
+                if not engine._store.session_belongs_to_conversation(
+                    payload_session_id, conversation_id
+                ):
+                    return None
+            except sqlite3.Error:
+                logger.debug("LCM payload conversation membership lookup failed", exc_info=True)
+                return None
     return payload
 
 

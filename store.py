@@ -713,6 +713,15 @@ class MessageStore:
             return True
         return False
 
+    def session_belongs_to_conversation(self, session_id: str, conversation_id: str) -> bool:
+        """Check persisted membership using the conversation/session index."""
+        if not session_id or not conversation_id:
+            return False
+        return self._conn.execute(
+            "SELECT 1 FROM messages WHERE conversation_id = ? AND session_id = ? LIMIT 1",
+            (conversation_id, session_id),
+        ).fetchone() is not None
+
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
                conversation_id: str = "") -> int:

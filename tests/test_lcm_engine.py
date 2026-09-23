@@ -24979,6 +24979,38 @@ class TestEngineTools:
         assert result["tool_call_id"] == "call_big"
         assert result["content_truncated"] is False
 
+    def test_externalized_ref_survives_same_conversation_session_rebind(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_rebind.db"))
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        content = "Original user payload " * 100
+        try:
+            engine.on_session_start("writer", platform="cli", conversation_id="shared")
+            engine._store.append("writer", {"role": "user", "content": "first"}, conversation_id="shared")
+            externalized = externalize_ingest_payload(
+                content,
+                role="user",
+                session_id="writer",
+                config=config,
+                hermes_home=str(tmp_path / "hermes"),
+            )
+            assert externalized is not None
+            ref = externalized["path"].name
+
+            engine.on_session_start("reader", platform="cli", conversation_id="shared")
+            engine._store.append("reader", {"role": "user", "content": "second"}, conversation_id="shared")
+            expanded = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref}))
+            described = json.loads(engine.handle_tool_call("lcm_describe", {"externalized_ref": ref}))
+            assert expanded["content"] == content
+            assert described["session_id"] == "writer"
+
+            engine.on_session_start("foreign", platform="cli", conversation_id="other")
+            engine._store.append("foreign", {"role": "user", "content": "third"}, conversation_id="other")
+            for tool in ("lcm_expand", "lcm_describe"):
+                result = json.loads(engine.handle_tool_call(tool, {"externalized_ref": ref}))
+                assert "error" in result
+        finally:
+            engine.shutdown()
+
     def test_handle_expand_externalized_ref_respects_max_tokens(self, tmp_path):
         from hermes_lcm.tokens import count_tokens
 
