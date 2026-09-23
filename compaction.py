@@ -321,14 +321,14 @@ class CompactionMixin:
         if replay_messages is not None and not self._compression_boundary_cooldown_active():
             replay_rough = count_messages_tokens(replay_messages)
             pressure_tokens = max(rough, replay_rough)
-            critical_store_pressure = self._critical_budget_pressure_reached(
-                observed_tokens=pressure_tokens,
-                messages=replay_messages,
-            )
-            store_maintenance_due = bool(
-                (self.threshold_tokens > 0 and pressure_tokens >= self.threshold_tokens)
-                or critical_store_pressure
-            )
+            threshold_store_due = self.threshold_tokens > 0 and pressure_tokens >= self.threshold_tokens
+            critical_store_pressure = False
+            if not threshold_store_due:
+                critical_store_pressure = self._critical_budget_pressure_reached(
+                    observed_tokens=pressure_tokens,
+                    messages=replay_messages,
+                )
+            store_maintenance_due = threshold_store_due or critical_store_pressure
             active_leaf_eligible = False
             if store_maintenance_due:
                 active_leaf_eligible, _active_leaf_reason = (
@@ -346,6 +346,11 @@ class CompactionMixin:
                 if store_maintenance_due and not active_leaf_eligible else None
             )
             if hidden_leaf:
+                if not critical_store_pressure:
+                    critical_store_pressure = self._critical_budget_pressure_reached(
+                        observed_tokens=pressure_tokens,
+                        messages=replay_messages,
+                    )
                 if self._config.deferred_maintenance_enabled and self._conversation_id:
                     hidden_bounds = hidden_leaf[2]
                     self._lifecycle.record_debt(
