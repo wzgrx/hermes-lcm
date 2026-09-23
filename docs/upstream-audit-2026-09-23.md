@@ -29,3 +29,11 @@ Local concurrency regression found during the #585 follow-up: two lazy
 eight opens and was repeated 20 times locally; this is narrower than upstream
 [#601](https://github.com/stephenschoettler/hermes-lcm/issues/601)'s broader
 WAL/handle incident, which needs its own ongoing audit.
+
+2026-09-24 follow-up for #601 found an avoidable write on every healthy SQLite helper
+open: `run_versioned_migrations()` restamped `metadata.schema_version` even
+when the value already matched. `set_schema_version()` now returns after a
+read-only equality check, and `test_current_schema_reopen_does_not_rewrite_metadata`
+verifies a second migration pass adds no row changes or open write transaction.
+This removes one source of WAL frames/lock pressure; it is **not** evidence
+that the deleted-WAL corruption incident's full root cause is resolved.

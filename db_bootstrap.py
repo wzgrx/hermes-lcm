@@ -2354,13 +2354,22 @@ def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> No
 
 def set_schema_version(conn: sqlite3.Connection, version: int = SCHEMA_VERSION) -> None:
     ensure_metadata_table(conn)
+    desired = str(version)
+    current = conn.execute(
+        "SELECT value FROM metadata WHERE key = 'schema_version'"
+    ).fetchone()
+    if current is not None and current[0] == desired:
+        # Every SQLite helper opens the same live database and runs the
+        # migration guard. Do not acquire a write lock (or add WAL frames)
+        # simply to stamp an unchanged schema version on each open.
+        return
     conn.execute(
         """
         INSERT INTO metadata(key, value)
         VALUES('schema_version', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """,
-        (str(version),),
+        (desired,),
     )
 
 

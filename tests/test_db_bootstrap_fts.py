@@ -1250,6 +1250,32 @@ def test_run_versioned_migrations_accepts_current_schema(tmp_path):
         conn.close()
 
 
+def test_current_schema_reopen_does_not_rewrite_metadata(tmp_path):
+    """A healthy database must not receive a WAL write on every helper open."""
+    path = tmp_path / "current-schema.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        db_bootstrap.run_versioned_migrations(conn)
+        conn.commit()
+        wal_path = tmp_path / "current-schema.db-wal"
+        wal_size_after_install = wal_path.stat().st_size
+
+        reopened = sqlite3.connect(path)
+        try:
+            db_bootstrap.run_versioned_migrations(reopened)
+
+            assert reopened.total_changes == 0
+            assert reopened.in_transaction is False
+            assert wal_path.stat().st_size == wal_size_after_install
+            assert db_bootstrap.read_existing_schema_version(reopened) == db_bootstrap.SCHEMA_VERSION
+        finally:
+            reopened.close()
+    finally:
+        conn.close()
+
+
 def test_message_store_refuses_newer_schema_before_startup_ddl(tmp_path):
     from hermes_lcm.store import MessageStore
 
