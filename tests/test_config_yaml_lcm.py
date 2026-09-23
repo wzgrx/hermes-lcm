@@ -195,3 +195,37 @@ def test_invalid_host_compression_threshold_does_not_leak_nonfinite_or_boolean(t
     bool_config = LCMConfig.from_env()
     assert bool_config.context_threshold == LCMConfig().context_threshold
     assert bool_config.config_sources["context_threshold"] == "default"
+
+
+def test_from_env_uses_one_hermes_yaml_snapshot(monkeypatch):
+    import hermes_lcm.config as config_module
+
+    snapshots = iter([
+        {
+            "lcm": {"fresh_tail_count": 47},
+            "compression": {"threshold": 0.61, "codex_gpt55_autoraise": False},
+            "auxiliary": {"compression": {"timeout": 23}},
+        },
+        {
+            "lcm": {"fresh_tail_count": 99},
+            "compression": {"threshold": 0.9, "codex_gpt55_autoraise": True},
+            "auxiliary": {"compression": {"timeout": 999}},
+        },
+    ])
+    calls = []
+
+    def load_snapshot():
+        calls.append(1)
+        return next(snapshots)
+
+    monkeypatch.setattr(config_module, "_load_hermes_config_yaml", load_snapshot)
+    for key in ("LCM_FRESH_TAIL_COUNT", "LCM_CONTEXT_THRESHOLD", "LCM_SUMMARY_TIMEOUT_MS"):
+        monkeypatch.delenv(key, raising=False)
+
+    config = LCMConfig.from_env()
+
+    assert calls == [1]
+    assert config.fresh_tail_count == 47
+    assert config.context_threshold == 0.61
+    assert config.codex_gpt55_autoraise_enabled is False
+    assert config.summary_timeout_ms == 23000

@@ -232,8 +232,10 @@ def _hermes_compression_threshold(default: float) -> float:
     return value
 
 
-def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_compression_threshold_with_source(
+    default: float, cfg: dict[str, Any] | None = None,
+) -> tuple[float, str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     try:
         lcm_section = cfg.get("lcm") or {}
         if isinstance(lcm_section, dict):
@@ -268,8 +270,10 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     return value
 
 
-def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_auxiliary_compression_timeout_ms_with_source(
+    default: int, cfg: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     try:
         auxiliary = cfg.get("auxiliary") or {}
         if not isinstance(auxiliary, dict):
@@ -285,8 +289,10 @@ def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[
         return default, "default"
 
 
-def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_codex_gpt55_autoraise_with_source(
+    default: bool, cfg: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     try:
         compression = cfg.get("compression") or {}
         if not isinstance(compression, dict):
@@ -957,6 +963,8 @@ class LCMConfig:
             if warning:
                 config_source_warnings.append(warning)
 
+        # Resolve all host-derived defaults from one snapshot: config.yaml can be
+        # rewritten atomically while a Gateway process is constructing this engine.
         hermes_yaml = _load_hermes_config_yaml()
         lcm_yaml = hermes_yaml.get("lcm") if isinstance(hermes_yaml, dict) else None
         lcm_yaml = lcm_yaml if isinstance(lcm_yaml, dict) else {}
@@ -977,7 +985,9 @@ class LCMConfig:
             "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
         )
         _record("leaf_chunk_tokens", source, warning)
-        context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
+        context_default, context_source = _hermes_compression_threshold_with_source(
+            c.context_threshold, hermes_yaml
+        )
         c.context_threshold, source, warning = _parse_float_env_with_source(
             "LCM_CONTEXT_THRESHOLD",
             context_default,
@@ -985,7 +995,7 @@ class LCMConfig:
         )
         _record("context_threshold", source, warning)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
-            c.codex_gpt55_autoraise_enabled
+            c.codex_gpt55_autoraise_enabled, hermes_yaml
         )
         _record("codex_gpt55_autoraise_enabled", source)
         c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
@@ -1004,7 +1014,7 @@ class LCMConfig:
         )
         _record("summary_spend_backoff_seconds", source, warning)
         summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
-            c.summary_timeout_ms
+            c.summary_timeout_ms, hermes_yaml
         )
         c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
             "LCM_SUMMARY_TIMEOUT_MS",
