@@ -6,6 +6,8 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Retry transient host journal-mode lock contention during concurrent first-open SQLite startup; separate WAL conversion and FTS repair race tests so each tests its own synchronization boundary.
+- Add configurable automatic foreground compaction pass/time ceilings (adapted from upstream PR #621); share one deadline across summary routes and levels, clamp automatic limits to the existing manual ceiling, and keep forced/manual work unchanged.
 - Skip model calls for tiny leaf chunks, cap deterministic fallback to the source-token estimate, and keep valid non-compressing summaries from opening healthy provider circuits (upstream issue #614).
 - Enforce L1/L2 summary token budgets as well as source reduction; bound deterministic L3 by the same caller budget so source echoes do not inflate context (upstream issue #562).
 - Raise mathematically unsatisfiable compaction thresholds above the protected fresh-tail floor on shorter fallback routes, preventing repeated no-progress preflights.

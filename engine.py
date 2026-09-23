@@ -1806,6 +1806,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
                     timeout=timeout_seconds,
+                    **({"deadline": deadline} if deadline is not None else {}),
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
@@ -5915,6 +5916,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
         critical_budget_pressure: bool = False,
+        deadline: Optional[float] = None,
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
@@ -5937,6 +5939,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
@@ -5958,6 +5962,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens, summary_tokens, level = self._condense_summary_nodes(
                 to_condense,
                 focus_topic=focus_topic,
+                deadline=deadline,
             )
             condensed_any = True
 
@@ -6005,6 +6010,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             circuit_breaker=self._summary_circuit_breaker,
             spend_guard=self._summary_spend_guard,
             timeout=timeout_seconds,
+            **({"deadline": deadline} if deadline is not None else {}),
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",

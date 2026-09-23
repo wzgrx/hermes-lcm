@@ -76,6 +76,48 @@ class TestConfigureConnectionPragmas:
         assert calls == ["lcm.db"]
         assert mode == configured_mode
 
+    def test_host_journal_mode_retries_transient_startup_lock(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        calls = []
+        host_module = ModuleType("hermes_state_wal")
+
+        def apply_wal_with_fallback(conn, *, db_label="state.db"):
+            calls.append(db_label)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
+
+        host_module.apply_wal_with_fallback = apply_wal_with_fallback
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", host_module)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            configure_connection(conn)
+            assert calls == ["lcm.db"] * 3
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        finally:
+            conn.close()
+
+    def test_host_journal_mode_does_not_retry_unrelated_error(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        calls = []
+        host_module = ModuleType("hermes_state_wal")
+
+        def apply_wal_with_fallback(conn, *, db_label="state.db"):
+            calls.append(db_label)
+            raise sqlite3.OperationalError("disk I/O error")
+
+        host_module.apply_wal_with_fallback = apply_wal_with_fallback
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", host_module)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+                configure_connection(conn)
+            assert calls == ["lcm.db"]
+        finally:
+            conn.close()
+
     def test_delete_mode_skips_wal_specific_pragmas(
         self,
         db_path: Path,

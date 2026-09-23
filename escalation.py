@@ -333,6 +333,7 @@ def _invoke_summary_llm_chain(
     model: str = "",
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
+    deadline: float | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
@@ -340,6 +341,16 @@ def _invoke_summary_llm_chain(
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        remaining_seconds = None if deadline is None else deadline - time.monotonic()
+        if remaining_seconds is not None and remaining_seconds <= 0:
+            logger.info("LCM summary deadline exhausted before another provider call")
+            break
+        call_timeout = timeout
+        if remaining_seconds is not None:
+            call_timeout = (
+                remaining_seconds if call_timeout is None
+                else min(call_timeout, remaining_seconds)
+            )
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
             logger.warning(
@@ -360,7 +371,7 @@ def _invoke_summary_llm_chain(
                 prompt,
                 max_tokens,
                 model=candidate_model,
-                timeout=timeout,
+                timeout=call_timeout,
             )
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
@@ -616,6 +627,7 @@ def summarize_with_escalation(
     depth: int = 0,
     model: str = "",
     timeout: float | None = None,
+    deadline: float | None = None,
     l2_budget_ratio: float = 0.50,
     l3_truncate_tokens: int = 512,
     focus_topic: str = "",
@@ -654,6 +666,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: _summary_fits_budget(
@@ -682,6 +695,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: _summary_fits_budget(

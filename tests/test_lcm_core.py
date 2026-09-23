@@ -396,6 +396,34 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["provider"] == "lcpp"
         assert seen["model"] == "4B-Qwen3-2507-compressor"
 
+    def test_summary_deadline_is_shared_across_models_and_levels(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        clock = [100.0]
+        calls = []
+        monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append((model, timeout))
+            clock[0] += 6.0
+            return "echo " * 100
+
+        monkeypatch.setattr(escalation, "_invoke_summary_llm", fake_summary_call)
+        source = "durable source content " * 500
+        summary, level = escalation.summarize_with_escalation(
+            source,
+            source_tokens=count_tokens(source),
+            token_budget=40,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            timeout=60.0,
+            deadline=110.0,
+        )
+
+        assert level == 3
+        assert count_tokens(summary) <= 40
+        assert calls == [("primary-model", 10.0), ("fallback-model", 4.0)]
+
     def test_summary_rejects_l1_over_budget_and_accepts_l2_within_budget(self, monkeypatch):
         from hermes_lcm import escalation
 
@@ -818,6 +846,8 @@ class TestConfig:
         assert c.deferred_maintenance_max_passes == 4
         assert c.critical_budget_pressure_ratio == 0.0
         assert c.threshold_full_sweep_enabled is False
+        assert c.automatic_foreground_max_passes == 12
+        assert c.automatic_foreground_max_seconds == 120.0
         assert c.summary_prefix_target_tokens == 0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
@@ -858,6 +888,8 @@ class TestConfig:
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
         monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
         monkeypatch.setenv("LCM_THRESHOLD_FULL_SWEEP_ENABLED", "true")
+        monkeypatch.setenv("LCM_AUTOMATIC_FOREGROUND_MAX_PASSES", "3")
+        monkeypatch.setenv("LCM_AUTOMATIC_FOREGROUND_MAX_SECONDS", "60")
         monkeypatch.setenv("LCM_SUMMARY_PREFIX_TARGET_TOKENS", "18000")
         monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
@@ -898,6 +930,8 @@ class TestConfig:
         assert c.cache_friendly_min_debt_groups == 3
         assert c.critical_budget_pressure_ratio == 0.92
         assert c.threshold_full_sweep_enabled is True
+        assert c.automatic_foreground_max_passes == 3
+        assert c.automatic_foreground_max_seconds == 60.0
         assert c.summary_prefix_target_tokens == 18_000
         assert c.custom_instructions == "Write as a neutral documenter."
         assert c.extraction_enabled is True

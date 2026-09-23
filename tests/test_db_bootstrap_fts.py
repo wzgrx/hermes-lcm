@@ -75,18 +75,19 @@ def _spawn_message_store_worker(db_path, start_barrier, repair_barrier, queue, w
         from hermes_lcm import db_bootstrap as worker_db_bootstrap
         from hermes_lcm.store import MessageStore
 
-        original_structural_check = worker_db_bootstrap._fts_needs_rebuild_structural
-        synchronized = False
+        if repair_barrier is not None:
+            original_structural_check = worker_db_bootstrap._fts_needs_rebuild_structural
+            synchronized = False
 
-        def synchronized_structural_check(conn, spec):
-            nonlocal synchronized
-            result = original_structural_check(conn, spec)
-            if result and not synchronized:
-                synchronized = True
-                repair_barrier.wait(timeout=30)
-            return result
+            def synchronized_structural_check(conn, spec):
+                nonlocal synchronized
+                result = original_structural_check(conn, spec)
+                if result and not synchronized:
+                    synchronized = True
+                    repair_barrier.wait(timeout=30)
+                return result
 
-        worker_db_bootstrap._fts_needs_rebuild_structural = synchronized_structural_check
+            worker_db_bootstrap._fts_needs_rebuild_structural = synchronized_structural_check
         store = MessageStore(db_path)
         messages = [
             {
@@ -117,11 +118,26 @@ def _spawn_message_store_worker(db_path, start_barrier, repair_barrier, queue, w
             store.close()
 
 
-def _run_spawn_message_store_probe(db_path):
+def _run_spawn_message_store_probe(db_path, *, synchronize_repair=True):
     workers = 6
+    if synchronize_repair:
+        # Isolate the FTS race from first-open journal conversion. Otherwise a
+        # worker waiting at the FTS barrier can hold a read lock that blocks a
+        # sibling's WAL upgrade, while that sibling is needed to release the
+        # barrier. Fresh WAL conversion gets its own race test below.
+        from hermes_lcm.store import MessageStore
+
+        store = MessageStore(db_path)
+        store.close()
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("DROP TABLE messages_fts")
+            conn.commit()
+        finally:
+            conn.close()
     ctx = mp.get_context("spawn")
     start_barrier = ctx.Barrier(workers + 1)
-    repair_barrier = ctx.Barrier(workers)
+    repair_barrier = ctx.Barrier(workers) if synchronize_repair else None
     queue = ctx.Queue()
     processes = [
         ctx.Process(
@@ -165,6 +181,27 @@ def _run_spawn_message_store_probe(db_path):
 if __name__ == "__main__" and sys.argv[1:2] == ["--spawn-fts-bootstrap"]:
     print(json.dumps(_run_spawn_message_store_probe(sys.argv[2])))
     raise SystemExit(0)
+if __name__ == "__main__" and sys.argv[1:2] == ["--spawn-fresh-wal"]:
+    print(json.dumps(_run_spawn_message_store_probe(sys.argv[2], synchronize_repair=False)))
+    raise SystemExit(0)
+
+
+def test_spawned_message_store_startup_retries_fresh_wal_conversion(tmp_path):
+    """Independent first-open constructors converge on WAL under contention."""
+    db_path = str(tmp_path / "spawn-fresh-wal.db")
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--spawn-fresh-wal", db_path],
+        capture_output=True, text=True, timeout=180, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    probe = json.loads(completed.stdout)
+    assert all(result["ok"] for result in probe["results"]), probe["results"]
+    assert all(exitcode == 0 for exitcode in probe["exitcodes"]), probe["exitcodes"]
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
 
 
 def test_spawned_message_store_startup_serializes_fresh_fts_repair(tmp_path):

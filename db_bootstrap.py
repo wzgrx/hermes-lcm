@@ -139,13 +139,39 @@ def configure_connection(conn: sqlite3.Connection) -> None:
         _execute_wal_conversion_with_lock_retry(conn)
         mode = "wal"
     else:
-        mode = apply_wal_with_fallback(conn, db_label="lcm.db")
+        mode = _apply_host_journal_mode_with_lock_retry(
+            conn, apply_wal_with_fallback,
+        )
 
     conn.execute("PRAGMA synchronous=FULL")
     if mode == "wal":
         conn.execute("PRAGMA wal_autocheckpoint=500")
         conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
+
+
+def _apply_host_journal_mode_with_lock_retry(
+    conn: sqlite3.Connection,
+    apply_wal_with_fallback,
+    *,
+    budget_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+) -> str:
+    """Retry transient host journal-mode lock contention on concurrent open.
+
+    The host helper honors the selected WAL/DELETE policy, so retry that helper
+    rather than falling back to a plugin-owned WAL conversion. SQLite can raise
+    SQLITE_BUSY during a DELETE-to-WAL upgrade without waiting on busy_timeout.
+    """
+    deadline = time.monotonic() + budget_ms / 1000.0
+    delay_seconds = 0.005
+    while True:
+        try:
+            return apply_wal_with_fallback(conn, db_label="lcm.db")
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_lock_error(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(delay_seconds)
+        delay_seconds = min(delay_seconds * 2, 0.25)
 
 
 def _execute_wal_conversion_with_lock_retry(
