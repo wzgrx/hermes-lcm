@@ -464,14 +464,22 @@ class MessageStore:
         # 28 bytes of the database file replaced with a TLS record header +
         # ciphertext while the "SQLit" magic remains intact).
         #
-        # This re-entrant lock is defense-in-depth: it forces all write call
-        # sites that use ``self._conn`` to be serialized at the Python layer,
-        # eliminating any window where Python-side buffer reuse or memory
-        # aliasing could intersect SQLite's flush of a write. It does not
-        # change semantics for single-threaded callers and adds only a single
-        # uncontended ``RLock.acquire``/``release`` pair per operation.
+        # Serialize writes and the full execute+fetch span of reads on this
+        # shared Python connection. Locking execute alone is insufficient:
+        # simultaneous fetches can still trip sqlite3.InterfaceError even
+        # when SQLite itself was built in serialized mode.
         self._write_lock = threading.RLock()
         self._init_db()
+
+    def _fetchone(self, query: str, params: Any = None) -> Any:
+        with self._write_lock:
+            cursor = self._conn.execute(query) if params is None else self._conn.execute(query, params)
+            return cursor.fetchone()
+
+    def _fetchall(self, query: str, params: Any = None) -> list[Any]:
+        with self._write_lock:
+            cursor = self._conn.execute(query) if params is None else self._conn.execute(query, params)
+            return cursor.fetchall()
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
@@ -522,7 +530,7 @@ class MessageStore:
 
     def _ensure_source_column(self) -> None:
         columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            row[1] for row in self._fetchall("PRAGMA table_info(messages)")
         }
         add_column_if_missing(
             self._conn, columns, "source",
@@ -534,7 +542,7 @@ class MessageStore:
 
     def _ensure_conversation_id_column(self) -> None:
         columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            row[1] for row in self._fetchall("PRAGMA table_info(messages)")
         }
         add_column_if_missing(
             self._conn, columns, "conversation_id",
@@ -552,7 +560,7 @@ class MessageStore:
         NULL because no source timestamp can be recovered honestly.
         """
         columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            row[1] for row in self._fetchall("PRAGMA table_info(messages)")
         }
         add_column_if_missing(
             self._conn,
@@ -668,7 +676,7 @@ class MessageStore:
             session_id=session_id,
         )
         try:
-            rows = self._conn.execute(
+            rows = self._fetchall(
                 f"""SELECT content, tool_calls FROM messages
                    WHERE session_id = ?
                      AND role = ?
@@ -685,7 +693,7 @@ class MessageStore:
                     anchor - window,
                     anchor + window,
                 ),
-            ).fetchall()
+            )
         except sqlite3.Error:
             logger.debug("Replay-duplicate probe failed; storing the message", exc_info=True)
             return False
@@ -717,10 +725,10 @@ class MessageStore:
         """Check persisted membership using the conversation/session index."""
         if not session_id or not conversation_id:
             return False
-        return self._conn.execute(
+        return self._fetchone(
             "SELECT 1 FROM messages WHERE conversation_id = ? AND session_id = ? LIMIT 1",
             (conversation_id, session_id),
-        ).fetchone() is not None
+        ) is not None
 
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
@@ -905,10 +913,10 @@ class MessageStore:
         offsets, returning a garbled fragment (F2).
         """
         with self._write_lock:
-            row = self._conn.execute(
+            row = self._fetchone(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
-            ).fetchone()
+            )
             if row is None:
                 return False
             role, pinned, current_content, tool_call_id = row
@@ -950,9 +958,9 @@ class MessageStore:
 
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
-        row = self._conn.execute(
+        row = self._fetchone(
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
-        ).fetchone()
+        )
         return self._row_to_dict(row) if row else None
 
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -963,10 +971,10 @@ class MessageStore:
         if not store_ids:
             return {}
         placeholders = ",".join("?" for _ in store_ids)
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
             store_ids,
-        ).fetchall()
+        )
         return {row[0]: self._row_to_dict(row) for row in rows}
 
     def scan_evidence_rows(self, *, limit: int = 4096) -> Dict[str, Any]:
@@ -979,7 +987,7 @@ class MessageStore:
         coverage.  Callers must treat ``truncated`` as an honest fallback.
         """
         bounded_limit = min(4096, max(1, int(limit)))
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"""
             WITH snapshot AS (
                 SELECT {_MESSAGE_SELECT_COLUMNS},
@@ -994,7 +1002,7 @@ class MessageStore:
             LIMIT ?
             """,
             (bounded_limit,),
-        ).fetchall()
+        )
         if not rows:
             return {
                 "rows": [],
@@ -1033,12 +1041,12 @@ class MessageStore:
             where.append("store_id <= ?")
             args.append(end_id)
         args.append(limit)
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE {' AND '.join(where)}
                ORDER BY store_id LIMIT ?""",
             args,
-        ).fetchall()
+        )
         return [self._row_to_dict(r) for r in rows]
 
     def _session_load_where(
@@ -1079,10 +1087,10 @@ class MessageStore:
             time_to=time_to,
         )
         return int(
-            self._conn.execute(
+            self._fetchone(
                 f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
                 args,
-            ).fetchone()[0]
+            )[0]
         )
 
     def load_session_page(
@@ -1108,12 +1116,12 @@ class MessageStore:
         )
         where.append("store_id > ?")
         args.extend([after_store_id, limit])
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE {' AND '.join(where)}
                ORDER BY store_id LIMIT ?""",
             args,
-        ).fetchall()
+        )
         return [self._row_to_dict(r) for r in rows]
 
     def load_session_window(
@@ -1127,51 +1135,51 @@ class MessageStore:
         """Load one bounded ordered window around an exact message anchor."""
         before = min(12, max(0, int(before)))
         after = min(12, max(0, int(after)))
-        prior = self._conn.execute(
+        prior = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                 FROM messages
                 WHERE session_id = ? AND store_id < ?
                 ORDER BY store_id DESC LIMIT ?""",
             (session_id, anchor_store_id, before),
-        ).fetchall()
-        following = self._conn.execute(
+        )
+        following = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                 FROM messages
                 WHERE session_id = ? AND store_id >= ?
                 ORDER BY store_id LIMIT ?""",
             (session_id, anchor_store_id, after + 1),
-        ).fetchall()
+        )
         rows = list(reversed(prior)) + list(following)
         return [self._row_to_dict(row) for row in rows]
 
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ?
                ORDER BY store_id LIMIT ?""",
             (session_id, limit),
-        ).fetchall()
+        )
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
                                    limit: int = 10000) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ? AND store_id > ?
                ORDER BY store_id LIMIT ?""",
             (session_id, after_store_id, limit),
-        ).fetchall()
+        )
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
-        rows = self._conn.execute(
+        rows = self._fetchall(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                FROM (
                    SELECT {_MESSAGE_SELECT_COLUMNS}
@@ -1182,23 +1190,23 @@ class MessageStore:
                )
                ORDER BY store_id""",
             (session_id, limit),
-        ).fetchall()
+        )
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
-        row = self._conn.execute(
+        row = self._fetchone(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?",
             (session_id,),
-        ).fetchone()
+        )
         return row[0] if row else 0
 
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session."""
-        row = self._conn.execute(
+        row = self._fetchone(
             "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
             (session_id,),
-        ).fetchone()
+        )
         return row[0] if row else 0
 
     def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
@@ -1219,7 +1227,7 @@ class MessageStore:
             {where}
             """
         query_args: list[Any] = [_UNKNOWN_SOURCE, _UNKNOWN_SOURCE, *args]
-        row = self._conn.execute(query, query_args).fetchone()
+        row = self._fetchone(query, query_args)
 
         messages_total = int(row[0] or 0) if row else 0
         normalized_unknown = int(row[1] or 0) if row else 0
@@ -1237,7 +1245,7 @@ class MessageStore:
         """Per-session ``(session_id, message_count, token_total, node_count)``
         rows across messages and summary nodes, for ``/lcm doctor clean``
         candidate scanning. Callers own the pattern/protection policy."""
-        return self._conn.execute(
+        return self._fetchall(
             """
             WITH session_ids AS (
                 SELECT session_id FROM messages
@@ -1265,13 +1273,13 @@ class MessageStore:
             LEFT JOIN node_stats n ON n.session_id = s.session_id
             ORDER BY s.session_id
             """
-        ).fetchall()
+        )
 
     def scan_session_retention_stats(self, session_id: str) -> List[tuple]:
         """Per-session activity/token stats for one session (messages + summary
         nodes), for ``/lcm doctor retention`` scanning. Callers own the
         staleness/protection policy."""
-        return self._conn.execute(
+        return self._fetchall(
             """
             WITH session_ids AS (
                 SELECT session_id FROM messages
@@ -1312,20 +1320,20 @@ class MessageStore:
             ORDER BY s.session_id
             """,
             (session_id,),
-        ).fetchall()
+        )
 
     def get_source_normalization_plan(self) -> Dict[str, Any]:
         """Return a dry-run plan for normalizing legacy blank source values."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        row = self._conn.execute(
+        row = self._fetchone(
             f"""
             SELECT COUNT(*) AS would_update_messages,
                    COUNT(DISTINCT session_id) AS affected_sessions
             FROM messages
             WHERE {blank_clause}
             """
-        ).fetchone()
+        )
         would_update = int(row[0] or 0) if row else 0
         affected_sessions = int(row[1] or 0) if row else 0
         return {
@@ -1357,10 +1365,10 @@ class MessageStore:
         if not store_ids:
             return None, None
         placeholders = ",".join("?" * len(store_ids))
-        row = self._conn.execute(
+        row = self._fetchone(
             f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
             store_ids,
-        ).fetchone()
+        )
         if not row:
             return None, None
         return row[0], row[1]
@@ -1374,16 +1382,15 @@ class MessageStore:
         stored value is empty. JSON decoding is deliberately *not* wrapped: a
         malformed value raises, so callers keep the ``try``/``except`` scoping
         that decides whether one bad key aborts a multi-key load or is skipped.
-        Reads are unlocked, matching the store's other read paths (``_write_lock``
-        guards writes only).
+        Reads use the same connection lock as writes, including fetching rows.
         """
         conn = self._conn
         if conn is None:
             return None
-        row = conn.execute(
+        row = self._fetchone(
             "SELECT value FROM metadata WHERE key = ?",
             (key,),
-        ).fetchone()
+        )
         if not row or not row[0]:
             return None
         return json.loads(str(row[0]))
@@ -1411,9 +1418,9 @@ class MessageStore:
         with self._write_lock:
             for key in keys:
                 if skip_unchanged:
-                    existing = conn.execute(
+                    existing = self._fetchone(
                         "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
+                    )
                     if existing is not None and existing[0] == serialized:
                         continue
                 conn.execute(
@@ -1476,10 +1483,10 @@ class MessageStore:
                 # of inheriting the connection's 30s wait.
                 with _temporary_sqlite_busy_timeout([conn], 100):
                     conn.execute("BEGIN IMMEDIATE")
-                    row = conn.execute(
+                    row = self._fetchone(
                         "SELECT value FROM metadata WHERE key = ?",
                         (key,),
-                    ).fetchone()
+                    )
                     try:
                         existing = json.loads(str(row[0])) if row and row[0] else {}
                     except (ValueError, TypeError):
@@ -1670,7 +1677,7 @@ class MessageStore:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
-                rows = self._conn.execute(
+                rows = self._fetchall(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
                               m.ingested_at, m.observed_at, m.observed_at_source,
@@ -1681,7 +1688,7 @@ class MessageStore:
                        WHERE {' AND '.join(where)}
                        ORDER BY {order_by} LIMIT ? OFFSET ?""",
                     args,
-                ).fetchall()
+                )
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
@@ -1872,14 +1879,14 @@ class MessageStore:
                 batch_limit = min(fetch_limit, candidate_cap - scanned_rows)
                 if batch_limit <= 0:
                     break
-                rows = self._conn.execute(
+                rows = self._fetchall(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
                     [*base_args, *order_args, batch_limit, offset],
-                ).fetchall()
+                )
                 scanned_rows += len(rows)
                 add_rows(rows)
                 offset += len(rows)
@@ -1889,14 +1896,14 @@ class MessageStore:
                     boundary_timestamp = rows[-1][8]
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
-                        tie_rows = self._conn.execute(
+                        tie_rows = self._fetchall(
                             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                                 FROM messages
                                 WHERE {' AND '.join(where)}
                                 {order_by}
                                 LIMIT ? OFFSET ?""",
                             [*base_args, *order_args, fetch_limit, offset],
-                        ).fetchall()
+                        )
                         if not tie_rows:
                             break
                         matching_tie_rows = []
@@ -1949,14 +1956,14 @@ class MessageStore:
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
-                rows = self._conn.execute(
+                rows = self._fetchall(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
                     [*base_args, *order_args, *exact_args, batch_limit, offset],
-                ).fetchall()
+                )
                 if not rows:
                     break
                 add_rows(rows)
@@ -2025,7 +2032,8 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -2034,22 +2042,23 @@ class MessageStore:
         store without reaching its private connection. Requires a live
         connection, matching direct ``_conn.backup(dest)`` use.
         """
-        self._conn.backup(dest)
+        with self._write_lock:
+            self._conn.backup(dest)
 
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
-            conn.close()
-            self._conn = None
+        with self._write_lock:
+            conn = getattr(self, "_conn", None)
+            if conn:
+                # Checkpoint committed WAL frames before releasing the shared
+                # connection; do not race an in-flight fetch on another thread.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass  # best-effort only; don't let this mask the real close()
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

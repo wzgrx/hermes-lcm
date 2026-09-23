@@ -411,8 +411,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if (
                 "_storage_lock" in state
                 and not state.get("_storage_bound", False)
-                and not state.get("_storage_binding", False)
                 and not state.get("_storage_shutdown", False)
+                # The binder itself may read helper attributes while creating
+                # them. Other threads must wait on _storage_lock, not observe
+                # the partially populated _store/_dag attributes.
+                and (
+                    not state.get("_storage_binding", False)
+                    or state.get("_storage_binding_thread_id") != threading.get_ident()
+                )
             ):
                 object.__getattribute__(self, "_ensure_storage")()
         return object.__getattribute__(self, name)
@@ -436,6 +442,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_lock = threading.RLock()
         self._storage_bound = False
         self._storage_binding = False
+        self._storage_binding_thread_id = None
         self._storage_shutdown = False
         self._store = None
         self._dag = None
@@ -756,6 +763,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
         self._storage_shutdown = False
         self._storage_binding = True
+        self._storage_binding_thread_id = threading.get_ident()
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -805,6 +813,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
         finally:
             self._storage_binding = False
+            self._storage_binding_thread_id = None
 
     def _ensure_storage(self) -> None:
         """Bind SQLite helpers on first use of a lazy clone."""
@@ -835,6 +844,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
         state["_storage_bound"] = False
         state["_storage_binding"] = False
+        state["_storage_binding_thread_id"] = None
 
     def _assertion_extraction_model(self) -> str:
         return str(
