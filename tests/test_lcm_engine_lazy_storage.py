@@ -119,8 +119,9 @@ def test_concurrent_first_access_binds_storage_once(tmp_path, monkeypatch):
     monkeypatch.setattr(clone, "_bind_storage", counting_bind)
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            counts = list(pool.map(lambda _: clone._store.get_session_count("session-a"), range(8)))
-        assert counts == [0] * 8
+            stores = list(pool.map(lambda _: clone._store, range(8)))
+        assert all(store is stores[0] for store in stores)
+        assert clone._store.get_session_count("session-a") == 0
         assert bind_calls == 1
     finally:
         clone.shutdown()
