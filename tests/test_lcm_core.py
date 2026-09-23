@@ -1583,6 +1583,15 @@ class TestMessageStore:
             "first_store_id": second,
             "last_store_id": third,
         }
+        assert store.get_session_post_frontier_stats(
+            "sess1", first, before_store_id=third,
+        ) == {
+            "messages": 1,
+            "estimated_tokens": 7,
+            "missing_token_estimate_rows": 0,
+            "first_store_id": second,
+            "last_store_id": second,
+        }
         assert store.get_session_post_frontier_stats("other", third) == {
             "messages": 0,
             "estimated_tokens": 0,
@@ -3754,6 +3763,63 @@ class TestSummaryDAG:
         r = dag.get_node(nid)
         assert r.summary == "FastAPI project setup"
         assert r.source_ids == [1, 2, 3]
+
+    def test_store_leaf_and_frontier_commit_together_and_reject_rollover(self, tmp_path):
+        db_path = tmp_path / "atomic-leaf.db"
+        lifecycle = LifecycleStateStore(db_path)
+        dag = SummaryDAG(db_path)
+        try:
+            lifecycle.bind_session("s1", conversation_id="c1")
+            leaf = SummaryNode(
+                session_id="s1", depth=0, summary="covered prefix",
+                token_count=3, source_token_count=50,
+                source_ids=[1, 2], source_type="messages",
+            )
+            node_id = dag.add_node_with_frontier(
+                leaf, conversation_id="c1", session_id="s1", frontier_store_id=2,
+            )
+            assert dag.get_node(node_id).source_ids == [1, 2]
+            assert lifecycle.get_by_conversation("c1").current_frontier_store_id == 2
+
+            lifecycle.bind_session("s2", conversation_id="c1")
+            with pytest.raises(RuntimeError, match="session binding changed"):
+                dag.add_node_with_frontier(
+                    SummaryNode(
+                        session_id="s1", depth=0, summary="stale",
+                        source_ids=[3], source_type="messages",
+                    ),
+                    conversation_id="c1", session_id="s1", frontier_store_id=3,
+                )
+            assert dag.get_session_node_count("s1") == 1
+            assert lifecycle.get_by_conversation("c1").current_frontier_store_id == 0
+        finally:
+            dag.close()
+            lifecycle.close()
+
+    def test_store_leaf_insert_rolls_back_if_frontier_update_fails(self, tmp_path):
+        db_path = tmp_path / "atomic-leaf-failure.db"
+        lifecycle = LifecycleStateStore(db_path)
+        dag = SummaryDAG(db_path)
+        try:
+            lifecycle.bind_session("s1", conversation_id="c1")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """CREATE TRIGGER block_frontier BEFORE UPDATE ON lcm_lifecycle_state
+                       BEGIN SELECT RAISE(ABORT, 'frontier update failed'); END"""
+                )
+            with pytest.raises(sqlite3.DatabaseError, match="frontier update failed"):
+                dag.add_node_with_frontier(
+                    SummaryNode(
+                        session_id="s1", depth=0, summary="must roll back",
+                        source_ids=[1], source_type="messages",
+                    ),
+                    conversation_id="c1", session_id="s1", frontier_store_id=1,
+                )
+            assert dag.get_session_node_count("s1") == 0
+            assert lifecycle.get_by_conversation("c1").current_frontier_store_id == 0
+        finally:
+            dag.close()
+            lifecycle.close()
 
     def test_session_nodes(self, dag):
         for i in range(3):

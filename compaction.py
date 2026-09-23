@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
+from .reconcile import _strip_replay_identity_shape_tag
 from .sanitize import _contains_sensitive_redaction
 from .store import _normalize_observed_at
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -50,6 +51,68 @@ def _update_cleanup_handoff_digest(digest: Any, value: str) -> None:
 
 
 class CompactionMixin:
+    def _visible_store_ids_from_tail(
+        self, messages: List[Dict[str, Any]],
+    ) -> list[int]:
+        """Align the active window backward to recent durable rows.
+
+        Forward matching can attach a repeated active literal to its oldest
+        hidden copy. A reverse, monotonic suffix match prefers the recent copy
+        without materializing the entire durable session. If the newest active
+        message cannot be proved durable, the caller treats the gap as unknown.
+        """
+        if not messages or len(messages) > 5_000:
+            return []
+        tail = self._store.get_session_tail(
+            self._session_id,
+            min(16_384, max(128, len(messages) * 3)),
+        )
+        if not tail:
+            return []
+
+        def tagless(identity: tuple[str, str, str, str]) -> tuple[str, str, str, str]:
+            return (
+                identity[0],
+                _strip_replay_identity_shape_tag(identity[1]),
+                identity[2],
+                identity[3],
+            )
+
+        stored_identities = [
+            tagless(self._message_replay_identity(row, stored_row=True))
+            for row in tail
+        ]
+        stored_cleanup_identities = [
+            self._active_cleanup_replay_identity(identity, content_is_tagged=False)
+            for identity in stored_identities
+        ]
+        cursor = len(tail) - 1
+        matched: list[int] = []
+        for offset, message in enumerate(reversed(messages)):
+            active_identity = tagless(self._message_replay_identity(message))
+            cleanup_identity = self._active_cleanup_replay_identity(
+                active_identity, content_is_tagged=False,
+            )
+            match_index = cursor
+            while match_index >= 0:
+                stored_identity = stored_identities[match_index]
+                if (
+                    stored_identity == active_identity
+                    or (
+                        cleanup_identity is not None
+                        and stored_cleanup_identities[match_index] == cleanup_identity
+                    )
+                ):
+                    break
+                match_index -= 1
+            if match_index < 0:
+                if offset == 0:
+                    return []
+                continue
+            matched.append(int(tail[match_index]["store_id"]))
+            cursor = match_index - 1
+        return matched
+
     def _invalidate_sanitation_operation(self) -> None:
         with self._sanitation_claim_lock:
             self._pending_sanitation_claim = None
@@ -255,6 +318,37 @@ class CompactionMixin:
                         reason="overflow_recovery",
                     )
                 return False
+        if replay_messages is not None and not self._compression_boundary_cooldown_active():
+            replay_rough = count_messages_tokens(replay_messages)
+            pressure_tokens = max(rough, replay_rough)
+            store_maintenance_due = bool(
+                (self.threshold_tokens > 0 and pressure_tokens >= self.threshold_tokens)
+                or self._critical_budget_pressure_reached(
+                    observed_tokens=pressure_tokens,
+                    messages=replay_messages,
+                )
+            )
+            hidden_leaf = (
+                self._load_hidden_store_leaf_chunk(replay_messages)
+                if store_maintenance_due else None
+            )
+            if hidden_leaf:
+                if self._config.deferred_maintenance_enabled and self._conversation_id:
+                    hidden_bounds = hidden_leaf[2]
+                    self._lifecycle.record_debt(
+                        self._conversation_id,
+                        kind="raw_backlog",
+                        size_estimate=max(
+                            1,
+                            hidden_bounds["estimated_tokens"],
+                            hidden_bounds["messages"],
+                        ),
+                    )
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="hidden_store_prefix",
+                    trigger="store_backlog",
+                )
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
             cleanup_observed_tokens = max(rough, replay_rough)
@@ -579,6 +673,188 @@ class CompactionMixin:
             )
         finally:
             self._current_compress_store_ids_by_message_id = previous_store_id_map
+
+    def _hidden_store_prefix_upper_bound(
+        self, messages: List[Dict[str, Any]],
+    ) -> dict[str, int] | None:
+        """Locate a session-scoped store prefix absent from the active window.
+
+        This is a read-only *upper bound* for the store-backed leaf path.
+        It deliberately stops before both the first mapped active message and
+        the effective protected store tail. DAG coverage, ignored rows, and
+        externalized payload health still need validation before compaction.
+        """
+        if not self._session_id or not self._conversation_id or not messages:
+            return None
+        if self._session_ignored or self._session_stateless:
+            return None
+        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        if state is None or state.current_session_id != self._session_id:
+            return None
+        frontier_store_id = max(
+            int(state.current_frontier_store_id or 0),
+            int(self._last_compacted_store_id or 0),
+        )
+        # A leading system anchor may be stored after the hidden prefix and
+        # later decorated with LCM's note in active context. Exact replay
+        # identity then stops matching, but the anchor is not raw leaf debt.
+        # Skip only a contiguous matching anchor at the frontier boundary;
+        # this is a selection cursor, not a persisted frontier advance.
+        selection_frontier_store_id = frontier_store_id
+        if messages[0].get("role") == "system":
+            first_after_frontier = self._store.get_session_messages_after(
+                self._session_id, after_store_id=frontier_store_id, limit=1,
+            )
+            if first_after_frontier and first_after_frontier[0].get("role") == "system":
+                stored_anchor = str(first_after_frontier[0].get("content") or "")
+                active_anchor = str(messages[0].get("content") or "")
+                if stored_anchor and active_anchor.startswith(stored_anchor):
+                    selection_frontier_store_id = int(first_after_frontier[0]["store_id"])
+        post_frontier = self._store.get_session_post_frontier_stats(
+            self._session_id, selection_frontier_store_id,
+        )
+        if post_frontier["messages"] <= 0:
+            return None
+
+        # The costly identity map is only needed when the store might hold at
+        # least one leaf chunk. A positive estimate below that bar with no
+        # unknown rows can be left to the ordinary active-window path.
+        if (
+            post_frontier["missing_token_estimate_rows"] == 0
+            and post_frontier["estimated_tokens"]
+            < self._raw_backlog_threshold(post_frontier["estimated_tokens"])
+            and not self._has_raw_backlog_debt()
+        ):
+            return None
+        active_store_ids = self._visible_store_ids_from_tail(messages)
+        visible_after_frontier = [
+            store_id for store_id in active_store_ids if store_id > selection_frontier_store_id
+        ]
+        if not visible_after_frontier:
+            return None
+        first_active_store_id = min(visible_after_frontier)
+        fresh_tail, _boundary = self._get_session_fresh_tail(
+            self._session_id, minimum_count=1,
+        )
+        if not fresh_tail:
+            return None
+        first_tail_store_id = int(fresh_tail[0].get("store_id") or 0)
+        before_store_id = min(first_active_store_id, first_tail_store_id)
+        if before_store_id <= selection_frontier_store_id:
+            return None
+        stats = self._store.get_session_post_frontier_stats(
+            self._session_id,
+            selection_frontier_store_id,
+            before_store_id=before_store_id,
+        )
+        if stats["messages"] <= 0:
+            return None
+        return {
+            **stats,
+            "frontier_store_id": selection_frontier_store_id,
+            "before_store_id": before_store_id,
+            "first_active_store_id": first_active_store_id,
+            "first_tail_store_id": first_tail_store_id,
+        }
+
+    def _load_hidden_store_leaf_chunk(
+        self, messages: List[Dict[str, Any]],
+    ) -> tuple[list[Dict[str, Any]], dict[int, int], dict[str, int]] | None:
+        """Materialize a bounded, complete hidden prefix for one leaf pass.
+
+        The returned id map is object-identity based and is valid only for the
+        returned message objects. No state is mutated. A missing sidecar,
+        system row, or incomplete tool group leaves the store untouched.
+        """
+        bounds = self._hidden_store_prefix_upper_bound(messages)
+        if bounds is None:
+            return None
+        target_tokens = self._raw_backlog_threshold(bounds["estimated_tokens"])
+        if (
+            bounds["estimated_tokens"] < target_tokens
+            and bounds["missing_token_estimate_rows"] == 0
+            and not self._has_raw_backlog_debt()
+        ):
+            return None
+        if self._has_raw_backlog_debt() and bounds["estimated_tokens"] > 0:
+            target_tokens = min(target_tokens, bounds["estimated_tokens"])
+
+        selected: list[Dict[str, Any]] = []
+        direct_ids: dict[int, int] = {}
+        after_store_id = bounds["frontier_store_id"]
+        used_tokens = 0
+        used_chars = 0
+        pending_tool_calls: set[str] = set()
+        max_rows = 16_384
+        max_chars = 4_000_000
+        scanned_rows = 0
+        seen_covered_prefix = False
+        while scanned_rows < max_rows:
+            page = self._store.get_session_messages_between(
+                self._session_id,
+                after_store_id=after_store_id,
+                before_store_id=bounds["before_store_id"],
+                limit=min(512, max_rows - scanned_rows),
+            )
+            if not page:
+                break
+            covered_ids = self._dag.get_covered_message_ids(
+                self._session_id,
+                after_store_id=after_store_id,
+                before_store_id=int(page[-1]["store_id"]) + 1,
+            )
+            scanned_rows += len(page)
+            for row in page:
+                after_store_id = int(row["store_id"])
+                if after_store_id in covered_ids:
+                    seen_covered_prefix = True
+                    continue
+                # An already-published D0 leaf may end with an assistant call
+                # whose delayed tool result was not part of its source IDs.
+                # Keep that result as the first raw item instead of losing it
+                # or blocking the entire hidden prefix. The summarizer sees a
+                # serialized transcript, so a leading tool row is valid here.
+                if row["role"] == "system" or (
+                    not selected and row["role"] == "tool" and not seen_covered_prefix
+                ):
+                    return None
+                message = self._store.to_openai_msg(row)
+                original_content = message.get("content")
+                restored_content = self._session_end_prefix_compare_value(
+                    original_content, session_id=self._session_id,
+                )
+                if (
+                    isinstance(original_content, str)
+                    and self._content_has_externalized_placeholder_ref(original_content)
+                    and restored_content == original_content
+                ):
+                    return None
+                if original_content is not None:
+                    message["content"] = restored_content
+                used_chars += len(str(restored_content or ""))
+                if used_chars > max_chars:
+                    return None
+                selected.append(message)
+                direct_ids[id(message)] = after_store_id
+                if not self._matches_ignore_message_patterns(message):
+                    used_tokens += count_message_tokens(message)
+
+                role = str(message.get("role") or "")
+                if role == "assistant":
+                    for call in message.get("tool_calls") or []:
+                        if isinstance(call, dict):
+                            call_id = str(call.get("id") or "")
+                            if call_id:
+                                pending_tool_calls.add(call_id)
+                elif role == "tool":
+                    pending_tool_calls.discard(str(message.get("tool_call_id") or ""))
+                if used_tokens >= target_tokens and not pending_tool_calls:
+                    return selected, direct_ids, bounds
+            if after_store_id >= bounds["before_store_id"] - 1:
+                break
+        if selected and used_tokens > 0 and not pending_tool_calls:
+            return selected, direct_ids, bounds
+        return None
 
     def _leaf_compaction_candidate_status(
         self,
@@ -960,7 +1236,32 @@ class CompactionMixin:
                 "fallback to generic compaction required"
             )
         anchor_source_messages = list(working_messages)
-        pressure_messages = messages if len(messages) == len(working_messages) else working_messages
+        hidden_direct_ids: dict[int, int] = {}
+        store_compaction_due = bool(
+            force
+            or cleanup_threshold_reached
+            or self._critical_budget_pressure_reached(
+                observed_tokens=cleanup_observed_tokens,
+                messages=working_messages,
+            )
+        )
+        hidden_leaf = (
+            self._load_hidden_store_leaf_chunk(working_messages)
+            if store_compaction_due else None
+        )
+        if hidden_leaf is not None:
+            hidden_messages, hidden_direct_ids, _hidden_bounds = hidden_leaf
+            anchor_count = self._leading_anchor_count(working_messages)
+            working_messages = (
+                working_messages[:anchor_count]
+                + hidden_messages
+                + working_messages[anchor_count:]
+            )
+        pressure_messages = (
+            working_messages
+            if hidden_direct_ids or len(messages) != len(working_messages)
+            else messages
+        )
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
@@ -1115,9 +1416,15 @@ class CompactionMixin:
                     break
 
             if candidate_start < fresh_tail_start:
-                self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(
-                    working_messages[leading_anchor_count:]
+                mapping_input = [
+                    message for message in working_messages[leading_anchor_count:]
+                    if id(message) not in hidden_direct_ids
+                ]
+                self._current_compress_store_ids_by_message_id = (
+                    self._get_store_id_map_for_messages(mapping_input)
+                    if mapping_input else {}
                 )
+                self._current_compress_store_ids_by_message_id.update(hidden_direct_ids)
                 compactable_pairs = list(
                     zip(
                         working_messages[candidate_start:fresh_tail_start],
@@ -1216,7 +1523,14 @@ class CompactionMixin:
 
             pressure_candidate_raw = pressure_messages[leading_anchor_count:fresh_tail_start]
             raw_tokens_outside_tail = count_messages_tokens(pressure_candidate_raw)
-            if threshold_full_sweep_active:
+            hidden_candidate_raw = [
+                message for message in candidate_raw if id(message) in hidden_direct_ids
+            ]
+            if hidden_candidate_raw:
+                # The loader already bounded and protected this prefix. Do not
+                # mix later active-window rows into its source lineage.
+                to_compact = hidden_candidate_raw
+            elif threshold_full_sweep_active:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(
                     raw_tokens_outside_tail
                 )
@@ -1329,9 +1643,20 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            if all(id(message) in hidden_direct_ids for message in source_lookup_chunk):
+                source_map = hidden_direct_ids
+            else:
+                source_map = self._get_store_id_map_for_messages(source_lookup_chunk)
+                source_map.update(hidden_direct_ids)
+            source_store_ids = [
+                source_map[id(message)] for message in source_lineage_chunk
+                if id(message) in source_map
+            ]
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            consumed_store_ids = [
+                source_map[id(message)] for message in source_lookup_chunk
+                if id(message) in source_map
+            ]
             consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
@@ -1349,18 +1674,60 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
+            store_backed_leaf = any(
+                id(message) in hidden_direct_ids for message in source_lookup_chunk
+            )
+            if store_backed_leaf:
+                if not source_store_ids or not consumed_store_ids:
+                    raise RuntimeError("store-backed leaf lacks exact source lineage")
+                pending_calls: set[str] = set()
+                for message in source_lookup_chunk:
+                    if message.get("role") == "assistant":
+                        for call in message.get("tool_calls") or []:
+                            if isinstance(call, dict) and call.get("id"):
+                                pending_calls.add(str(call["id"]))
+                    elif message.get("role") == "tool":
+                        pending_calls.discard(str(message.get("tool_call_id") or ""))
+                if pending_calls:
+                    raise RuntimeError(
+                        "store-backed leaf rescue stopped inside an assistant tool group"
+                    )
+                self._dag.add_node_with_frontier(
+                    node,
+                    conversation_id=self._conversation_id,
+                    session_id=self._session_id,
+                    frontier_store_id=max(consumed_store_ids),
+                )
+            else:
+                self._dag.add_node(node)
             self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
+            if not store_backed_leaf:
+                self._persist_frontier_marker()
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
-            working_messages = working_messages[:leading_anchor_count] + remaining_messages
-            pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
+            working_messages = working_messages[:leading_anchor_count] + [
+                message for message in remaining_messages
+                if id(message) not in hidden_direct_ids
+            ]
+            pressure_messages = pressure_messages[:leading_anchor_count] + [
+                message for message in pressure_remaining_messages
+                if id(message) not in hidden_direct_ids
+            ]
             leaf_compacted_this_turn = True
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
+
+            if store_backed_leaf:
+                remaining_hidden = self._store.get_session_post_frontier_stats(
+                    self._session_id,
+                    self._last_compacted_store_id,
+                    before_store_id=_hidden_bounds["before_store_id"],
+                )
+                if remaining_hidden["messages"] > 0:
+                    sweep_stop_reason = "store_prefix_remaining"
+                    break
 
             if threshold_full_sweep_active:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
@@ -1405,6 +1772,11 @@ class CompactionMixin:
             sweep_stop_reason = "pass_budget_exhausted"
 
         if not leaf_compacted_this_turn:
+            if hidden_direct_ids:
+                working_messages = [
+                    message for message in working_messages
+                    if id(message) not in hidden_direct_ids
+                ]
             self._refresh_raw_backlog_debt(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,
@@ -1575,6 +1947,7 @@ class CompactionMixin:
             partial_stop_reasons = {
                 "pass_budget_exhausted",
                 "time_budget_exhausted",
+                "store_prefix_remaining",
                 "leaf_summary_error",
                 "condensation_error",
                 "condensation_no_progress",

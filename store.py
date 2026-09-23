@@ -1255,7 +1255,11 @@ class MessageStore:
         return row[0] if row else 0
 
     def get_session_post_frontier_stats(
-        self, session_id: str, frontier_store_id: int,
+        self,
+        session_id: str,
+        frontier_store_id: int,
+        *,
+        before_store_id: int | None = None,
     ) -> Dict[str, int]:
         """Read-only source-row estimate beyond one session's lifecycle frontier.
 
@@ -1264,14 +1268,18 @@ class MessageStore:
         still fall inside this range. The `(session_id, store_id)` index keeps
         the scan scoped to one session without materializing message content.
         """
+        upper_predicate = " AND store_id < ?" if before_store_id is not None else ""
+        params: tuple[Any, ...] = (session_id, max(0, int(frontier_store_id)))
+        if before_store_id is not None:
+            params += (int(before_store_id),)
         row = self._fetchone(
-            """SELECT COUNT(*),
+            f"""SELECT COUNT(*),
                       COALESCE(SUM(CASE WHEN token_estimate > 0 THEN token_estimate ELSE 0 END), 0),
                       COALESCE(SUM(CASE WHEN token_estimate IS NULL OR token_estimate <= 0 THEN 1 ELSE 0 END), 0),
                       COALESCE(MIN(store_id), 0),
                       COALESCE(MAX(store_id), 0)
-               FROM messages WHERE session_id = ? AND store_id > ?""",
-            (session_id, max(0, int(frontier_store_id))),
+               FROM messages WHERE session_id = ? AND store_id > ?{upper_predicate}""",
+            params,
         )
         return {
             "messages": int(row[0]) if row else 0,

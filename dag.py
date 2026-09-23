@@ -270,6 +270,90 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
+    def add_node_with_frontier(
+        self,
+        node: SummaryNode,
+        *,
+        conversation_id: str,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> int:
+        """Publish one store-backed leaf and its lifecycle cursor atomically.
+
+        The separate lifecycle connection may roll over a conversation while
+        summarization is in flight. SQLite's writer lock and the guarded state
+        check make that a rollback, rather than an orphan node or a cursor that
+        claims coverage of unpublished source rows.
+        """
+        if node.session_id != session_id or node.depth != 0 or node.source_type != "messages":
+            raise ValueError("store-backed frontier publication requires a matching D0 message leaf")
+        if not node.source_ids or max(node.source_ids) > frontier_store_id:
+            raise ValueError("frontier must cover every published leaf source id")
+        with self._db_lock:
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                bound = conn.execute(
+                    "SELECT current_session_id FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if bound is None or bound[0] != session_id:
+                    raise RuntimeError("session binding changed during store-backed compaction")
+                cur = conn.execute(
+                    """INSERT INTO summary_nodes
+                       (session_id, depth, summary, token_count, source_token_count,
+                        source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        node.session_id,
+                        node.depth,
+                        node.summary,
+                        node.token_count,
+                        node.source_token_count,
+                        json.dumps(node.source_ids),
+                        node.source_type,
+                        node.created_at or time.time(),
+                        node.earliest_at,
+                        node.latest_at,
+                        node.expand_hint,
+                    ),
+                )
+                conn.execute(
+                    """UPDATE lcm_lifecycle_state
+                       SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                           updated_at = ?
+                       WHERE conversation_id = ? AND current_session_id = ?""",
+                    (frontier_store_id, time.time(), conversation_id, session_id),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            node.node_id = cur.lastrowid
+            return node.node_id
+
+    def get_covered_message_ids(
+        self,
+        session_id: str,
+        *,
+        after_store_id: int,
+        before_store_id: int,
+    ) -> set[int]:
+        """Return D0 source IDs already represented inside one cursor range."""
+        if before_store_id <= after_store_id:
+            return set()
+        with self._db_lock:
+            rows = self._conn.execute(
+                """SELECT DISTINCT CAST(j.value AS INTEGER)
+                   FROM summary_nodes AS n, json_each(n.source_ids) AS j
+                   WHERE n.session_id = ? AND n.depth = 0
+                     AND n.source_type = 'messages'
+                     AND CAST(j.value AS INTEGER) > ?
+                     AND CAST(j.value AS INTEGER) < ?""",
+                (session_id, int(after_store_id), int(before_store_id)),
+            ).fetchall()
+        return {int(row[0]) for row in rows}
+
     @staticmethod
     def stage_delete_session_scope(
         conn: sqlite3.Connection,

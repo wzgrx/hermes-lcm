@@ -2411,9 +2411,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> bool:
         if not self._has_raw_backlog_debt():
             return False
-        raw_tokens = self._raw_backlog_tokens(messages)
+        hidden_bounds = self._hidden_store_prefix_upper_bound(messages)
+        hidden_ready = bool(
+            hidden_bounds and self._load_hidden_store_leaf_chunk(messages)
+        )
+        raw_tokens = max(
+            self._raw_backlog_tokens(messages),
+            int(hidden_bounds["estimated_tokens"]) if hidden_ready else 0,
+        )
         if raw_tokens <= 0:
             return False
+        if (
+            hidden_ready
+            and self.threshold_tokens > 0
+            and observed_tokens is not None
+            and observed_tokens >= self.threshold_tokens
+        ):
+            return True
         if raw_tokens >= self._raw_backlog_threshold(raw_tokens):
             return True
         return self._critical_budget_pressure_reached(
@@ -2429,14 +2443,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> None:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
             return
-        raw_tokens = self._raw_backlog_tokens(messages)
+        hidden_bounds = self._hidden_store_prefix_upper_bound(messages)
+        raw_tokens = max(
+            self._raw_backlog_tokens(messages),
+            int(hidden_bounds["estimated_tokens"]) if hidden_bounds else 0,
+        )
         threshold = self._raw_backlog_threshold(raw_tokens) if raw_tokens > 0 else 0
         keep_under_critical_pressure = (
             raw_tokens > 0
             and self._has_raw_backlog_debt()
-            and self._critical_budget_pressure_reached(
-                observed_tokens=observed_tokens,
-                messages=messages,
+            and (
+                bool(hidden_bounds and hidden_bounds["messages"] > 0)
+                or self._critical_budget_pressure_reached(
+                    observed_tokens=observed_tokens,
+                    messages=messages,
+                )
             )
         )
         if raw_tokens > 0 and (raw_tokens >= threshold or keep_under_critical_pressure):
