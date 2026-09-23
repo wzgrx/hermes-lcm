@@ -31,7 +31,7 @@ from .codex_routing import (
 from .config import LCMConfig
 from .db_bootstrap import join_background_integrity_scans
 from .dag import SummaryDAG, SummaryNode
-from .diagnostics import _enforce_state_db_containment
+from .diagnostics import _enforce_state_db_containment, inspect_orphaned_sqlite_handles
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
@@ -154,8 +154,12 @@ _ROLLUP_INTEGRITY_RETRY_UNTIL: dict[str, float] = {}
 _ROLLUP_INTEGRITY_RETRY_LOCK = threading.Lock()
 
 
+class _RollupPreflightFailure(RuntimeError):
+    """An actionable background-only maintenance gate, not a turn failure."""
+
+
 def _rollup_integrity_preflight(database_path: Path) -> bool:
-    """Check incident-critical SQLite tables before optional background writes.
+    """Check SQLite handles and incident-critical tables before background writes.
 
     A partial integrity check is fast on a large message corpus while covering
     the metadata autoindex damaged in upstream #601. Failure defers repeated
@@ -169,12 +173,17 @@ def _rollup_integrity_preflight(database_path: Path) -> bool:
             return False
         _ROLLUP_INTEGRITY_RETRY_UNTIL.pop(key, None)
     try:
+        handles = inspect_orphaned_sqlite_handles(database_path)
+        if handles["status"] == "fail":
+            raise _RollupPreflightFailure("orphaned SQLite handles detected")
+        if handles["status"] == "partial":
+            raise _RollupPreflightFailure("orphaned SQLite handles not ruled out")
         with closing(sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True, timeout=3.0)) as conn:
             for table in ("metadata", "lcm_migration_state"):
                 result = conn.execute(f"PRAGMA integrity_check('{table}')").fetchone()
                 if result is None or result[0] != "ok":
                     raise sqlite3.DatabaseError(f"{table} integrity check failed")
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, sqlite3.Error, _RollupPreflightFailure) as exc:
         if isinstance(exc, sqlite3.Error) and _is_sqlite_locked_error(exc):
             logger.debug("LCM rollup integrity preflight deferred by a transient SQLite lock")
             return False
@@ -187,11 +196,12 @@ def _rollup_integrity_preflight(database_path: Path) -> bool:
                 oldest = min(_ROLLUP_INTEGRITY_RETRY_UNTIL, key=_ROLLUP_INTEGRITY_RETRY_UNTIL.get)
                 _ROLLUP_INTEGRITY_RETRY_UNTIL.pop(oldest, None)
             _ROLLUP_INTEGRITY_RETRY_UNTIL[key] = now + _ROLLUP_INTEGRITY_RETRY_SECONDS
+        detail = str(exc) if isinstance(exc, _RollupPreflightFailure) else type(exc).__name__
         logger.error(
-            "LCM background rollup maintenance deferred for %.0fs: targeted SQLite integrity preflight failed "
+            "LCM background rollup maintenance deferred for %.0fs: SQLite integrity/handle preflight failed "
             "(%s); inspect with /lcm doctor before further maintenance",
             _ROLLUP_INTEGRITY_RETRY_SECONDS,
-            type(exc).__name__,
+            detail,
         )
         return False
     return True

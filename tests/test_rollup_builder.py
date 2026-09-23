@@ -816,12 +816,12 @@ def test_rollup_integrity_preflight_checks_metadata_and_bounds_retries(tmp_path,
         conn.execute("DROP TABLE metadata")
     caplog.set_level("ERROR", logger="hermes_lcm.engine")
     assert not engine_module._rollup_integrity_preflight(db_path)
-    assert "targeted SQLite integrity preflight failed" in caplog.text
+    assert "SQLite integrity/handle preflight failed" in caplog.text
 
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
     assert not engine_module._rollup_integrity_preflight(db_path)
-    assert caplog.text.count("targeted SQLite integrity preflight failed") == 1
+    assert caplog.text.count("SQLite integrity/handle preflight failed") == 1
 
     monkeypatch.setitem(engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL, str(db_path), time.monotonic() - 1)
     assert engine_module._rollup_integrity_preflight(db_path)
@@ -836,6 +836,31 @@ def test_rollup_integrity_preflight_does_not_cache_transient_lock(tmp_path, monk
     monkeypatch.setattr(engine_module.sqlite3, "connect", locked)
     assert not engine_module._rollup_integrity_preflight(db_path)
     assert str(db_path) not in engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL
+
+
+@pytest.mark.parametrize("handle_status", ["fail", "partial"])
+def test_rollup_preflight_defers_when_sqlite_handle_scan_is_not_clean(
+    tmp_path, monkeypatch, caplog, handle_status
+):
+    db_path = tmp_path / "rollup-orphaned-handles.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE lcm_migration_state (step_name TEXT PRIMARY KEY)")
+    monkeypatch.setattr(
+        engine_module,
+        "inspect_orphaned_sqlite_handles",
+        lambda path: {
+            "status": handle_status,
+            "orphaned": [{"artifact": "wal"}] if handle_status == "fail" else [],
+        },
+    )
+    caplog.set_level("ERROR", logger="hermes_lcm.engine")
+
+    assert not engine_module._rollup_integrity_preflight(db_path)
+    assert "SQLite integrity/handle preflight failed" in caplog.text
+    assert "orphaned SQLite handles" in caplog.text
+    assert not engine_module._rollup_integrity_preflight(db_path)
+    assert caplog.text.count("SQLite integrity/handle preflight failed") == 1
 
 
 def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(

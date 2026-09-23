@@ -78,4 +78,9 @@ background rollup passes for five minutes, with one operator-visible error;
 a transient SQLite lock skips only that pass. Regression tests cover the
 write gate, targeted check, bounded retries, and lock behavior. Partial checks
 are not a whole-database integrity certification, and the broader WAL unlink
-root cause remains under investigation.
+root cause remains under investigation. A later preflight also checks the
+same-user `/proc` file-descriptor scan before touching SQLite; a deleted
+database/WAL/SHM handle or an inconclusive scan defers optional rollup writes
+for the same five-minute window, even if a fresh connection would pass the
+partial integrity check. The live scan on this WSL host took about 3.5 ms.
+This is a containment gate, not proof that the WAL unlink cause is fixed.
