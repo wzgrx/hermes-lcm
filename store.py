@@ -481,6 +481,14 @@ class MessageStore:
             cursor = self._conn.execute(query) if params is None else self._conn.execute(query, params)
             return cursor.fetchall()
 
+    def read_rows(self, query: str, params: Any = None) -> list[Any]:
+        """Read fully materialized rows under the shared-connection lock.
+
+        Other plugin modules should use this instead of ``connection.execute``
+        when a gateway turn may read the same MessageStore concurrently.
+        """
+        return self._fetchall(query, params)
+
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
