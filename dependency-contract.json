@@ -68,11 +68,12 @@
     "hermes_cli": {
       "distribution": "hermes-agent",
       "availability": "optional",
-      "scope": "host home, provider routing, and plugin hook integration",
+      "scope": "host home, provider routing, plugin hook integration, and read-only SQLite journal config inspection",
       "version_policy": "Hermes Agent >=0.16,<1; each compatibility path has an explicit fallback",
       "imported_api": [
         "hermes_cli.auth.PROVIDER_REGISTRY",
         "hermes_cli.config.get_hermes_home",
+        "hermes_cli.config.load_config_readonly",
         "hermes_cli.plugins.get_plugin_manager",
         "hermes_cli.runtime_provider._get_named_custom_provider"
       ]

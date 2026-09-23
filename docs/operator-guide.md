@@ -689,6 +689,11 @@ content/tool-call rows, suspicious inline `data:*;base64` rows, suspicious long
 base64-looking rows, and aggregate externalized-payload stats.
 Doctor output is metadata-only for these scans; it intentionally does not print
 raw payload previews.
+The `journal_mode_config` check compares the readable host
+`database.journal_mode` setting with the live SQLite mode. An unreadable
+configuration, an invalid setting, or an explicit/actual mismatch is a warning,
+not a live-mode conversion. Check config readability and close all SQLite
+connections before any deliberate offline WAL-to-DELETE conversion.
 
 Externalized-payload integrity is state-aware. References in plugin-local
 `lcm.db` and host-owned `state.db` both keep a payload live; doctor reports the

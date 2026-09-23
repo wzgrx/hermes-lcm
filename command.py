@@ -20,6 +20,7 @@ from .db_bootstrap import (
     check_external_content_fts_integrity,
     external_content_fts_needs_repair,
     inspect_lcm_schema_health,
+    journal_config_diagnostic,
     join_background_integrity_scans,
     load_integrity_failed,
     remediate_interim_schema_stamp,
@@ -1401,6 +1402,12 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         journal_mode = f"error: {exc}"
         issues.append("sqlite_journal_mode")
+    journal_config = journal_config_diagnostic(journal_mode)
+    if journal_config["status"] in {"unreadable", "invalid", "mismatch"}:
+        recommended_actions.append(
+            "inspect Hermes database.journal_mode and config readability; "
+            "if a mode change is intentional, close every database connection before converting the file"
+        )
     try:
         quick_row = store_conn.execute("PRAGMA quick_check").fetchone()
         quick_check = str(quick_row[0]) if quick_row else "unknown"
@@ -1642,6 +1649,8 @@ def _doctor_text(engine) -> str:
         )
 
     triage_checks: list[dict[str, Any]] = []
+    if journal_config["status"] in {"unreadable", "invalid", "mismatch"}:
+        triage_checks.append({"check": "journal_mode_config", "status": "warn", "detail": journal_config})
     if integrity != "ok":
         triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
     if orphaned_handles["status"] in {"fail", "partial"}:
@@ -1724,6 +1733,8 @@ def _doctor_text(engine) -> str:
         f"schema_missing_tables: {', '.join(schema_missing_tables) or '(none)'}",
         f"schema_existing_tables: {', '.join(schema_existing_tables) or '(none)'}",
         f"journal_mode: {journal_mode}",
+        f"journal_config_status: {journal_config['status']}",
+        f"requested_journal_mode: {journal_config['requested_mode']}",
         f"quick_check: {quick_check}",
         f"sqlite_integrity: {integrity}",
         f"messages_total: {total_messages}",

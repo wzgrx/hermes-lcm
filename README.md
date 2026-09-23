@@ -662,6 +662,13 @@ dropping data.
 `lcm_doctor` reports SQLite `journal_mode`, `quick_check`, database/WAL sizes,
 largest content/tool-call rows, suspicious inline payload rows, and aggregate
 externalized-payload stats. Doctor output is metadata-only for these scans.
+It also reports `journal_mode_config`: an unreadable host config, an invalid
+`database.journal_mode`, or a mismatch between an explicit setting and the
+active database mode yields a warning. When the host config cannot be read,
+LCM logs a one-time warning rather than silently presenting default WAL as the
+operator's choice. This is diagnostic only: Hermes still owns journal-mode
+selection, and an existing live WAL database is never converted to DELETE by
+the doctor. Close all connections before an intentional offline conversion.
 
 The integrity inventory treats refs found in either `lcm.db` or the host
 `state.db` as live. A payload referenced only by host history is reported as a

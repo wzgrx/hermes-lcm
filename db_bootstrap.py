@@ -20,6 +20,54 @@ from contextlib import contextmanager
 from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
+_journal_config_warned = False
+_journal_config_warn_lock = threading.Lock()
+
+
+def inspect_host_journal_config() -> dict[str, str]:
+    """Read the host's journal preference without hiding config read failures.
+
+    The host WAL helper owns the actual mode decision. This inspection is only
+    for diagnostics, and intentionally never includes config values or exception
+    messages that might contain credentials.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except ImportError as exc:
+        try:
+            import hermes_state_wal  # noqa: F401 - distinguish host fallback from broken config import
+        except Exception:
+            return {"status": "unavailable", "requested_mode": "wal"}
+        return {
+            "status": "unreadable",
+            "requested_mode": "unknown",
+            "error_type": type(exc).__name__,
+        }
+    except Exception as exc:
+        return {
+            "status": "unreadable",
+            "requested_mode": "unknown",
+            "error_type": type(exc).__name__,
+        }
+    database = config.get("database", {}) if isinstance(config, dict) else {}
+    if not isinstance(database, dict) or "journal_mode" not in database:
+        return {"status": "default", "requested_mode": "wal"}
+    raw = database["journal_mode"]
+    mode = raw.strip().lower() if isinstance(raw, str) else ""
+    if mode in {"wal", "delete"}:
+        return {"status": "configured", "requested_mode": mode}
+    return {"status": "invalid", "requested_mode": "wal"}
+
+
+def journal_config_diagnostic(actual_mode: str) -> dict[str, str]:
+    """Describe a config read failure or explicit/actual mode discrepancy."""
+    result = inspect_host_journal_config()
+    status = result["status"]
+    if status == "configured" and result["requested_mode"] != actual_mode.lower():
+        return {**result, "status": "mismatch", "actual_mode": actual_mode}
+    return {**result, "actual_mode": actual_mode}
 
 
 class SchemaVersionTooNewError(RuntimeError):
@@ -139,6 +187,17 @@ def configure_connection(conn: sqlite3.Connection) -> None:
         _execute_wal_conversion_with_lock_retry(conn)
         mode = "wal"
     else:
+        config_read = inspect_host_journal_config()
+        if config_read["status"] == "unreadable":
+            global _journal_config_warned
+            with _journal_config_warn_lock:
+                if not _journal_config_warned:
+                    logger.warning(
+                        "database.journal_mode config unreadable (%s); "
+                        "Hermes may use default WAL instead of the requested mode",
+                        config_read["error_type"],
+                    )
+                    _journal_config_warned = True
         mode = _apply_host_journal_mode_with_lock_retry(
             conn, apply_wal_with_fallback,
         )

@@ -34,6 +34,7 @@ from .dag import build_nodes_fts_spec
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
+    journal_config_diagnostic,
     load_integrity_failed,
 )
 from .extraction import sanitize_pre_compaction_content
@@ -6780,6 +6781,14 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "database_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
                 "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
             },
+        })
+        journal_config = journal_config_diagnostic(
+            str(journal_mode_row[0]) if journal_mode_row else "unknown"
+        )
+        checks.append({
+            "check": "journal_mode_config",
+            "status": "warn" if journal_config["status"] in {"unreadable", "invalid", "mismatch"} else "pass",
+            "detail": journal_config,
         })
         payload_risks = scan_sqlite_payload_risks(engine._store.connection)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)

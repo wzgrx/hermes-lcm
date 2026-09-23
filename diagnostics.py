@@ -204,6 +204,18 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
             rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
     elif name == "sqlite_storage":
         command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
+    elif name == "journal_mode_config":
+        action = DOCTOR_ACTION_INSPECT
+        warning_only = True
+        if isinstance(detail, dict) and detail.get("status") == "unreadable":
+            command = "check Hermes config readability and database.journal_mode; the host may have used default WAL"
+            rationale = "a config read error can silently hide an explicitly selected SQLite journal mode"
+        elif isinstance(detail, dict) and detail.get("status") == "invalid":
+            command = "set Hermes database.journal_mode to wal or delete, then rerun doctor"
+            rationale = "the host defaults to WAL for invalid journal modes"
+        else:
+            command = "verify the requested and actual journal modes; close all DB connections before an intentional offline mode conversion"
+            rationale = "Hermes preserves an existing live WAL database instead of downgrading it in place"
     elif name == "payload_storage":
         missing_refs = 0
         heartbeat_rows = 0

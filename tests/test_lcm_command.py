@@ -507,6 +507,31 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "triage_guidance:\n- none" in result
 
 
+@pytest.mark.parametrize("config_status", ["unreadable", "invalid", "mismatch"])
+def test_both_doctors_surface_journal_config_problem(engine, monkeypatch, config_status):
+    finding = {
+        "status": config_status,
+        "requested_mode": "delete" if config_status == "mismatch" else "wal",
+        "actual_mode": "wal",
+    }
+    if config_status == "unreadable":
+        finding["error_type"] = "PermissionError"
+    monkeypatch.setattr(command_mod, "journal_config_diagnostic", lambda mode: finding)
+    monkeypatch.setattr(lcm_tools, "journal_config_diagnostic", lambda mode: finding)
+
+    text = handle_lcm_command("doctor", engine)
+    assert "status: action-recommended" in text
+    assert f"journal_config_status: {config_status}" in text
+    assert f"requested_journal_mode: {finding['requested_mode']}" in text
+    assert "journal_mode_config: inspect warning-only" in text
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    check = next(item for item in payload["checks"] if item["check"] == "journal_mode_config")
+    assert check == {"check": "journal_mode_config", "status": "warn", "detail": finding}
+    assert payload["overall"] == "warnings"
+    assert any(item["check"] == "journal_mode_config" for item in payload["guidance"])
+
+
 def test_both_doctors_surface_orphaned_wal_even_when_integrity_is_ok(engine, monkeypatch):
     finding = {
         "status": "fail", "scope": "same_uid_accessible_processes",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import threading
+import logging
 from types import ModuleType
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from hermes_lcm.db_bootstrap import (
     configure_connection,
     ensure_message_origin_columns,
 )
+import hermes_lcm.db_bootstrap as db_bootstrap
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.lifecycle_state import LifecycleStateStore
@@ -75,6 +77,64 @@ class TestConfigureConnectionPragmas:
 
         assert calls == ["lcm.db"]
         assert mode == configured_mode
+
+    def test_unreadable_host_config_is_reported_once(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ):
+        host_module = ModuleType("hermes_state_wal")
+        host_module.apply_wal_with_fallback = lambda conn, **kwargs: conn.execute(
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0].lower()
+        config_module = ModuleType("hermes_cli.config")
+
+        def unreadable():
+            raise PermissionError("synthetic config read failure")
+
+        config_module.load_config_readonly = unreadable
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", host_module)
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
+        monkeypatch.setattr(db_bootstrap, "_journal_config_warned", False, raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(2):
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    configure_connection(conn)
+                finally:
+                    conn.close()
+
+        warnings = [record.message for record in caplog.records if "database.journal_mode" in record.message]
+        assert len(warnings) == 1
+        assert "PermissionError" in warnings[0]
+        assert "synthetic config read failure" not in warnings[0]
+        assert db_bootstrap.inspect_host_journal_config()["status"] == "unreadable"
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            ({}, {"status": "default", "requested_mode": "wal"}),
+            ({"database": {"journal_mode": " DELETE "}}, {"status": "configured", "requested_mode": "delete"}),
+            ({"database": {"journal_mode": "unsupported"}}, {"status": "invalid", "requested_mode": "wal"}),
+        ],
+    )
+    def test_host_journal_config_inspection(self, monkeypatch, config, expected):
+        config_module = ModuleType("hermes_cli.config")
+        config_module.load_config_readonly = lambda: config
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
+
+        assert db_bootstrap.inspect_host_journal_config() == expected
+        actual = db_bootstrap.journal_config_diagnostic("wal")
+        assert actual["status"] == ("mismatch" if expected["requested_mode"] == "delete" else expected["status"])
+        assert actual["actual_mode"] == "wal"
+
+    def test_missing_config_import_with_host_helper_is_unreadable(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", ModuleType("hermes_state_wal"))
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+
+        diagnostic = db_bootstrap.inspect_host_journal_config()
+        assert diagnostic == {
+            "status": "unreadable", "requested_mode": "unknown", "error_type": "ModuleNotFoundError",
+        }
 
     def test_host_journal_mode_retries_transient_startup_lock(
         self, db_path: Path, monkeypatch: pytest.MonkeyPatch,
