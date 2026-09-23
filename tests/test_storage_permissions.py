@@ -476,15 +476,7 @@ def test_maintenance_creates_private_backups_and_tightens_existing_slot(tmp_path
     backup_dir.chmod(0o755)
     rotate_path = backup_dir / "rotate-latest.sqlite3"
     rotate_path.write_bytes(b"stale")
-    rotate_sidecars = [
-        rotate_path.with_name(rotate_path.name + suffix)
-        for suffix in _SQLITE_SIDECAR_SUFFIXES
-    ]
-    for artifact in [rotate_path, *rotate_sidecars]:
-        if not artifact.exists():
-            artifact.write_bytes(b"stale")
-        artifact.chmod(0o644)
-
+    rotate_path.chmod(0o644)
     engine = SimpleNamespace(
         _store=store,
         _dag=SimpleNamespace(_conn=store.connection),
@@ -504,6 +496,9 @@ def test_maintenance_creates_private_backups_and_tightens_existing_slot(tmp_path
         _assert_private_sqlite_artifacts(timestamped["backup_path"])
         _assert_private_sqlite_artifacts(rotate_path)
         assert not rotate_path.with_name(rotate_path.name + ".tmp").exists()
+        assert not list(backup_dir.glob("*.tmp*"))
+        assert timestamped["integrity_check"] == "ok"
+        assert rotated["integrity_check"] == "ok"
 
         for backup_path in (timestamped["backup_path"], rotate_path):
             with sqlite3.connect(backup_path) as restored:
@@ -593,6 +588,94 @@ def test_maintenance_rejects_symlinked_backup_directory_before_chmod(
         store.close()
 
 
+def test_rotate_preserves_prior_slot_when_old_name_sidecar_exists(tmp_path):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    store.append("session", {"role": "user", "content": "new content"})
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    rotate_path = backup_dir / "rotate-latest.sqlite3"
+    old_content = b"prior snapshot"
+    rotate_path.write_bytes(old_content)
+    old_wal = rotate_path.with_name(rotate_path.name + "-wal")
+    old_wal.write_bytes(b"prior WAL")
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        rotate_backup_path=lambda: rotate_path,
+    )
+    try:
+        result = rotate_backup_database(engine)
+        assert result["ok"] is False
+        assert "sidecar exists" in result["error"]
+        assert rotate_path.read_bytes() == old_content
+        assert old_wal.read_bytes() == b"prior WAL"
+        assert not list(backup_dir.glob(".rotate-latest.sqlite3.*.tmp*"))
+    finally:
+        store.close()
+
+
+def test_rotate_preserves_slot_when_sidecar_appears_during_verification(tmp_path, monkeypatch):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    store.append("session", {"role": "user", "content": "new content"})
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    rotate_path = backup_dir / "rotate-latest.sqlite3"
+    rotate_path.write_bytes(b"prior snapshot")
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        rotate_backup_path=lambda: rotate_path,
+    )
+    verify = maintenance_module._verify_backup_integrity
+
+    def sidecar_arrives(stage):
+        verify(stage)
+        rotate_path.with_name(rotate_path.name + "-wal").write_bytes(b"late WAL")
+
+    monkeypatch.setattr(maintenance_module, "_verify_backup_integrity", sidecar_arrives)
+    try:
+        result = rotate_backup_database(engine)
+        assert result["ok"] is False
+        assert "sidecar exists" in result["error"]
+        assert rotate_path.read_bytes() == b"prior snapshot"
+        assert not list(backup_dir.glob(".rotate-latest.sqlite3.*.tmp*"))
+    finally:
+        store.close()
+
+
+def test_rotate_uses_unique_stage_without_touching_another_attempt(tmp_path):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    store.append("session", {"role": "user", "content": "backup"})
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    rotate_path = backup_dir / "rotate-latest.sqlite3"
+    other_stage = backup_dir / "rotate-latest.sqlite3.tmp"
+    other_wal = backup_dir / "rotate-latest.sqlite3.tmp-wal"
+    other_stage.write_bytes(b"other worker")
+    other_wal.write_bytes(b"other wal")
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        rotate_backup_path=lambda: rotate_path,
+    )
+    try:
+        result = rotate_backup_database(engine)
+        assert result["ok"] is True
+        assert other_stage.read_bytes() == b"other worker"
+        assert other_wal.read_bytes() == b"other wal"
+        assert not list(backup_dir.glob(".rotate-latest.sqlite3.*.tmp*"))
+        with sqlite3.connect(rotate_path) as restored:
+            assert restored.execute("SELECT content FROM messages").fetchone()[0] == "backup"
+    finally:
+        store.close()
+
+
 def test_rotate_backup_failure_preserves_existing_atomic_slot(tmp_path, monkeypatch):
     db_path = tmp_path / "database" / "lcm.db"
     store = MessageStore(db_path)
@@ -626,6 +709,42 @@ def test_rotate_backup_failure_preserves_existing_atomic_slot(tmp_path, monkeypa
         assert _mode(backup_dir) == 0o700
         assert _mode(rotate_path) == 0o600
         assert not rotate_path.with_name(rotate_path.name + ".tmp").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("operation", ["timestamped", "rotate"])
+def test_integrity_failure_never_publishes_staged_backup(tmp_path, monkeypatch, operation):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    store.append("session", {"role": "user", "content": "backup"})
+    backup_dir = tmp_path / "backups"
+    rotate_path = backup_dir / "rotate-latest.sqlite3"
+    backup_dir.mkdir()
+    rotate_path.write_bytes(b"prior-restore-point")
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        backup_dir=lambda: backup_dir,
+        rotate_backup_path=lambda: rotate_path,
+    )
+
+    def fail_integrity(_path):
+        raise sqlite3.DatabaseError("synthetic integrity failure")
+
+    monkeypatch.setattr(maintenance_module, "_verify_backup_integrity", fail_integrity)
+    try:
+        result = (
+            backup_database(engine) if operation == "timestamped"
+            else rotate_backup_database(engine)
+        )
+        assert result["ok"] is False
+        assert "integrity failure" in result["error"]
+        assert rotate_path.read_bytes() == b"prior-restore-point"
+        assert not list(backup_dir.glob("*.tmp*"))
+        if operation == "timestamped":
+            assert not list(backup_dir.glob("lcm-*.sqlite3"))
     finally:
         store.close()
 

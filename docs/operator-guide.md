@@ -748,7 +748,7 @@ Available commands:
 - `/lcm doctor source` - read-only scan for legacy blank-source rows
 - `/lcm doctor source apply` - backup-first normalization of legacy blank-source rows to `unknown`
 - `/lcm doctor retention` - read-only retention analysis
-- `/lcm backup` - timestamped SQLite backup
+- `/lcm backup` - private timestamped SQLite backup, published only after WAL checkpoint and full integrity verification
 - `/lcm rotate` - read-only preview of an in-place tail-preserving compact of the active session
 - `/lcm rotate apply` - backup-first rotate that advances the lifecycle frontier past pre-tail raw messages
 - `/lcm embed warmup` - explicitly prepare the configured provider/model and register its vector dimension
@@ -787,8 +787,8 @@ What rotate does:
 - advances the lifecycle frontier marker past every raw message before the tail,
   so subsequent bootstrap stops replaying them into the active prompt
 - writes a rolling `*-rotate-latest.sqlite3` backup under the same backup
-  directory as `/lcm backup`, overwriting the previous rotate slot atomically
-  so disk usage stays bounded across repeated rotates
+  directory as `/lcm backup`, replacing the previous rotate slot only after
+  a full integrity check of the new standalone snapshot; repeated rotates keep disk usage bounded. If old-name WAL/SHM/journal sidecars exist, rotation preserves the previous slot and reports an error for inspection rather than pairing the new main file with stale sidecars
 
 What rotate does not do:
 
