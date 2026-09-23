@@ -109,6 +109,7 @@ def test_register_subscribes_to_subagent_hooks(tmp_path, monkeypatch):
 
     assert "subagent_start" in captured
     assert "subagent_stop" in captured
+    assert "on_session_reset" in captured
     assert "pre_llm_call" in captured
     assert "post_llm_call" in captured
 

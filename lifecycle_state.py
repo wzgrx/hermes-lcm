@@ -270,6 +270,10 @@ class LifecycleStateStore:
         state = self.get_by_conversation(conversation_id)
         if state is None:
             return None
+        # A late end hook from an older agent must not replace a newer
+        # conversation's carry source, especially after an explicit /new.
+        if session_id not in (state.current_session_id, state.last_finalized_session_id):
+            return state
         now = time.time()
         current_session_id = state.current_session_id
         current_frontier = state.current_frontier_store_id
@@ -292,6 +296,7 @@ class LifecycleStateStore:
                 last_finalized_at = ?,
                 updated_at = ?
             WHERE conversation_id = ?
+              AND (current_session_id = ? OR last_finalized_session_id = ?)
             """,
             (
                 current_session_id,
@@ -301,6 +306,8 @@ class LifecycleStateStore:
                 now,
                 now,
                 state.conversation_id,
+                session_id,
+                session_id,
             ),
         )
         self._conn.commit()
@@ -667,6 +674,45 @@ class LifecycleStateStore:
         )
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
+
+    @_synchronized
+    def clear_carry_for_explicit_new(self, old_session_id: str) -> LifecycleState | None:
+        """Fence an explicit /new while preserving old summaries for recall."""
+        state = self.get_by_session(old_session_id)
+        if state is None:
+            return None
+        now = time.time()
+        self._conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET current_session_id = CASE WHEN current_session_id = ? THEN NULL
+                                          ELSE current_session_id END,
+                current_frontier_store_id = CASE WHEN current_session_id = ? THEN 0
+                                                  ELSE current_frontier_store_id END,
+                last_finalized_session_id = NULL,
+                last_finalized_frontier_store_id = 0,
+                last_finalized_at = NULL,
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = ?,
+                last_reset_at = ?,
+                updated_at = ?
+            WHERE conversation_id = ?
+              AND (current_session_id = ? OR last_finalized_session_id = ?)
+            """,
+            (
+                old_session_id,
+                old_session_id,
+                now,
+                now,
+                now,
+                state.conversation_id,
+                old_session_id,
+                old_session_id,
+            ),
+        )
+        self._conn.commit()
+        return self.get_by_conversation(state.conversation_id)
 
     @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:

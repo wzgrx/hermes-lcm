@@ -1,8 +1,8 @@
 # Session lifecycle and rotate
 
-Hermes `/new` starts a new host session. Hermes-LCM binds that session to its own lifecycle row and may carry eligible higher-depth summaries into the new current-session context. Source eligibility and exact expansion still come from descendant raw messages; carried summaries do not rewrite source ownership.
+Hermes `/new` starts a new host session. On gateway surfaces that supply the outgoing session ID to the observer hook, Hermes-LCM clears that conversation's summary carry pointer and frontier before the next inbound turn. A delayed finalization of the old session does not rearm the pointer. Compression-initiated session rollover is separate and still carries eligible summaries.
 
-Do not promise that `/new` deletes historical LCM data. Earlier rows remain in `lcm.db` unless an explicitly authorized cleanup removes them, and they remain available through bounded cross-session recall.
+The operation preserves historical raw rows and summary nodes in `lcm.db` for explicit, bounded recall; it only removes them from automatic new-session inheritance. Other conversations are untouched. CLI hosts that omit the outgoing ID from the reset hook retain their existing reset behavior; inspect the host hook payload before promising the same carry fence there.
 
 ## `/lcm rotate`
 

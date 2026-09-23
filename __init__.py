@@ -360,6 +360,32 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
     return _handler
 
 
+def _on_explicit_session_reset(engine, **payload):
+    """Fence the old conversation after a gateway /new hook.
+
+    Gateway supplies old_session_id; a host surface without an outgoing ID
+    leaves durable state unchanged rather than guessing another chat's owner.
+    """
+    if str(payload.get("reason") or "") != "new_session":
+        return None
+    old_session_id = str(payload.get("old_session_id") or "")
+    if not old_session_id:
+        return None
+    try:
+        from .session_reset import reset_explicit_new_carry
+
+        hermes_home = str(payload.get("hermes_home") or engine._hermes_home)
+        db_path = engine._resolve_db_path(hermes_home)
+        return reset_explicit_new_carry(
+            db_path,
+            old_session_id,
+            conversation_id=str(payload.get("conversation_id") or ""),
+        )
+    except Exception:
+        logger.warning("LCM explicit /new carry reset failed", exc_info=True)
+        return None
+
+
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
@@ -438,6 +464,13 @@ def register(ctx):
                 "host; auxiliary detection uses the legacy frame-walk fallback: %s",
                 exc,
             )
+        try:
+            register_hook(
+                "on_session_reset",
+                lambda **payload: _on_explicit_session_reset(engine, **payload),
+            )
+        except Exception as exc:
+            logger.info("LCM explicit session-reset observer unavailable: %s", exc)
 
         # Hermes invokes this hook after the context engine has received
         # on_session_start(). Resolve through LCM's own registry so merely
