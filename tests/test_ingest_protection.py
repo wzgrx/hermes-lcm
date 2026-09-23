@@ -2321,6 +2321,122 @@ def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_example
     assert detail["missing_externalized_payload_refs"] == []
 
 
+@pytest.mark.parametrize("method", ["startswith", "endswith"])
+def test_externalized_integrity_ignores_production_named_ref_in_source_assertion(tmp_path, method):
+    engine = _engine(tmp_path)
+    try:
+        (tmp_path / "externalized").mkdir()
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_gc; chars=12008; "
+            "bytes=12008; ref=20260809_161858_call_gc_71c66761c2bb_18ca2f6ae69a6d30.json]"
+        )
+        source_line = f"assert '{placeholder}'.{method}('[Externalized tool output:')"
+        engine._store.append(
+            engine.current_session_id,
+            {"role": "tool", "content": json.dumps({"output": source_line})},
+            source="telegram",
+            conversation_id="payload-conversation",
+        )
+
+        detail = scan_externalized_payload_integrity(
+            engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+        )
+
+        assert detail["externalized_payload_refs_total"] == 0
+        assert detail["externalized_payload_refs_missing"] == 0
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_integrity_ignores_method_repr_for_quoted_source_ref(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        (tmp_path / "externalized").mkdir()
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_gc; chars=12008; "
+            "bytes=12008; ref=20260809_161858_call_gc_71c66761c2bb_18ca2f6ae69a6d30.json]"
+        )
+        output = (
+            "terminal output preserves source text\n"
+            f"E <method startswith of str object> = '{placeholder}'.startswith\n"
+            "end of captured traceback"
+        )
+        engine._store.append(
+            engine.current_session_id,
+            {"role": "tool", "content": json.dumps({"output": output})},
+            source="telegram",
+            conversation_id="payload-conversation",
+        )
+
+        detail = scan_externalized_payload_integrity(
+            engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+        )
+
+        assert detail["externalized_payload_refs_total"] == 0
+        assert detail["externalized_payload_refs_missing"] == 0
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_integrity_keeps_real_ref_after_incomplete_serialized_line(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        (tmp_path / "externalized").mkdir()
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_real; chars=10; "
+            "bytes=10; ref=20260809_real_after_incomplete.json]"
+        )
+        engine._store.append(
+            engine.current_session_id,
+            {"role": "tool", "content": (
+                "[Externalized tool output: tool_call_id=call_bad; chars=1; "
+                "bytes=1; ref=unfinished\\n" + placeholder
+            )},
+            source="telegram",
+            conversation_id="payload-conversation",
+        )
+
+        detail = scan_externalized_payload_integrity(
+            engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+        )
+
+        assert detail["externalized_payload_refs_total"] == 1
+        assert detail["externalized_payload_refs_missing"] == 1
+        assert detail["missing_externalized_payload_refs"][0]["externalized_ref"] == (
+            "20260809_real_after_incomplete.json"
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_externalized_integrity_counts_unquoted_ref_with_method_like_suffix(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        (tmp_path / "externalized").mkdir()
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_real; chars=10; "
+            "bytes=10; ref=20260809_real_payload.json]"
+        )
+        engine._store.append(
+            engine.current_session_id,
+            {"role": "tool", "content": placeholder + "'.startswith('suffix')"},
+            source="telegram",
+            conversation_id="payload-conversation",
+        )
+
+        detail = scan_externalized_payload_integrity(
+            engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+        )
+
+        assert detail["externalized_payload_refs_total"] == 1
+        assert detail["externalized_payload_refs_missing"] == 1
+        assert detail["missing_externalized_payload_refs"][0]["externalized_ref"] == (
+            "20260809_real_payload.json"
+        )
+    finally:
+        engine.shutdown()
+
+
 def test_externalized_payload_integrity_scan_detects_nested_tool_call_argument_json_placeholder(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()
