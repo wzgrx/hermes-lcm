@@ -101,7 +101,14 @@ database created by either v0.20.0 or v0.21.0-rc2 opens in place and remains on
 core schema version 5. The assertion, query-view, and trajectory families use
 additive named feature markers and create their tables only when the
 corresponding store or workflow is invoked. A stock/default-off upgrade
-therefore creates none of those optional tables. For rollback to either
+therefore creates none of those optional tables. For temporal rollups and query
+views, the first optional-schema bind now holds a SQLite `BEGIN IMMEDIATE`
+transaction through schema verification and the named migration marker; a
+healthy later bind verifies object shape and skips repeated optional DDL and
+historical backfill. If an optional-schema repair is interrupted, the feature
+DDL rolls back as a unit and the next bind rechecks it. Keep the pre-upgrade
+online backup and check `/lcm doctor` (`quick_check`, WAL status) after an
+unexpected shutdown. For rollback to either
 v0.20.0 or v0.21.0-rc2, restore the pre-upgrade backup rather than opening a
 database modified by v1.0.0-rc.1 with the older plugin.
 

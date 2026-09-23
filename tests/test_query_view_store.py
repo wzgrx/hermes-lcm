@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import sqlite3
 import threading
@@ -12,6 +13,8 @@ from hermes_lcm.assertion_store import AssertionCandidate, AssertionStore
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.maintenance import backup_database, rotate_backup_database
+from hermes_lcm import query_view_store as query_view_module
+from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.query_view_store import (
     QueryViewBuildInProgressError,
     QueryViewIdentity,
@@ -30,6 +33,91 @@ def view_db(tmp_path):
     finally:
         views.close()
         messages.close()
+
+
+def test_healthy_query_view_reopen_skips_feature_ddl_and_backfill(tmp_path, monkeypatch):
+    db_path = tmp_path / "healthy-view.db"
+    MessageStore(db_path).close()
+    QueryViewStore(db_path).close()
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("healthy query-view reopen repeated feature migration")
+
+    monkeypatch.setattr(query_view_module, "_ensure_query_view_schema", unexpected)
+    monkeypatch.setattr(query_view_module, "mark_migration_step_complete", unexpected)
+    reopened = QueryViewStore(db_path)
+    try:
+        assert query_view_module._verify_query_view_schema(reopened._conn) == []
+    finally:
+        reopened.close()
+
+
+def test_query_view_feature_ddl_rolls_back_if_marker_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollback-view.db"
+    MessageStore(db_path).close()
+
+    def fail_marker(*_args, **_kwargs):
+        raise RuntimeError("injected marker failure")
+
+    monkeypatch.setattr(query_view_module, "mark_migration_step_complete", fail_marker)
+    with pytest.raises(RuntimeError, match="injected marker failure"):
+        QueryViewStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'lcm_query%'"
+            )
+        }
+        assert tables == set()
+    finally:
+        conn.close()
+
+
+def test_concurrent_first_optional_schema_bind_is_consistent(tmp_path):
+    db_path = tmp_path / "concurrent-features.db"
+    MessageStore(db_path).close()
+
+    def bind(index):
+        cls = RollupStore if index % 2 else QueryViewStore
+        store = cls(db_path)
+        try:
+            if cls is QueryViewStore:
+                assert query_view_module._verify_query_view_schema(store._conn) == []
+        finally:
+            store.close()
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(bind, range(12)))
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        count = conn.execute(
+            "SELECT count(*) FROM lcm_migration_state WHERE step_name IN (?, ?)",
+            ("temporal_rollups_v1", "query_views_v1"),
+        ).fetchone()[0]
+        assert count == 2
+    finally:
+        conn.close()
+
+
+def test_missing_query_view_table_repairs_on_reopen(tmp_path):
+    db_path = tmp_path / "repair-view.db"
+    MessageStore(db_path).close()
+    QueryViewStore(db_path).close()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TABLE lcm_query_view_sources")
+        conn.commit()
+    finally:
+        conn.close()
+
+    repaired = QueryViewStore(db_path)
+    try:
+        assert query_view_module._verify_query_view_schema(repaired._conn) == []
+    finally:
+        repaired.close()
 
 
 def _append(messages: MessageStore, content: str, *, session="session-a") -> int:

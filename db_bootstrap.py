@@ -765,15 +765,20 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     they are created idempotently from :class:`RollupStore`'s own init on the
     enabled path (recorded as the named ``temporal_rollups_v1`` migration step),
     so a disabled install leaves ``schema_version`` untouched and stays readable
-    by a base build. Keep every statement ``IF NOT EXISTS`` / additive so a
-    concurrent enabled process can run this at the same time without racing.
+    by a base build. A ``BEGIN IMMEDIATE`` inside the script serializes the
+    first-time DDL and subsequent backfill/index repair across processes;
+    statements remain idempotent for a second enabled process.
 
     ``generation`` is an optimistic-concurrency counter bumped on every
     invalidation; ``lease_expires_at`` bounds a ``building`` row so a crashed
     build can be reclaimed. See :mod:`hermes_lcm.rollup_store`.
     """
+    # executescript commits any pre-existing transaction; begin a new write
+    # transaction inside the script so all feature DDL and later backfill/index
+    # repair remain fenced until RollupStore verifies and commits them.
     conn.executescript(
         """
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS lcm_rollups (
             rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
             period_kind TEXT NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),

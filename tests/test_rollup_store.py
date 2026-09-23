@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from hermes_lcm import db_bootstrap
+from hermes_lcm import db_bootstrap, rollup_store as rollup_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.rollup_store import RollupBuildToken, RollupStore
@@ -24,6 +24,38 @@ def rollup_store(tmp_path):
         yield store
     finally:
         store.close()
+
+
+def test_healthy_rollup_reopen_skips_feature_ddl(tmp_path, monkeypatch):
+    db_path = tmp_path / "healthy-rollup.db"
+    RollupStore(db_path).close()
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("healthy rollup reopen repeated feature migration")
+
+    monkeypatch.setattr(rollup_module, "ensure_temporal_rollup_tables", unexpected)
+    monkeypatch.setattr(rollup_module, "mark_migration_step_complete", unexpected)
+    reopened = RollupStore(db_path)
+    try:
+        assert db_bootstrap.verify_temporal_rollup_schema(reopened.connection) == []
+    finally:
+        reopened.close()
+
+
+def test_rollup_feature_ddl_rolls_back_if_marker_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollback-rollup.db"
+
+    def fail_marker(*_args, **_kwargs):
+        raise RuntimeError("injected marker failure")
+
+    monkeypatch.setattr(rollup_module, "mark_migration_step_complete", fail_marker)
+    with pytest.raises(RuntimeError, match="injected marker failure"):
+        RollupStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert not (ROLLUP_TABLES & _table_names(conn))
+    finally:
+        conn.close()
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:

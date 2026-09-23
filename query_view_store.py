@@ -299,8 +299,12 @@ _REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
 
 
 def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
+    # Keep all lazy feature DDL and the corpus-state backfill in one write
+    # transaction. The caller verifies the schema and commits the marker;
+    # an error rolls the entire feature migration back on close.
     conn.executescript(
         """
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS lcm_query_corpus_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
@@ -544,13 +548,24 @@ class QueryViewStore:
             configure_connection(self._conn)
             self._conn.row_factory = sqlite3.Row
             run_versioned_migrations(self._conn)
-            _ensure_query_view_schema(self._conn)
+            # The healthy path should stay read-only with respect to this
+            # optional feature. In particular, the ensure script's historical
+            # corpus COUNT/MAX backfill must not rescan every message each time
+            # an agent binds a query-view store. Verify before lazy repair.
             missing = _verify_query_view_schema(self._conn)
             if missing:
-                raise RuntimeError(
-                    "query-view schema incomplete after ensure: " + ", ".join(missing)
-                )
-            mark_migration_step_complete(self._conn, QUERY_VIEW_MIGRATION_STEP)
+                _ensure_query_view_schema(self._conn)
+                missing = _verify_query_view_schema(self._conn)
+                if missing:
+                    raise RuntimeError(
+                        "query-view schema incomplete after ensure: " + ", ".join(missing)
+                    )
+            marker = self._conn.execute(
+                "SELECT 1 FROM lcm_migration_state WHERE step_name = ?",
+                (QUERY_VIEW_MIGRATION_STEP,),
+            ).fetchone()
+            if marker is None:
+                mark_migration_step_complete(self._conn, QUERY_VIEW_MIGRATION_STEP)
             self._conn.commit()
         except Exception as exc:
             self._conn.close()
