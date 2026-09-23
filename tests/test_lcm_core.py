@@ -446,6 +446,62 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert level == 1
         assert calls == ["primary-model", "fallback-model"]
 
+    def test_tiny_leaf_skips_models_without_poisoning_circuits(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummaryCircuitBreaker
+
+        calls = []
+        monkeypatch.setattr(
+            escalation,
+            "_call_llm_for_summary",
+            lambda *args, **kwargs: calls.append(kwargs) or "an oversized summary",
+        )
+        breaker = SummaryCircuitBreaker(failure_threshold=1, cooldown_seconds=300)
+        summary, level = escalation.summarize_with_escalation(
+            '[TOOL RESULT call_1]: {"total_count": 0}',
+            source_tokens=9,
+            token_budget=2000,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            circuit_breaker=breaker,
+        )
+
+        assert level == 3
+        assert count_tokens(summary) <= 9
+        assert calls == []
+        assert breaker.allows("primary-model")
+        assert breaker.allows("fallback-model")
+        assert breaker._failures == {}
+
+    def test_noncompressing_response_does_not_open_provider_circuit(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummaryCircuitBreaker
+
+        calls = []
+
+        def noncompressing(*args, **kwargs):
+            calls.append(kwargs.get("model", ""))
+            return "unhelpfully verbose " * 500
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", noncompressing)
+        breaker = SummaryCircuitBreaker(failure_threshold=2, cooldown_seconds=300)
+        breaker.record_failure("primary-model")
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            circuit_breaker=breaker,
+        )
+
+        assert level == 3
+        assert count_tokens(summary) <= 200
+        assert calls == ["primary-model", "fallback-model"] * 2
+        assert breaker._failures == {}
+        assert breaker.allows("primary-model")
+        assert breaker.allows("fallback-model")
+
     def test_summary_fallback_chain_escalates_past_reasoning_only_primary(self, monkeypatch):
         """A reasoning-only primary output is sanitized to "" by
         _call_llm_for_summary; summarize_with_escalation must escalate to the

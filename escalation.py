@@ -365,10 +365,18 @@ def _invoke_summary_llm_chain(
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
             result = None
-        if result and (accepts_result is None or accepts_result(result)):
+        if result:
+            if accepts_result is None or accepts_result(result):
+                if circuit_breaker is not None:
+                    circuit_breaker.record_success(candidate_model)
+                return result
+            # The provider responded successfully; its text simply did not
+            # satisfy this compaction's size gate. Do not open its circuit for
+            # unrelated future summaries.
+            logger.debug("LCM summary route returned non-compressing text: %s", candidate_model)
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
-            return result
+            continue
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
@@ -614,9 +622,16 @@ def summarize_with_escalation(
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
-    Guarantees convergence: level 3 is deterministic and always produces
-    output shorter than the source.
+    Level 3 is deterministic and never exceeds the source-token estimate.
     """
+    # A tiny leaf has too little room to benefit from a model round-trip.
+    # Skipping it also avoids spending two full fallback chains on a source
+    # whose token estimate is smaller than a useful summary.
+    if source_tokens <= 10:
+        tiny_budget = max(0, min(source_tokens, l3_truncate_tokens))
+        result = _deterministic_truncate(text, tiny_budget) if tiny_budget else ""
+        return result, 3
+
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(
         text,
@@ -669,6 +684,7 @@ def summarize_with_escalation(
         return l2_result, 2
 
     # Level 3: deterministic truncation — guaranteed convergence
-    l3_result = _deterministic_truncate(text, l3_truncate_tokens)
+    l3_budget = max(0, min(source_tokens, l3_truncate_tokens))
+    l3_result = _deterministic_truncate(text, l3_budget) if l3_budget else ""
     logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
     return l3_result, 3
