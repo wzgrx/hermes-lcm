@@ -1109,6 +1109,25 @@ class CompactionMixin:
         self._last_compression_noop_reason = ""
         self._last_preflight_cleanup_only_executed = False
         _compress_started = time.perf_counter()
+        # Only a lowered automatic ceiling starts at entry; keep manual and
+        # default sweep timing unchanged.
+        configured_automatic_passes = int(self._config.automatic_foreground_max_passes)
+        automatic_pass_ceiling = min(
+            _THRESHOLD_FULL_SWEEP_MAX_PASSES,
+            configured_automatic_passes
+            if configured_automatic_passes > 0 else _THRESHOLD_FULL_SWEEP_MAX_PASSES,
+        )
+        configured_automatic_seconds = float(self._config.automatic_foreground_max_seconds)
+        automatic_seconds_ceiling = min(
+            _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
+            configured_automatic_seconds
+            if configured_automatic_seconds > 0 else _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
+        )
+        automatic_budget_enforced = not force and (
+            automatic_pass_ceiling < _THRESHOLD_FULL_SWEEP_MAX_PASSES
+            or automatic_seconds_ceiling < _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        )
+        _automatic_budget_started = time.monotonic() if automatic_budget_enforced else None
         if force:
             logger.info(
                 "LCM compression decision operation=compact reason=manual_force"
@@ -1318,31 +1337,8 @@ class CompactionMixin:
         # how long it is allowed to hold that turn. Forced/manual compaction
         # keeps the full sweep ceiling. Defaults match, so this is a no-op
         # until the automatic ceiling is explicitly lowered.
-        automatic_foreground = not force
-        configured_automatic_passes = int(
-            self._config.automatic_foreground_max_passes
-        )
-        automatic_pass_ceiling = min(
-            _THRESHOLD_FULL_SWEEP_MAX_PASSES,
-            configured_automatic_passes
-            if configured_automatic_passes > 0
-            else _THRESHOLD_FULL_SWEEP_MAX_PASSES,
-        )
-        configured_automatic_seconds = float(
-            self._config.automatic_foreground_max_seconds
-        )
-        automatic_seconds_ceiling = min(
-            _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
-            configured_automatic_seconds
-            if configured_automatic_seconds > 0
-            else _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
-        )
         # Only diverge from upstream defaults when an operator actually lowered
         # a ceiling, so the default automatic path stays byte-identical.
-        automatic_budget_enforced = automatic_foreground and (
-            automatic_pass_ceiling < _THRESHOLD_FULL_SWEEP_MAX_PASSES
-            or automatic_seconds_ceiling < _THRESHOLD_FULL_SWEEP_MAX_SECONDS
-        )
         sweep_pass_budget = (
             automatic_pass_ceiling
             if automatic_budget_enforced
@@ -1353,7 +1349,13 @@ class CompactionMixin:
             if automatic_budget_enforced
             else _THRESHOLD_FULL_SWEEP_MAX_SECONDS
         )
-        sweep_deadline = time.monotonic() + sweep_seconds_budget
+        # Include ingest/sanitation preparation in a lowered live-turn
+        # ceiling. A large transcript can spend substantial time there before
+        # the first summary call. Keep the legacy/manual sweep start unchanged
+        # when the operator has not lowered the automatic budget.
+        sweep_deadline = (
+            _automatic_budget_started if _automatic_budget_started is not None else time.monotonic()
+        ) + sweep_seconds_budget
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,

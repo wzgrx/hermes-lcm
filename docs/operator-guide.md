@@ -519,6 +519,13 @@ could repeat the same expensive attempt on each turn.
 `host_rejection_reason`. A new session clears the backoff; an explicit manual
 `/compress` uses Hermes' force path and bypasses the automatic gate.
 
+When `LCM_AUTOMATIC_FOREGROUND_MAX_SECONDS` is lower than the default sweep
+ceiling, its best-effort clock begins at compression entry, including local
+ingest and sanitation preparation before the first summary request. If that
+preparation exhausts the budget, raw rows remain durable and the leaf pass is
+deferred. Provider and filesystem calls still need their own timeouts; this
+setting is not a hard deadline for every synchronous operation.
+
 What the main knobs do:
 
 - `LCM_CONTEXT_THRESHOLD` decides when compaction starts. Lower values build the
