@@ -490,6 +490,15 @@ A reasonable first pass for a true 1M effective window is:
 | Balanced large-context use | `350000` to `500000` | `0.35` to `0.50` | Good starting point for many long-running agents |
 | Keep more raw context active | `600000+` | `0.60+` | Higher token burn, later compaction |
 
+Hermes may reject a compaction candidate if its fully assembled transcript
+would grow, or report a structural no-op when the transcript is unchanged.
+LCM accepts these host verdicts and defers automatic retries for up to five
+minutes instead of repeating the same expensive pass on every turn (see
+[upstream issue #582](https://github.com/stephenschoettler/hermes-lcm/issues/582)).
+`lcm_status` exposes `host_rejection_backoff_seconds` and
+`host_rejection_reason`. A new session clears the backoff; an explicit manual
+`/compress` uses Hermes' force path and bypasses the automatic gate.
+
 What the main knobs do:
 
 - `LCM_CONTEXT_THRESHOLD` decides when compaction starts. Lower values build the

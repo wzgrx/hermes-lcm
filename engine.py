@@ -349,6 +349,7 @@ class _RollupMaintenanceScheduler:
 _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_HOST_REJECTION_BACKOFF_SECONDS = 300.0
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 
@@ -630,6 +631,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
+        # Hermes reports pre-commit growth refusals and structural no-ops via
+        # optional compressor hooks. Keep automatic retries off the turn path
+        # for a bounded interval; manual /compress bypasses the host gate.
+        self._host_rejection_backoff_until: float = 0.0
+        self._host_rejection_session_id: str = ""
+        self._host_rejection_reason: str = ""
         # One-shot handoff from preflight: publish deterministic replay cleanup
         # without letting below-threshold work invoke the summarizer.
         self._preflight_cleanup_only = False
@@ -1518,6 +1525,66 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compaction_telemetry_turn_reset_pending = False
         except Exception:
             logger.debug("LCM compaction telemetry update failed", exc_info=True)
+
+    def _automatic_compression_blocked(self, *, ignore_cooldown: bool = False) -> bool:
+        """Hermes automatic-compression gate for rejected LCM candidates.
+
+        ``ignore_cooldown`` bypasses only provider-summary cooldown in Hermes;
+        it must not bypass a structural no-op or a candidate the host refused
+        because it grew the transcript. Manual ``force=True`` bypasses this gate
+        in the host and remains available for an explicit retry.
+        """
+        del ignore_cooldown
+        if self._host_rejection_session_id != self._session_id:
+            self._host_rejection_backoff_until = 0.0
+            self._host_rejection_reason = ""
+            return False
+        remaining = self._host_rejection_backoff_until - time.monotonic()
+        if remaining <= 0:
+            self._host_rejection_backoff_until = 0.0
+            self._host_rejection_reason = ""
+            return False
+        return True
+
+    def _compression_block_reason(self) -> str | None:
+        """Classify the gate as transient for Hermes overflow-recovery logic."""
+        if self._host_rejection_session_id != self._session_id:
+            return None
+        remaining = self._host_rejection_backoff_until - time.monotonic()
+        return f"structural_backoff:{remaining:.0f}" if remaining > 0 else None
+
+    def _record_host_compaction_backoff(self, reason: str) -> None:
+        if not self._session_id:
+            return
+        self._host_rejection_session_id = self._session_id
+        self._host_rejection_reason = reason
+        self._host_rejection_backoff_until = time.monotonic() + _HOST_REJECTION_BACKOFF_SECONDS
+        logger.warning(
+            "LCM automatic compaction deferred for %.0fs after host verdict: %s (session=%s)",
+            _HOST_REJECTION_BACKOFF_SECONDS,
+            reason,
+            self._session_id or "none",
+        )
+
+    def record_rejected_compaction(self) -> None:
+        """Receive Hermes' pre-commit would-grow verdict (#582)."""
+        self._record_host_compaction_backoff("would_grow")
+
+    def _record_structural_no_op(self, reason: str) -> None:
+        """Receive Hermes' unchanged-transcript verdict without retrying every turn."""
+        self._record_host_compaction_backoff(f"no_progress: {reason}")
+
+    def record_completed_compaction(
+        self, *, used_fallback: bool = False, feasibility_skip: bool = False
+    ) -> None:
+        """Lift host-rejection backoff only after Hermes commits a real boundary."""
+        del used_fallback, feasibility_skip
+        # The host's fallback branch sets this when no completion hook exists.
+        # Preserve that post-boundary real-usage verification contract.
+        self._verify_compaction_cleared_threshold = True
+        self._host_rejection_backoff_until = 0.0
+        self._host_rejection_session_id = ""
+        self._host_rejection_reason = ""
 
     def _compression_boundary_cooldown_active(self) -> bool:
         """Return true while a boundary skip is in its short no-compress window."""
@@ -4078,6 +4145,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_length": self.context_length,
             "effective_context_length_cap": self.effective_context_length_cap,
             "effective_context_length_reason": self.effective_context_length_reason,
+            "host_rejection_backoff_seconds": max(
+                0, int(self._host_rejection_backoff_until - time.monotonic())
+            ) if self._host_rejection_session_id == self._session_id else 0,
+            "host_rejection_reason": (
+                self._host_rejection_reason
+                if self._host_rejection_session_id == self._session_id
+                and self._host_rejection_backoff_until > time.monotonic()
+                else ""
+            ),
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,

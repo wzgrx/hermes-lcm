@@ -34,6 +34,9 @@ class ResetStateMixin:
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
         self._last_boundary_skip_time = 0
+        self._host_rejection_backoff_until = 0.0
+        self._host_rejection_session_id = ""
+        self._host_rejection_reason = ""
         self._compaction_telemetry_counter_rebaseline_pending = True
         self._compaction_telemetry_turn_reset_pending = False
 
