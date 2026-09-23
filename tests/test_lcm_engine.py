@@ -22467,6 +22467,81 @@ class TestAssemblyToolPairGuardrail:
         ]
         assert len(orphan_ids) == 0, f"Overflow fallback leaked orphan tool result: {orphan_ids}"
 
+    def test_no_system_overflow_recovery_keeps_objective_instead_of_empty_result(self, tmp_path):
+        from hermes_lcm.tokens import count_messages_tokens
+
+        instance = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "no-system-overflow.db")))
+        instance._session_id = "no-system-overflow"
+        instance.compression_count = 1
+        instance.context_length = 200000
+        tail_messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "[Current user objective preserved from compacted history]\n"
+                    "KEEP_OBJECTIVE: continue the active plan."
+                ),
+            },
+            {"role": "assistant", "content": "oversized assistant/tool chatter " * 400},
+            {"role": "tool", "tool_call_id": "orphan-call", "content": "latest tool status"},
+        ]
+
+        result = instance._assemble_overflow_recovery_context(
+            None, tail_messages, assembly_cap_override=120
+        )
+
+        assert result and result[0]["role"] == "user"
+        assert "KEEP_OBJECTIVE" in result[0]["content"]
+        assert count_messages_tokens(result) <= 120
+
+    def test_no_system_overflow_recovery_bounds_latest_real_user_anchor(self, tmp_path):
+        from hermes_lcm.tokens import count_messages_tokens
+
+        instance = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "user-overflow.db")))
+        instance._session_id = "user-overflow"
+        tail_messages = [
+            {"role": "user", "content": "MOST_RECENT_OBJECTIVE: fix LCM. " + "padding " * 400},
+            {"role": "assistant", "content": "derived chatter " * 400},
+            {"role": "tool", "tool_call_id": "orphan-call", "content": "orphan result"},
+        ]
+
+        result = instance._assemble_overflow_recovery_context(
+            None, tail_messages, assembly_cap_override=80
+        )
+
+        assert result and result[0]["role"] == "user"
+        assert "MOST_RECENT_OBJECTIVE" in result[0]["content"]
+        assert count_messages_tokens(result) <= 80
+
+    def test_no_system_overflow_recovery_has_generic_anchor_for_tool_only_tail(self, tmp_path):
+        from hermes_lcm.tokens import count_messages_tokens
+
+        instance = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "tool-overflow.db")))
+        instance._session_id = "tool-overflow"
+        result = instance._assemble_overflow_recovery_context(
+            None,
+            [{"role": "tool", "tool_call_id": "orphan-call", "content": "orphan result"}],
+            assembly_cap_override=40,
+        )
+
+        assert result and result[0]["role"] == "user"
+        assert "LCM overflow recovery" in result[0]["content"]
+        assert count_messages_tokens(result) <= 40
+
+    def test_no_system_overflow_recovery_does_not_start_with_assistant(self, tmp_path):
+        from hermes_lcm.tokens import count_messages_tokens
+
+        instance = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "assistant-overflow.db")))
+        instance._session_id = "assistant-overflow"
+        result = instance._assemble_overflow_recovery_context(
+            None,
+            [{"role": "assistant", "content": "derived chatter " * 400}],
+            assembly_cap_override=40,
+        )
+
+        assert result and result[0]["role"] == "user"
+        assert count_messages_tokens(result) <= 40
+
     def test_overflow_recovery_fallback_inserts_stub_for_missing_tool_result(self, tmp_path):
         """Overflow recovery fallback must sanitize an assistant tool_call-only tail."""
         config = LCMConfig(

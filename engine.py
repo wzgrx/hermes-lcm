@@ -6894,6 +6894,56 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: helpers -------------------------------------------------
 
+    def _overflow_recovery_user_anchor(
+        self,
+        tail_messages: List[Dict[str, Any]],
+        available_tokens: Optional[int],
+    ) -> Dict[str, Any]:
+        """Keep a provider-valid prompt when sanitizing a tool-heavy tail empties it."""
+        content = self._latest_user_context_anchor(tail_messages, [])
+        if not content:
+            for message in reversed(tail_messages):
+                if not isinstance(message, dict):
+                    continue
+                content = self._sanitized_preserved_objective_context_content(message)
+                if content:
+                    break
+        if not content:
+            content = (
+                "[LCM overflow recovery] Earlier conversation context is stored. "
+                "Inspect it with lcm_recall before continuing."
+            )
+
+        if available_tokens is not None:
+            cap = max(0, int(available_tokens))
+            def fits(value: str) -> bool:
+                return count_message_tokens({"role": "user", "content": value}) <= cap
+
+            if not fits(content):
+                prefix = (
+                    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX + "\n"
+                    if content.startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
+                    else ""
+                )
+                if prefix and not fits(prefix):
+                    content = "[LCM recovery] Use lcm_recall to inspect prior context."
+                    prefix = ""
+                remainder = content[len(prefix):]
+                low, high = 0, min(len(remainder), max(1, cap * 8))
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if fits(prefix + remainder[:middle]):
+                        low = middle
+                    else:
+                        high = middle - 1
+                content = prefix + remainder[:low]
+                if not content:
+                    # A cap smaller than the provider's per-message overhead
+                    # cannot contain any non-empty message. Favor a recoverable
+                    # transcript over another empty-transcript compression loop.
+                    content = "[LCM recovery]"
+        return {"role": "user", "content": content}
+
     def _assemble_overflow_recovery_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -6926,7 +6976,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         minimum_candidate_len = 1 if system_msg is not None else 0
         if len(candidate) == minimum_candidate_len and tail_messages:
             fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
-            return self._sanitize_active_context_messages(fallback)
+            sanitized = self._sanitize_active_context_messages(fallback)
+            cap = (
+                assembly_cap_override
+                if assembly_cap_override is not None
+                else self._effective_assembly_token_cap()
+            )
+            if len(sanitized) > minimum_candidate_len:
+                # A sanitized real user turn is still authoritative even if
+                # redaction expanded it beyond this emergency cap. The host
+                # must see that turn and report an overflow, not silently
+                # replace it with a generic recovery instruction (#72).
+                if system_msg is not None or sanitized[0].get("role") == "user":
+                    return sanitized
+            available = (
+                cap - count_message_tokens(system_msg)
+                if cap is not None and system_msg is not None
+                else cap
+            )
+            return ([system_msg] if system_msg is not None else []) + [
+                self._overflow_recovery_user_anchor(tail_messages, available)
+            ]
         return candidate
 
     @staticmethod
