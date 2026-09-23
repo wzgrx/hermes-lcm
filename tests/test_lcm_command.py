@@ -67,9 +67,39 @@ def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
     return db_path
 
 
-def test_lcm_engine_declares_automatic_compaction_silent(engine):
-    assert engine.emit_automatic_compaction_status is False
+def test_lcm_engine_preserves_automatic_compaction_lifecycle(engine):
+    assert engine.emit_automatic_compaction_status is True
     assert engine.quiet_mode is True
+
+    # The portable CI job has only a minimal ContextEngine stub. On a real
+    # Hermes install, exercise the host's canonical start/terminal event rail.
+    try:
+        from agent.conversation_compression import (
+            COMPACTION_DONE_STATUS,
+            COMPACTION_STATUS,
+            _announce_compression_start,
+        )
+    except ImportError:
+        return
+
+    events = []
+    host = SimpleNamespace(
+        context_compressor=engine,
+        session_id="test-session",
+        model="test-model",
+        status_callback=lambda kind, message: events.append((kind, message)),
+        _emit_status=lambda message: events.append(("lifecycle", message)),
+    )
+    lifecycle = _announce_compression_start(
+        host, message_count=3, approx_tokens=1234, focus_topic=None, force=False,
+    )
+    assert events == [("lifecycle", COMPACTION_STATUS)]
+    lifecycle.commit_status = "committed"
+    lifecycle.complete()
+    assert events == [
+        ("lifecycle", COMPACTION_STATUS),
+        ("compacted", COMPACTION_DONE_STATUS),
+    ]
 
 
 def test_lcm_status_default_reports_current_session(engine):
