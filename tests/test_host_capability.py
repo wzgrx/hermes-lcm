@@ -167,6 +167,7 @@ class TestRegistrationGating:
         assert len(callbacks) == 1
         assert callbacks[0].__self__ is ctx.engine
         clone = ctx.engine.clone_for_agent()
+        clone.on_session_start("active-clone", platform="cli")
         assert db_path.is_file()
 
         callbacks[0]()
@@ -296,16 +297,12 @@ class TestRegistrationGating:
         assert partial_engine is not None
 
         callbacks[0]()
-        partial_closed = partial_engine._store._conn is None
-        if not partial_closed:
-            for name in ("_adaptive_retrieval", "_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
-                resource = getattr(partial_engine, name, None)
-                if resource is not None:
-                    resource.close()
+        partial_state = object.__getattribute__(partial_engine, "__dict__")
+        assert partial_state["_storage_shutdown"] is True
+        assert partial_state["_store"] is None
         if db_path.exists():
             db_path.unlink()
 
-        assert partial_closed
         assert not db_path.exists()
 
     def test_unload_serializes_profile_storage_rebind(

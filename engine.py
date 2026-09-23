@@ -7563,24 +7563,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         shutdown_group = getattr(self, "_shutdown_group", None)
         if shutdown_group is not None:
             shutdown_group.discard(self)
-        for name in (
-            "_adaptive_retrieval",
-            "_store",
-            "_dag",
-            "_lifecycle",
-            "_assertions",
-            "_query_views",
-        ):
-            resource = getattr(self, name, None)
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # pragma: no cover - defensive cleanup path
-                    logger.exception(
-                        "LCM failed to close %s after engine initialization error",
-                        name,
-                    )
+        state = object.__getattribute__(self, "__dict__")
+        # A failed lazy clone may have initialized the storage lock but not
+        # opened SQLite yet. Accessing a helper via getattr() here would bind
+        # storage just to close it (or retry the failing constructor path).
+        state["_storage_shutdown"] = True
+        lock = state.get("_storage_lock")
+        if lock is not None:
+            with lock:
+                self._close_storage()
         if hasattr(self, "_primary_shutdown_complete"):
             self._primary_shutdown_complete = True
 
