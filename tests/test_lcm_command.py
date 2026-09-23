@@ -102,6 +102,40 @@ def test_lcm_status_json_reports_runtime_context_indicators(engine):
     assert payload["threshold_tokens"] == int(200000 * engine._config.context_threshold)
 
 
+def test_status_reports_store_rows_after_matching_frontier(engine):
+    engine.on_session_start(
+        "test-session", platform="telegram", context_length=200000,
+        conversation_id="test-conversation",
+    )
+    old_id = engine._store.append(
+        "test-session", {"role": "user", "content": "old"}, token_estimate=11,
+    )
+    engine._store.append(
+        "test-session", {"role": "user", "content": "new"}, token_estimate=7,
+    )
+    engine._lifecycle.advance_frontier("test-conversation", "test-session", old_id)
+
+    post_frontier = engine.get_status()["store_post_frontier"]
+    assert post_frontier["frontier_matches_session"] is True
+    assert post_frontier["frontier_store_id"] == old_id
+    assert post_frontier["messages"] == 1
+    assert post_frontier["estimated_tokens"] == 7
+    assert post_frontier["diagnostic_only"] is True
+    assert json.loads(lcm_tools.lcm_status({}, engine=engine))["store"]["post_frontier"] == post_frontier
+    assert "store_post_frontier_estimated_tokens: 7" in handle_lcm_command("", engine)
+
+
+def test_status_does_not_apply_other_sessions_frontier(engine):
+    engine.on_session_start(
+        "bound-session", platform="telegram", context_length=200000,
+        conversation_id="bound-conversation",
+    )
+    engine._foreground_session_id = "other-session"
+    post_frontier = engine.get_status()["store_post_frontier"]
+    assert post_frontier["frontier_matches_session"] is False
+    assert "estimated_tokens" not in post_frontier
+
+
 def test_lcm_status_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
     engine._dag.add_node(SummaryNode(
         session_id="test-session",

@@ -1229,6 +1229,33 @@ class MessageStore:
         )
         return row[0] if row else 0
 
+    def get_session_post_frontier_stats(
+        self, session_id: str, frontier_store_id: int,
+    ) -> Dict[str, int]:
+        """Read-only source-row estimate beyond one session's lifecycle frontier.
+
+        This is a diagnostic upper bound, not a compactability decision: the
+        protected fresh tail, ignored rows, and already represented nodes may
+        still fall inside this range. The `(session_id, store_id)` index keeps
+        the scan scoped to one session without materializing message content.
+        """
+        row = self._fetchone(
+            """SELECT COUNT(*),
+                      COALESCE(SUM(CASE WHEN token_estimate > 0 THEN token_estimate ELSE 0 END), 0),
+                      COALESCE(SUM(CASE WHEN token_estimate IS NULL OR token_estimate <= 0 THEN 1 ELSE 0 END), 0),
+                      COALESCE(MIN(store_id), 0),
+                      COALESCE(MAX(store_id), 0)
+               FROM messages WHERE session_id = ? AND store_id > ?""",
+            (session_id, max(0, int(frontier_store_id))),
+        )
+        return {
+            "messages": int(row[0]) if row else 0,
+            "estimated_tokens": int(row[1]) if row else 0,
+            "missing_token_estimate_rows": int(row[2]) if row else 0,
+            "first_store_id": int(row[3]) if row else 0,
+            "last_store_id": int(row[4]) if row else 0,
+        }
+
     def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
         """Return raw source-bucket counts for diagnostics."""
         where = ""

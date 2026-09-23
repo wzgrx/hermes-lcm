@@ -6492,6 +6492,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "store": {
             "messages": store_messages,
             "estimated_tokens": store_tokens,
+            "post_frontier": full_status.get("store_post_frontier"),
         },
         "dag": {
             "total_nodes": total_dag_nodes,

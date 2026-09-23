@@ -1570,6 +1570,28 @@ class TestMessageStore:
         assert retrieved["role"] == "user"
         assert retrieved["content"] == "hello"
 
+    def test_post_frontier_stats_are_session_scoped_and_read_only(self, store):
+        first = store.append("sess1", {"role": "user", "content": "old"}, token_estimate=11)
+        store.append("other", {"role": "user", "content": "other"}, token_estimate=99)
+        second = store.append("sess1", {"role": "user", "content": "new"}, token_estimate=7)
+        third = store.append("sess1", {"role": "assistant", "content": "unknown"})
+
+        assert store.get_session_post_frontier_stats("sess1", first) == {
+            "messages": 2,
+            "estimated_tokens": 7,
+            "missing_token_estimate_rows": 1,
+            "first_store_id": second,
+            "last_store_id": third,
+        }
+        assert store.get_session_post_frontier_stats("other", third) == {
+            "messages": 0,
+            "estimated_tokens": 0,
+            "missing_token_estimate_rows": 0,
+            "first_store_id": 0,
+            "last_store_id": 0,
+        }
+        assert store.get_session_count("sess1") == 3
+
     def test_append_batch(self, store):
         msgs = [
             {"role": "user", "content": "one"},

@@ -4272,6 +4272,38 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["rotate_backup_error"] = str(exc)
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
+            # The lifecycle frontier belongs to one session, not merely its
+            # conversation. A side-channel rebind can temporarily make those
+            # identifiers disagree; never publish another session's frontier
+            # as if it covered the foreground store rows.
+            frontier_matches_session = bool(
+                lifecycle_state is not None
+                and lifecycle_state.current_session_id == session_id
+            )
+            if frontier_matches_session:
+                frontier_store_id = int(lifecycle_state.current_frontier_store_id or 0)
+                try:
+                    status["store_post_frontier"] = {
+                        **self._store.get_session_post_frontier_stats(
+                            session_id, frontier_store_id,
+                        ),
+                        "frontier_store_id": frontier_store_id,
+                        "frontier_matches_session": True,
+                        "diagnostic_only": True,
+                    }
+                except Exception as exc:  # pragma: no cover - defensive
+                    status["store_post_frontier"] = {
+                        "frontier_store_id": frontier_store_id,
+                        "frontier_matches_session": True,
+                        "diagnostic_only": True,
+                        "error": str(exc),
+                    }
+            else:
+                status["store_post_frontier"] = {
+                    "frontier_matches_session": False,
+                    "diagnostic_only": True,
+                    "reason": "lifecycle frontier does not match the foreground session",
+                }
             status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
             status["session_ignored"] = self.current_session_ignored

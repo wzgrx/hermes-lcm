@@ -584,6 +584,16 @@ def _status_text(engine) -> str:
             f"store_messages: {status.get('store_messages', 0)}",
             f"dag_nodes: {status.get('dag_nodes', 0)}",
         ])
+        post_frontier = status.get("store_post_frontier") or {}
+        if post_frontier.get("frontier_matches_session") and not post_frontier.get("error"):
+            lines.extend([
+                f"store_post_frontier_messages: {post_frontier.get('messages', 0)}",
+                f"store_post_frontier_estimated_tokens: {post_frontier.get('estimated_tokens', 0)}",
+                f"store_post_frontier_missing_estimates: {post_frontier.get('missing_token_estimate_rows', 0)}",
+                "store_post_frontier_note: diagnostic upper bound; not eligible compaction debt",
+            ])
+        elif post_frontier.get("error"):
+            lines.append(f"store_post_frontier_error: {post_frontier['error']}")
     else:
         lines.append(
             "note: no active Hermes session has initialized LCM in this process yet — after a fresh restart, send one normal message first if you want live per-session runtime details"
