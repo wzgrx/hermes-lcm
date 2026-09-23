@@ -7,6 +7,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.store import MessageStore
@@ -272,6 +274,7 @@ def test_cli_new_rejects_unproven_rotation_and_expired_or_cross_thread_hint(tmp_
         == ""
     )
 
+
     with sqlite3.connect(host_db) as conn:
         conn.execute("UPDATE sessions SET end_reason = 'new_session' WHERE id = 'old'")
         conn.execute("UPDATE sessions SET profile_name = 'other' WHERE id = 'new'")
@@ -310,6 +313,38 @@ def test_cli_new_rejects_unproven_rotation_and_expired_or_cross_thread_hint(tmp_
         )
         == ""
     )
+
+
+def test_installed_host_sessiondb_cli_rotation_is_verifiable(tmp_path):
+    """Check the installed host's real session writer, not only a schema stub."""
+    plugin_root = Path(__file__).resolve().parents[1]
+    shadowing_paths = [
+        entry for entry in sys.path if Path(entry or ".").resolve() == plugin_root
+    ]
+    for entry in shadowing_paths:
+        sys.path.remove(entry)
+    shadowed_tools = sys.modules.pop("tools", None)
+    try:
+        host = pytest.importorskip("hermes_state")
+    finally:
+        if shadowed_tools is not None:
+            sys.modules["tools"] = shadowed_tools
+        sys.path[:0] = shadowing_paths
+
+    db = host.SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("old", source="cli")
+        db.end_session("old", "new_session")
+        db.create_session("new", source="cli")
+        pairing = CliNewSessionPairing()
+        pairing.note_finalization(
+            platform="cli", reason="session_boundary", session_id="old"
+        )
+        assert pairing.consume_verified_old_session(
+            new_session_id="new", hermes_home=str(tmp_path)
+        ) == "old"
+    finally:
+        db.close()
 
 
 def test_interleaved_old_finalize_cannot_restore_cleared_carry(tmp_path, monkeypatch):
