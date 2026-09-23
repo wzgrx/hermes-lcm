@@ -493,7 +493,9 @@ A reasonable first pass for a true 1M effective window is:
 Hermes may reject a compaction candidate if its fully assembled transcript
 would grow, or report a structural no-op when the transcript is unchanged.
 LCM accepts these host verdicts and defers automatic retries for up to five
-minutes instead of repeating the same expensive pass on every turn (see
+minutes instead of repeating the same expensive pass on every turn. The
+process-local guard is shared by new agent clones for that database/session,
+so a gateway cache eviction does not immediately retrigger it (see
 [upstream issue #582](https://github.com/stephenschoettler/hermes-lcm/issues/582)).
 `lcm_status` exposes `host_rejection_backoff_seconds` and
 `host_rejection_reason`. A new session clears the backoff; an explicit manual

@@ -3,7 +3,7 @@
 import time
 
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.engine import LCMEngine
+from hermes_lcm.engine import LCMEngine, _HOST_REJECTION_BACKOFF_BY_SESSION
 
 
 def _engine(tmp_path):
@@ -28,7 +28,9 @@ def test_would_grow_feedback_defers_automatic_retry_but_expires(tmp_path):
         assert status["host_rejection_backoff_seconds"] > 0
         assert status["host_rejection_reason"] == "would_grow"
 
-        engine._host_rejection_backoff_until = time.monotonic() - 1
+        _HOST_REJECTION_BACKOFF_BY_SESSION[engine._host_rejection_key()] = (
+            time.monotonic() - 1, "would_grow"
+        )
         assert engine._automatic_compression_blocked() is False
         assert engine._compression_block_reason() is None
         assert engine.get_status()["host_rejection_reason"] == ""
@@ -72,3 +74,30 @@ def test_committed_boundary_lifts_backoff(tmp_path):
         assert engine.get_status()["host_rejection_reason"] == ""
     finally:
         engine.shutdown()
+
+
+def test_recreated_agent_clone_keeps_same_session_backoff(tmp_path):
+    engine = _engine(tmp_path)
+    clone = engine.clone_for_agent()
+    try:
+        engine.record_rejected_compaction()
+        clone.on_session_start("session-a", platform="telegram", conversation_id="chat-a")
+        assert clone._automatic_compression_blocked() is True
+        assert clone.get_status()["host_rejection_reason"] == "would_grow"
+
+        clone.record_completed_compaction()
+        assert engine._automatic_compression_blocked() is False
+    finally:
+        clone.shutdown()
+        engine.shutdown()
+
+
+def test_shared_backoff_does_not_cross_database_profiles(tmp_path):
+    engine = _engine(tmp_path / "profile-a")
+    other = _engine(tmp_path / "profile-b")
+    try:
+        engine.record_rejected_compaction()
+        assert other._automatic_compression_blocked() is False
+    finally:
+        engine.shutdown()
+        other.shutdown()

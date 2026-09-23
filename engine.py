@@ -350,6 +350,10 @@ _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _HOST_REJECTION_BACKOFF_SECONDS = 300.0
+_HOST_REJECTION_BACKOFF_LOCK = threading.RLock()
+# Agent cache evictions can clone a new engine for the same session inside the
+# five-minute window. Share only this transient gate across clones in-process.
+_HOST_REJECTION_BACKOFF_BY_SESSION: dict[tuple[str, str], tuple[float, str]] = {}
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 
@@ -634,9 +638,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Hermes reports pre-commit growth refusals and structural no-ops via
         # optional compressor hooks. Keep automatic retries off the turn path
         # for a bounded interval; manual /compress bypasses the host gate.
-        self._host_rejection_backoff_until: float = 0.0
-        self._host_rejection_session_id: str = ""
-        self._host_rejection_reason: str = ""
         # One-shot handoff from preflight: publish deterministic replay cleanup
         # without letting below-threshold work invoke the summarizer.
         self._preflight_cleanup_only = False
@@ -1526,6 +1527,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except Exception:
             logger.debug("LCM compaction telemetry update failed", exc_info=True)
 
+    def _host_rejection_key(self) -> tuple[str, str] | None:
+        session_id = str(getattr(self, "_session_id", "") or "")
+        return (str(self._storage_db_path), session_id) if session_id else None
+
+    def _host_rejection_snapshot(self) -> tuple[float, str]:
+        key = self._host_rejection_key()
+        if key is None:
+            return 0.0, ""
+        with _HOST_REJECTION_BACKOFF_LOCK:
+            deadline, reason = _HOST_REJECTION_BACKOFF_BY_SESSION.get(key, (0.0, ""))
+            if deadline <= time.monotonic():
+                _HOST_REJECTION_BACKOFF_BY_SESSION.pop(key, None)
+                return 0.0, ""
+            return deadline, reason
+
+    def _clear_host_compaction_backoff(self) -> None:
+        key = self._host_rejection_key()
+        if key is not None:
+            with _HOST_REJECTION_BACKOFF_LOCK:
+                _HOST_REJECTION_BACKOFF_BY_SESSION.pop(key, None)
+
     def _automatic_compression_blocked(self, *, ignore_cooldown: bool = False) -> bool:
         """Hermes automatic-compression gate for rejected LCM candidates.
 
@@ -1535,35 +1557,38 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         in the host and remains available for an explicit retry.
         """
         del ignore_cooldown
-        if self._host_rejection_session_id != self._session_id:
-            self._host_rejection_backoff_until = 0.0
-            self._host_rejection_reason = ""
-            return False
-        remaining = self._host_rejection_backoff_until - time.monotonic()
-        if remaining <= 0:
-            self._host_rejection_backoff_until = 0.0
-            self._host_rejection_reason = ""
-            return False
-        return True
+        return self._host_rejection_snapshot()[0] > 0
 
     def _compression_block_reason(self) -> str | None:
         """Classify the gate as transient for Hermes overflow-recovery logic."""
-        if self._host_rejection_session_id != self._session_id:
-            return None
-        remaining = self._host_rejection_backoff_until - time.monotonic()
+        deadline, _reason = self._host_rejection_snapshot()
+        remaining = deadline - time.monotonic()
         return f"structural_backoff:{remaining:.0f}" if remaining > 0 else None
 
     def _record_host_compaction_backoff(self, reason: str) -> None:
-        if not self._session_id:
+        key = self._host_rejection_key()
+        if key is None:
             return
-        self._host_rejection_session_id = self._session_id
-        self._host_rejection_reason = reason
-        self._host_rejection_backoff_until = time.monotonic() + _HOST_REJECTION_BACKOFF_SECONDS
+        now = time.monotonic()
+        with _HOST_REJECTION_BACKOFF_LOCK:
+            # Bound process-local state even if a busy gateway cycles through
+            # many one-shot sessions without revisiting their expired entries.
+            if len(_HOST_REJECTION_BACKOFF_BY_SESSION) >= 256:
+                for stale_key, (deadline, _stale_reason) in list(_HOST_REJECTION_BACKOFF_BY_SESSION.items()):
+                    if deadline <= now:
+                        del _HOST_REJECTION_BACKOFF_BY_SESSION[stale_key]
+            if len(_HOST_REJECTION_BACKOFF_BY_SESSION) >= 1024 and key not in _HOST_REJECTION_BACKOFF_BY_SESSION:
+                oldest = min(_HOST_REJECTION_BACKOFF_BY_SESSION, key=lambda item: _HOST_REJECTION_BACKOFF_BY_SESSION[item][0])
+                del _HOST_REJECTION_BACKOFF_BY_SESSION[oldest]
+            _HOST_REJECTION_BACKOFF_BY_SESSION[key] = (
+                now + _HOST_REJECTION_BACKOFF_SECONDS,
+                reason,
+            )
         logger.warning(
             "LCM automatic compaction deferred for %.0fs after host verdict: %s (session=%s)",
             _HOST_REJECTION_BACKOFF_SECONDS,
             reason,
-            self._session_id or "none",
+            key[1],
         )
 
     def record_rejected_compaction(self) -> None:
@@ -1582,9 +1607,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # The host's fallback branch sets this when no completion hook exists.
         # Preserve that post-boundary real-usage verification contract.
         self._verify_compaction_cleared_threshold = True
-        self._host_rejection_backoff_until = 0.0
-        self._host_rejection_session_id = ""
-        self._host_rejection_reason = ""
+        self._clear_host_compaction_backoff()
 
     def _compression_boundary_cooldown_active(self) -> bool:
         """Return true while a boundary skip is in its short no-compress window."""
@@ -4129,6 +4152,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
+        host_backoff_until, host_backoff_reason = self._host_rejection_snapshot()
         status.update({
             "compression_count": self.compression_count,
             "last_prompt_tokens": self.last_prompt_tokens,
@@ -4145,15 +4169,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_length": self.context_length,
             "effective_context_length_cap": self.effective_context_length_cap,
             "effective_context_length_reason": self.effective_context_length_reason,
-            "host_rejection_backoff_seconds": max(
-                0, int(self._host_rejection_backoff_until - time.monotonic())
-            ) if self._host_rejection_session_id == self._session_id else 0,
-            "host_rejection_reason": (
-                self._host_rejection_reason
-                if self._host_rejection_session_id == self._session_id
-                and self._host_rejection_backoff_until > time.monotonic()
-                else ""
-            ),
+            "host_rejection_backoff_seconds": max(0, int(host_backoff_until - time.monotonic())),
+            "host_rejection_reason": host_backoff_reason,
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
