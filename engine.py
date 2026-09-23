@@ -1447,6 +1447,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         trigger: str = "",
     ) -> bool:
         """Record and explain a positive preflight decision without content."""
+        # Hermes' sub-threshold engine hook does not consult should_compress(),
+        # so a would-grow/no-progress verdict from the preceding turn could
+        # otherwise re-enter the same model-backed preflight on every turn.
+        # Deterministic cleanup and emergency pressure must still proceed.
+        if operation == "compact" and trigger != "critical_pressure" and reason != "overflow_recovery":
+            deadline, backoff_reason = self._host_rejection_snapshot()
+            if deadline > time.monotonic():
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = f"automatic compression backoff: {backoff_reason}"
+                logger.debug("LCM preflight deferred: %s", self._last_compression_noop_reason)
+                return False
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
         if trigger:

@@ -101,3 +101,54 @@ def test_shared_backoff_does_not_cross_database_profiles(tmp_path):
     finally:
         engine.shutdown()
         other.shutdown()
+
+
+def test_preflight_honors_host_rejection_but_preserves_emergency_and_cleanup(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        engine.record_rejected_compaction()
+        assert engine._mark_preflight_compression_requested(
+            operation="compact", reason="eligible_leaf", trigger="threshold",
+        ) is False
+        assert engine.last_compression_was_noop is True
+        assert "backoff" in engine.last_compression_noop_reason
+
+        assert engine._mark_preflight_compression_requested(
+            operation="compact", reason="overflow_recovery",
+        ) is True
+        assert engine._mark_preflight_compression_requested(
+            operation="compact", reason="eligible_leaf", trigger="critical_pressure",
+        ) is True
+        assert engine._mark_preflight_compression_requested(
+            operation="sanitize", reason="replay_cleanup",
+        ) is True
+    finally:
+        engine.shutdown()
+
+
+def test_rejected_eligible_preflight_does_not_reenter_until_backoff_expires(tmp_path):
+    engine = _engine(tmp_path)
+    engine._config.fresh_tail_count = 4
+    engine._config.leaf_chunk_tokens = 100
+    engine.threshold_tokens = 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old backlog " + "compressible segment " * 100},
+        {"role": "assistant", "content": "old answer " + "detail " * 100},
+        {"role": "user", "content": "fresh request"},
+        {"role": "assistant", "content": "fresh answer"},
+        {"role": "user", "content": "new request"},
+    ]
+    try:
+        assert engine.should_compress_preflight(messages) is True
+        engine.record_rejected_compaction()
+        assert engine.should_compress_preflight(messages) is False
+        assert engine.last_compression_was_noop is True
+        assert "backoff" in engine.last_compression_noop_reason
+
+        _HOST_REJECTION_BACKOFF_BY_SESSION[engine._host_rejection_key()] = (
+            time.monotonic() - 1, "would_grow",
+        )
+        assert engine.should_compress_preflight(messages) is True
+    finally:
+        engine.shutdown()

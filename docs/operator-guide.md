@@ -511,6 +511,10 @@ minutes instead of repeating the same expensive pass on every turn. The
 process-local guard is shared by new agent clones for that database/session,
 so a gateway cache eviction does not immediately retrigger it (see
 [upstream issue #582](https://github.com/stephenschoettler/hermes-lcm/issues/582)).
+The engine-driven preflight hook also honors this guard for ordinary model-backed
+maintenance; emergency overflow recovery, critical pressure and deterministic
+sanitation are still eligible. This closes a sub-threshold re-entry path that
+could repeat the same expensive attempt on each turn.
 `lcm_status` exposes `host_rejection_backoff_seconds` and
 `host_rejection_reason`. A new session clears the backoff; an explicit manual
 `/compress` uses Hermes' force path and bypasses the automatic gate.

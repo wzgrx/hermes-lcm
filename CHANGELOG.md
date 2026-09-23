@@ -6,6 +6,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Make engine-driven preflight honor the existing session-scoped host-rejection backoff, preventing a would-grow/no-progress verdict from immediately re-entering the same automatic model-backed maintenance. Emergency overflow recovery, critical pressure, and deterministic sanitation remain eligible (follow-up to upstream #542/#582).
 - Explicit gateway /new clears only the outgoing conversation's automatic summary carry and frontier; historical raw messages and summary nodes remain searchable, and late old-session finalization cannot restore the carry (adapted from upstream PR #625).
 - Retry transient host journal-mode lock contention during concurrent first-open SQLite startup; separate WAL conversion and FTS repair race tests so each tests its own synchronization boundary.
 - Add configurable automatic foreground compaction pass/time ceilings (adapted from upstream PR #621); share one deadline across summary routes and levels, clamp automatic limits to the existing manual ceiling, and keep forced/manual work unchanged.

@@ -321,12 +321,13 @@ class CompactionMixin:
         if replay_messages is not None and not self._compression_boundary_cooldown_active():
             replay_rough = count_messages_tokens(replay_messages)
             pressure_tokens = max(rough, replay_rough)
+            critical_store_pressure = self._critical_budget_pressure_reached(
+                observed_tokens=pressure_tokens,
+                messages=replay_messages,
+            )
             store_maintenance_due = bool(
                 (self.threshold_tokens > 0 and pressure_tokens >= self.threshold_tokens)
-                or self._critical_budget_pressure_reached(
-                    observed_tokens=pressure_tokens,
-                    messages=replay_messages,
-                )
+                or critical_store_pressure
             )
             active_leaf_eligible = False
             if store_maintenance_due:
@@ -359,7 +360,7 @@ class CompactionMixin:
                 return self._mark_preflight_compression_requested(
                     operation="compact",
                     reason="hidden_store_prefix",
-                    trigger="store_backlog",
+                    trigger="critical_pressure" if critical_store_pressure else "store_backlog",
                 )
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
