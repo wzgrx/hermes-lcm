@@ -630,7 +630,9 @@ def test_non_codex_gpt55_keeps_host_context_window(engine):
         "gpt-5.6-luna-900k",
     ],
 )
-def test_exact_codex_900k_routes_cap_higher_host_context(engine, model):
+def test_exact_codex_900k_routes_cap_higher_host_context(engine, model, monkeypatch):
+    # Exercise the compatibility fallback used when the host lacks variant metadata.
+    monkeypatch.setattr("hermes_lcm.codex_routing._is_host_codex_context_variant", lambda _model: False)
     engine.update_model(
         model=model,
         provider="openai-codex",
@@ -643,7 +645,8 @@ def test_exact_codex_900k_routes_cap_higher_host_context(engine, model):
     assert engine.effective_context_length_reason == "codex_oauth_context_cap"
 
 
-def test_exact_codex_900k_session_context_uses_lower_host_bound(tmp_path):
+def test_exact_codex_900k_session_context_uses_lower_host_bound(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermes_lcm.codex_routing._is_host_codex_context_variant", lambda _model: False)
     config = LCMConfig(database_path=str(tmp_path / "codex-900k-session.db"))
     engine = LCMEngine(config=config)
     try:
@@ -675,6 +678,18 @@ def test_exact_codex_900k_session_context_uses_lower_host_bound(tmp_path):
         assert engine.effective_context_length_reason == ""
     finally:
         engine.shutdown()
+
+
+def test_host_declared_codex_variant_keeps_host_context_window(engine, monkeypatch):
+    monkeypatch.setattr("hermes_lcm.codex_routing._is_host_codex_context_variant", lambda _model: True)
+    engine.update_model(
+        model="gpt-5.6-sol-900k",
+        provider="openai-codex",
+        context_length=1_000_000,
+    )
+    assert engine.raw_context_length == 1_000_000
+    assert engine.context_length == 1_000_000
+    assert engine.effective_context_length_cap is None
 
 
 def test_session_start_does_not_overwrite_update_model_context_length_with_stale_metadata(engine):
