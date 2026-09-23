@@ -1,4 +1,4 @@
-"""Explicit /new fences summary carry without deleting historical evidence."""
+"""Explicit /new removes summary carry while preserving raw source messages."""
 
 import importlib.util
 import sys
@@ -7,6 +7,8 @@ from pathlib import Path
 
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.lifecycle_state import LifecycleStateStore
+from hermes_lcm.store import MessageStore
+from hermes_lcm.vector_store import VectorStore
 from hermes_lcm.session_reset import reset_explicit_new_carry
 
 
@@ -22,7 +24,7 @@ def _load_plugin_module():
     return module
 
 
-def test_explicit_new_clears_carry_but_keeps_history_and_other_conversations(tmp_path):
+def test_explicit_new_forgets_owned_summary_nodes_and_keeps_other_conversations(tmp_path):
     db_path = tmp_path / "lcm.db"
     lifecycle = LifecycleStateStore(db_path)
     dag = SummaryDAG(db_path)
@@ -41,13 +43,61 @@ def test_explicit_new_clears_carry_but_keeps_history_and_other_conversations(tmp
         assert state.last_finalized_frontier_store_id == 0
         assert state.current_frontier_store_id == 0
         assert state.last_reset_at is not None
-        assert len(dag.get_session_nodes("old")) == 1
+        assert dag.get_session_nodes("old") == []
+        assert len(dag.get_session_nodes("other")) == 1
+        assert result["deleted_nodes"] == 1
         assert lifecycle.get_by_conversation("chat-b").last_finalized_session_id == "other"
 
         lifecycle.bind_session("new", conversation_id="chat-a")
         assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id is None
         assert dag.get_session_nodes("new") == []
     finally:
+        dag.close()
+        lifecycle.close()
+
+
+def test_explicit_new_forgets_current_and_finalized_summaries_not_raw_rows(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    lifecycle = LifecycleStateStore(db_path)
+    dag = SummaryDAG(db_path)
+    store = MessageStore(db_path)
+    vectors = VectorStore(db_path)
+    try:
+        lifecycle.bind_session("old", conversation_id="chat-a")
+        lifecycle.finalize_session("chat-a", "old", frontier_store_id=42)
+        lifecycle.bind_session("fresh", conversation_id="chat-a")
+        lifecycle.bind_session("unrelated", conversation_id="chat-b")
+        old_node_id = dag.add_node(SummaryNode(session_id="old", depth=0, summary="old leaf"))
+        dag.add_node(SummaryNode(session_id="old", depth=2, summary="old high-level"))
+        dag.add_node(SummaryNode(session_id="fresh", depth=0, summary="new segment"))
+        dag.add_node(SummaryNode(session_id="unrelated", depth=1, summary="other topic"))
+        store.append("old", {"role": "user", "content": "raw source remains"})
+        identity = vectors.register_profile("cleanup-test", "local", 2)
+        vectors.connection.execute(
+            "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) VALUES (?, ?, ?)",
+            (str(old_node_id), identity, bytes(8)),
+        )
+        vectors.connection.execute(
+            "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, identity_hash, embedded_at, source_token_count, archived) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (str(old_node_id), "summary", identity, "2026-01-01", 1, 0),
+        )
+        vectors.connection.commit()
+
+        result = reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")
+        assert result["deleted_nodes"] == 3
+        assert dag.get_session_nodes("old") == []
+        assert dag.get_session_nodes("fresh") == []
+        assert len(dag.get_session_nodes("unrelated")) == 1
+        assert len(store.get_session_messages("old")) == 1
+        assert vectors.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_vectors WHERE embedded_id = ?",
+            (str(old_node_id),),
+        ).fetchone()[0] == 0
+        assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id is None
+    finally:
+        vectors.close()
+        store.close()
         dag.close()
         lifecycle.close()
 

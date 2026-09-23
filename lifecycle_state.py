@@ -716,12 +716,12 @@ class LifecycleStateStore:
 
     @_synchronized
     def clear_carry_for_explicit_new(self, old_session_id: str) -> LifecycleState | None:
-        """Fence an explicit /new while preserving old summaries for recall."""
+        """Fence an explicit /new after verifying ownership of the outgoing session."""
         state = self.get_by_session(old_session_id)
         if state is None:
             return None
         now = time.time()
-        self._conn.execute(
+        cursor = self._conn.execute(
             """
             UPDATE lcm_lifecycle_state
             SET current_session_id = CASE WHEN current_session_id = ? THEN NULL
@@ -751,7 +751,7 @@ class LifecycleStateStore:
             ),
         )
         self._conn.commit()
-        return self.get_by_conversation(state.conversation_id)
+        return self.get_by_conversation(state.conversation_id) if cursor.rowcount == 1 else None
 
     @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:
