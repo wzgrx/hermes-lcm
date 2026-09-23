@@ -300,10 +300,10 @@ def test_concurrent_lazy_initialization_is_idempotent(tmp_path):
         finally:
             store.close()
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _index: initialize(), range(2)))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _index: initialize(), range(8)))
 
-    assert results == [[], []]
+    assert results == [[]] * 8
     with sqlite3.connect(db_path) as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM lcm_migration_state WHERE step_name = ?",

@@ -18,3 +18,12 @@ For a live database, keep diagnostics read-only while the gateway is running.
 Before any repair, take a consistent SQLite backup and verify it with
 `PRAGMA quick_check`; never delete a message merely to silence a missing-ref
 warning.
+
+Local concurrency regression found during the #585 follow-up: two lazy
+`AssertionStore` initializers could expose a missing
+`lcm_assertion_source_insert_guard` between `DROP TRIGGER` and the subsequent
+`executescript`. The assertion-family DDL now rebuilds that guard inside one
+`BEGIN IMMEDIATE` / `COMMIT` transaction. The parallel initializer test covers
+eight opens and was repeated 20 times locally; this is narrower than upstream
+[#601](https://github.com/stephenschoettler/hermes-lcm/issues/601)'s broader
+WAL/handle incident, which needs its own ongoing audit.

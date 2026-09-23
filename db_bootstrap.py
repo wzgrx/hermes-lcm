@@ -1928,9 +1928,14 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
     # This guard is owned by the rebuildable assertion family. Recreate it so
     # databases opened after the optional source-time migration compare the
     # derived observation time, with the legacy write timestamp as fallback.
-    conn.execute("DROP TRIGGER IF EXISTS lcm_assertion_source_insert_guard")
-    conn.executescript(
-        """
+    # Keep the drop and recreate in ONE SQLite transaction. Otherwise a
+    # concurrent lazy opener can verify between the two statements and see a
+    # transiently missing trigger even though both initializers succeed.
+    try:
+        conn.executescript(
+            """
+        BEGIN IMMEDIATE;
+        DROP TRIGGER IF EXISTS lcm_assertion_source_insert_guard;
         CREATE TABLE IF NOT EXISTS lcm_assertion_sources (
             source_store_id INTEGER NOT NULL,
             extraction_version TEXT NOT NULL
@@ -2143,8 +2148,12 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
                AND extraction_version = OLD.extraction_version
                AND source_content_sha256 = OLD.source_content_sha256;
         END;
-        """
-    )
+        COMMIT;
+            """
+        )
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 @lru_cache(maxsize=1)
