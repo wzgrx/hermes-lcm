@@ -807,7 +807,6 @@ class LifecycleStateStore:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            sessions_with_data: set[str] = set()
             tables = {
                 row[0] for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
@@ -829,17 +828,6 @@ class LifecycleStateStore:
                     return True
                 return False
 
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-
             now = time.time()
             max_age_seconds = (
                 float(max_age_hours) * 3600.0
@@ -855,10 +843,6 @@ class LifecycleStateStore:
                 cur = str(row["current_session_id"] or "")
                 fin = str(row["last_finalized_session_id"] or "")
 
-                if ((cur and cur in sessions_with_data)
-                        or (fin and fin in sessions_with_data)):
-                    continue
-
                 refs = {r for r in (cur, fin) if r}
                 if refs & protected:
                     continue
@@ -872,10 +856,11 @@ class LifecycleStateStore:
                     if row_age is not None and (now - float(row_age)) < max_age_seconds:
                         continue
 
-                # Recheck against the tables right before deletion. BEGIN
-                # IMMEDIATE blocks concurrent writers while this transaction is
-                # open; this fresh query also keeps the safety check honest if
-                # the broad snapshot logic above changes later.
+                # Probe only the referenced sessions through their indexes;
+                # materializing every distinct session in the large message/DAG
+                # tables would hold BEGIN IMMEDIATE across whole-table scans.
+                # The write lock prevents a concurrent ingest between the probe
+                # and deletion of this empty lifecycle row.
                 if _session_has_data(cur) or _session_has_data(fin):
                     continue
 

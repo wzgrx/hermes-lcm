@@ -78,3 +78,29 @@ def test_summary_only_session_still_finalizes(tmp_path):
         lifecycle.close()
         dag.close()
         messages.close()
+
+
+def test_empty_lifecycle_gc_probes_referenced_sessions_only(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    messages = MessageStore(db_path)
+    dag = SummaryDAG(db_path)
+    lifecycle = LifecycleStateStore(db_path)
+    try:
+        messages.append("historical", {"role": "user", "content": "retain"})
+        lifecycle.bind_session("empty", conversation_id="empty-conversation")
+        statements = []
+        lifecycle.connection.set_trace_callback(statements.append)
+        assert lifecycle.prune_empty_sessions() == 1
+        lifecycle.connection.set_trace_callback(None)
+        normalized = [statement.upper() for statement in statements]
+        assert any("SELECT 1 FROM MESSAGES WHERE SESSION_ID" in sql for sql in normalized)
+        assert any("SELECT 1 FROM SUMMARY_NODES WHERE SESSION_ID" in sql for sql in normalized)
+        assert not any("SELECT DISTINCT SESSION_ID" in sql for sql in normalized)
+        retained = messages.connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", ("historical",)
+        ).fetchone()[0]
+        assert retained == 1
+    finally:
+        lifecycle.close()
+        dag.close()
+        messages.close()
