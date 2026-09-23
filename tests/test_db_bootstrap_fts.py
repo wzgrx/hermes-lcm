@@ -687,10 +687,51 @@ def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, mon
     conn.commit()
     assert db_bootstrap.load_integrity_failed(conn, spec) is not None
 
-    # Index is healthy: repair makes no rebuild but must still clear the flag.
-    repaired = db_bootstrap.repair_external_content_fts(conn, spec, throttle=True)
+    # Explicit repair checks the index and clears the stale flag on a pass.
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec, throttle=False)
     assert repaired["rebuilt"] is False
     assert db_bootstrap.load_integrity_failed(conn, spec) is None
+    conn.close()
+
+
+def test_throttled_startup_preserves_unverified_integrity_failure(tmp_path, monkeypatch):
+    """A fresh throttle marker alone is not proof that a failure flag is stale."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+    db_bootstrap._record_integrity_failed(conn, spec, detail="pending verification")
+    conn.commit()
+
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec, throttle=True)
+    assert repaired["rebuilt"] is False
+    assert db_bootstrap.load_integrity_failed(conn, spec) is not None
+    conn.close()
+
+
+def test_startup_does_not_erase_background_scan_failure(tmp_path, monkeypatch):
+    """The worker can finish before the bind fast path reaches its commit."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+    conn.execute(
+        "UPDATE messages SET content = 'completely different searchable text' WHERE store_id = 1"
+    )
+    conn.commit()
+    _age_marker(conn)
+    assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+
+    original_missing_triggers = db_bootstrap._fts_missing_triggers
+
+    def wait_for_worker(conn_, spec_):
+        db_bootstrap.join_background_integrity_scans(timeout=30)
+        return original_missing_triggers(conn_, spec_)
+
+    monkeypatch.setattr(db_bootstrap, "_fts_missing_triggers", wait_for_worker)
+    ensure_external_content_fts(conn, spec)
+    assert db_bootstrap.load_integrity_failed(conn, spec) is not None
     conn.close()
 
 

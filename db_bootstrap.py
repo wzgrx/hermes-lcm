@@ -2726,16 +2726,18 @@ def _run_background_integrity_scan(
                 _record_integrity_failed(
                     meta_conn, spec, detail=result.get("detail", ""), now=started_at
                 )
+            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+            # so the next bind retries; do not stamp or flag.
+            _clear_scan_started(meta_conn, spec, expected=started_at)
+            meta_conn.commit()
+            if status == "fail":
+                # Emit the warning only after the corruption marker is durable.
                 logger.warning(
                     "Background FTS integrity-check found corruption in '%s': %s. "
                     "Run `/lcm doctor repair apply` to rebuild the index.",
                     spec.table_name,
                     result.get("detail", ""),
                 )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
         finally:
             meta_conn.close()
     except Exception:  # pragma: no cover - defensive
@@ -2853,6 +2855,10 @@ def _fts_needs_rebuild(
     result = check_external_content_fts_integrity(conn, spec)
     if result["status"] == "pass":
         _record_integrity_checked(conn, spec, now=now)
+        # Only a completed deep check proves an old failure flag is stale.
+        # The startup fast path may merely dispatch a background check; clearing
+        # the flag there can race its worker and erase newly found corruption.
+        _clear_integrity_failed(conn, spec)
     return result["status"] == "fail"
 
 
@@ -3051,7 +3057,6 @@ def repair_external_content_fts(
             # Return on the healthy fast path only while it is still complete;
             # any observed trigger repair must pass through write ownership below.
             if not _fts_missing_triggers(conn, spec):
-                _clear_integrity_failed(conn, spec)
                 conn.commit()
                 return {
                     "rebuilt": False,
