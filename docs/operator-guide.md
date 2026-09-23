@@ -694,6 +694,12 @@ The `journal_mode_config` check compares the readable host
 configuration, an invalid setting, or an explicit/actual mismatch is a warning,
 not a live-mode conversion. Check config readability and close all SQLite
 connections before any deliberate offline WAL-to-DELETE conversion.
+On POSIX hosts without Linux `O_PATH` plus `/proc/self/fd`, an existing SQLite
+file or sidecar with permissions wider than `0600` is left untouched and startup
+reports an offline permission-repair error. Stop all processes using the
+database, tighten the named artifact to `0600`, then restart. This preserves
+SQLite advisory locks; the plugin does not use a regular open/close merely to
+change permissions on a live database.
 
 Externalized-payload integrity is state-aware. References in plugin-local
 `lcm.db` and host-owned `state.db` both keep a payload live; doctor reports the

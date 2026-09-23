@@ -7,7 +7,10 @@ This fork follows stephenschoettler/hermes-lcm while carrying a small set of rev
 - origin: wzgrx/hermes-lcm, the maintained fork
 - upstream: stephenschoettler/hermes-lcm, the source project
 
-Never force-push the maintained main branch. Bring upstream changes into a short-lived sync branch, run the complete validation matrix, and merge them through a pull request.
+Never force-push the maintained main branch. Bring upstream changes into a
+short-lived local sync branch, run the complete validation matrix, then
+fast-forward and push the maintained `main` directly, as requested by the
+maintainer. Do not open a pull request for routine fork maintenance.
 
 ## Update procedure
 
@@ -16,31 +19,23 @@ Never force-push the maintained main branch. Bring upstream changes into a short
 3. Merge upstream/main into the sync branch. Preserve upstream authorship and resolve conflicts against current behavior rather than blindly preferring either side.
 4. Retire a carried patch when upstream contains an equivalent tested fix.
 5. Run the validation commands below.
-6. Push the sync branch and open a pull request against origin/main.
-7. Merge only after GitHub Actions and the local validation gate pass.
-8. Update the installed checkout and restart Hermes through its drain-aware gateway command.
+6. Fast-forward local `main` to the validated sync branch, then push `main`
+   directly to origin (without rewriting history).
+7. Confirm GitHub Actions and the local validation gate pass. If CI fails,
+   fix forward on `main` and re-run the gate.
+8. Update the installed checkout and restart Hermes through its drain-aware
+   gateway command after checking active work.
 
-## Deploy a pull-request branch for review
+## Deploy the maintained main branch
 
-Keep the live checkout, the updater comparison ref, and the documented branch
-identity aligned. A branch deployment is review state, not a permanent fork of
-history.
-
-1. Start the review branch from `origin/main`, commit the scoped change, push it,
-   and open a pull request against the maintained fork's `main`.
-2. In the live checkout, fetch that exact branch and switch to a local tracking
-   branch of the same name. Do not rebase or force-push it after deployment.
-3. Temporarily configure the local updater to compare that checkout with
-   `origin/<review-branch>`. Comparing the live PR checkout with `origin/main`
-   creates false ahead/behind results and can replay the wrong commits.
-4. Run the required validation below, Plugin Doctor, and SQLite health checks,
-   then restart Hermes and confirm the reported loaded branch/commit.
-5. After merge, move the checkout and updater together back to
-   `main`/`origin/main`. Preserve a backup ref for rollback.
+Keep the live checkout and updater comparison ref aligned to `main` and
+`origin/main`. Validate the exact pushed commit, run Plugin Doctor and SQLite
+health checks, then restart Hermes after its active work is drained. Record the
+loaded commit and keep the previous commit as a rollback reference.
 
 `hermes plugins install --ref` is suitable for a one-commit immutable pin only:
-its `--ref` value must be a full 40-character commit SHA. Use a Git tracking
-branch when the requirement is to follow an open pull-request branch.
+its `--ref` value must be a full 40-character commit SHA. Use the Git-tracking
+`main` branch for ongoing updates.
 
 ## Required validation
 
@@ -67,7 +62,7 @@ Every fork-only change must have:
 - a focused regression test;
 - an issue, upstream pull request, or reproducible local failure explaining why it exists;
 - a clear retirement condition;
-- an entry in the pull request that introduced or retained it.
+- an entry in the commit and upstream audit that introduced or retained it.
 
 Current carried changes cover threshold-aware preflight maintenance, SQLite POSIX-lock preservation while enforcing private file modes, public lifecycle-hook registration for current Hermes hosts, the reviewed mutated-tail replay reconciliation from upstream PR #613, and the native-Anthropic tool-schema compatibility fix from PR #618.
 

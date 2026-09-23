@@ -111,6 +111,16 @@ def _chmod_sqlite_artifact_at(
             # process's SQLite locks on the file for no benefit.
             return True
 
+        if not _CHMOD_THROUGH_PATH_DESCRIPTOR:
+            # A regular open/fchmod/close of a live SQLite inode drops *all*
+            # same-process POSIX locks. A path-only chmod cannot pin identity
+            # across a directory-entry swap. Preserve both invariants: leave
+            # the existing file untouched and require offline chmod instead.
+            raise _sqlite_artifact_error(
+                path, "unsafe to tighten permissions while SQLite may hold locks; "
+                "stop all connections and chmod the artifact to 0600 offline",
+            )
+
     use_path_descriptor = expected is not None and _CHMOD_THROUGH_PATH_DESCRIPTOR
     if use_path_descriptor:
         flags = _O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)

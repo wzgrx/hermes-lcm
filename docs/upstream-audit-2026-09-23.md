@@ -55,3 +55,13 @@ read-only, and a partial `/proc` scan is reported rather than described as
 clean. Same-UID scan coverage does not certify other users' processes or prove
 every #601 cause absent. A subprocess regression proves a CLI doctor detects
 an orphaned WAL held by a separate long-running process.
+
+2026-09-24 additional #588 regression found that the permission helper's
+non-`O_PATH` fallback still used a regular `open`/`fchmod`/`close` when an
+existing SQLite artifact had loose permissions. With a live WAL connection, the
+test reproduced sidecar removal after another process closed. The fallback now
+leaves a loose existing artifact untouched and reports an offline `chmod 0600`
+requirement; already-private artifacts remain usable. O_PATH-enabled Linux
+continues to tighten modes online with identity-pinned descriptors. Tests cover
+both a loose database file and a loose WAL sidecar while a connection is live.
+This does not establish that every #601 corruption mechanism is resolved.

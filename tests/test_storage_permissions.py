@@ -76,9 +76,9 @@ def _assert_searchable_store_integrity(store: MessageStore) -> None:
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-@pytest.fixture(params=["path-descriptor", "regular-descriptor"])
+@pytest.fixture(params=["path-descriptor", "no-path-descriptor"])
 def chmod_descriptor(request, monkeypatch):
-    """Run a permission test through both artifact chmod strategies."""
+    """Run permission tests with and without the safe O_PATH route."""
     if request.param == "path-descriptor":
         if not sqlite_util_module._CHMOD_THROUGH_PATH_DESCRIPTOR:
             pytest.skip("requires O_PATH and /proc/self/fd")
@@ -193,6 +193,44 @@ def test_permission_helpers_tighten_loose_database_without_releasing_sqlite_lock
         held.close()
 
 
+@pytest.mark.parametrize("helper", ["prepare", "restrict", "message_store"])
+def test_no_path_descriptor_refuses_loose_live_database_without_losing_locks(
+    tmp_path, monkeypatch, helper,
+):
+    """macOS and proc-less Linux must not open/close a live SQLite artifact."""
+    monkeypatch.setattr(sqlite_util_module, "_CHMOD_THROUGH_PATH_DESCRIPTOR", False)
+    db_path = tmp_path / "lcm.db"
+    held = _hold_wal_connection(db_path)
+    store = None
+    try:
+        for artifact in _sqlite_artifacts(db_path):
+            if artifact.exists():
+                artifact.chmod(0o644)
+
+        with pytest.raises(OSError, match="unsafe to tighten permissions"):
+            store = _run_permission_helper(helper, db_path)
+        _assert_wal_survives_other_process_close(db_path, held)
+    finally:
+        if store is not None:
+            store.close()
+        held.close()
+
+
+def test_no_path_descriptor_refuses_loose_live_wal_without_losing_locks(tmp_path, monkeypatch):
+    monkeypatch.setattr(sqlite_util_module, "_CHMOD_THROUGH_PATH_DESCRIPTOR", False)
+    db_path = tmp_path / "lcm.db"
+    held = _hold_wal_connection(db_path)
+    try:
+        db_path.chmod(0o600)
+        db_path.with_name(db_path.name + "-wal").chmod(0o644)
+
+        with pytest.raises(OSError, match="unsafe to tighten permissions"):
+            sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+        _assert_wal_survives_other_process_close(db_path, held)
+    finally:
+        held.close()
+
+
 def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path):
     db_path = tmp_path / "database" / "lcm.db"
 
@@ -255,6 +293,8 @@ def test_message_store_refuses_created_directory_swap_before_chmod(tmp_path, mon
 
 
 def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path, chmod_descriptor):
+    if chmod_descriptor == "no-path-descriptor":
+        pytest.skip("loose artifacts require offline chmod without O_PATH")
     db_dir = tmp_path / "existing"
     db_dir.mkdir(mode=0o755)
     db_dir.chmod(0o755)
@@ -320,6 +360,8 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
     link_kind,
     chmod_descriptor,
 ):
+    if chmod_descriptor == "no-path-descriptor":
+        pytest.skip("fallback refuses loose artifacts before chmod")
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-wal")
     sidecar.write_text("replace me", encoding="utf-8")
@@ -356,6 +398,8 @@ def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
     monkeypatch,
     chmod_descriptor,
 ):
+    if chmod_descriptor == "no-path-descriptor":
+        pytest.skip("fallback refuses loose artifacts before open")
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-journal")
     replacement = tmp_path / "replacement-journal"
@@ -391,6 +435,8 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     monkeypatch,
     chmod_descriptor,
 ):
+    if chmod_descriptor == "no-path-descriptor":
+        pytest.skip("fallback refuses loose artifacts before open")
     db_path = tmp_path / "lcm.db"
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
@@ -422,6 +468,8 @@ def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     monkeypatch,
     chmod_descriptor,
 ):
+    if chmod_descriptor == "no-path-descriptor":
+        pytest.skip("fallback refuses loose artifacts before open")
     db_path = tmp_path / "lcm.db"
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
