@@ -1868,11 +1868,16 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
                 for field, value in (("content", content), ("tool_calls", tool_calls)):
                     if not isinstance(value, str):
                         continue
-                    # Be conservative at the host boundary: any exact payload
-                    # basename retained by state.db is enough to keep the file.
-                    # Host rows may wrap the placeholder in transport metadata
-                    # that the stricter LCM-row parser intentionally ignores.
-                    for ref in (candidate for candidate in existing_files if candidate in value):
+                    # Recognized placeholders must be counted even if their
+                    # JSON file is missing; otherwise host-only missing refs
+                    # disappear from the integrity report. Retain the broader
+                    # basename check for *existing* files because host transport
+                    # metadata can wrap the placeholder in an unknown format.
+                    refs = set(_refs_for_externalized_integrity_scan(
+                        value, role=str(role or ""), field=field,
+                    ))
+                    refs.update(candidate for candidate in existing_files if candidate in value)
+                    for ref in refs:
                         host_referenced_refs.add(ref)
                         first_location_by_ref.setdefault(
                             ref,

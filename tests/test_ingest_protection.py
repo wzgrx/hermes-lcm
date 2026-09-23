@@ -2101,6 +2101,46 @@ def test_externalized_payload_integrity_scan_preserves_host_state_refs(tmp_path)
     assert detail["externalized_payload_host_scan_error"] == ""
 
 
+def test_externalized_payload_integrity_scan_reports_missing_host_only_ref(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+
+    state_db = Path(engine._hermes_home) / "state.db"
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    state_conn = sqlite3.connect(state_db)
+    state_conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, tool_calls TEXT)"
+    )
+    state_conn.execute(
+        "INSERT INTO messages VALUES (1, 'host-session', 'assistant', ?, NULL)",
+        ("[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
+         "chars=7; bytes=7; ref=missing-host.json]",),
+    )
+    state_conn.commit()
+    state_conn.close()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn, engine._config, hermes_home=engine._hermes_home
+    )
+
+    assert detail["externalized_payload_lcm_refs_total"] == 0
+    assert detail["externalized_payload_host_only_refs"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [{
+        "store_id": 1,
+        "session_id": "host-session",
+        "source": "hermes-state",
+        "role": "assistant",
+        "field": "content",
+        "externalized_ref": "missing-host.json",
+    }]
+    verify_conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+    try:
+        assert verify_conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 1
+    finally:
+        verify_conn.close()
+
+
 def test_externalized_payload_integrity_scan_detects_embedded_content_placeholder_with_trailing_text(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()
