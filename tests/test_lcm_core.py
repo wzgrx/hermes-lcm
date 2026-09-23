@@ -5089,6 +5089,35 @@ class TestIngestExternalization:
         expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": by_store_id["externalized_ref"], "max_tokens": 20_000}, engine=engine))
         assert expanded["content"] == full_result
 
+    def test_ingest_recovers_windows_text_mode_persisted_output(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "FULL_RECOVERED_NEEDLE:\n" + ("abcdef\n" * 1000)
+        persisted_path = host_storage / "call_windows.txt"
+        persisted_path.write_bytes(full_result.replace("\n", "\r\n").encode("utf-8"))
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 6.8 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_windows", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert len(stored) == 1
+        assert stored[0]["content"].startswith("[Externalized tool output:")
+        payload_file = next(output_dir.glob("*.json"))
+        assert json.loads(payload_file.read_text())["content"] == full_result
+
     def test_ingest_preserves_marker_when_recovered_file_preview_does_not_match(self, tmp_path, monkeypatch):
         import tempfile
 

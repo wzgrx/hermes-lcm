@@ -542,9 +542,11 @@ def recover_hermes_persisted_output_with_file_stat(text: str | None) -> tuple[st
     Recovery is intentionally conservative: the marker must include Hermes'
     character count, the file path must be an absolute basename under a
     `hermes-results` temp directory, the target must be a regular non-symlink
-    file, and the recovered character count must match the marker. If any check
-    fails, callers should keep the marker/preview instead of claiming lossless
-    recovery from an unsafe or stale file.
+    file, and the recovered character count must match the marker. Windows
+    text-mode writes expand each LF to CRLF; invert only that exact expansion
+    before checking the marker's count and preview. If any check fails, callers
+    should keep the marker/preview instead of claiming lossless recovery from
+    an unsafe or stale file.
     """
     if not isinstance(text, str) or not _is_hermes_persisted_output_marker(text):
         return None
@@ -563,7 +565,16 @@ def recover_hermes_persisted_output_with_file_stat(text: str | None) -> tuple[st
         return None
     recovered, file_stat = recovered_with_stat
     if len(recovered) != expected_chars:
-        return None
+        newline_count = recovered.count("\n")
+        if (
+            not newline_count
+            or len(recovered) != expected_chars + newline_count
+            or recovered.count("\r\n") != newline_count
+        ):
+            return None
+        recovered = recovered.replace("\r\n", "\n")
+        if len(recovered) != expected_chars:
+            return None
     preview_prefix = _persisted_output_preview_prefix(text)
     if not preview_prefix or not recovered.startswith(preview_prefix):
         return None
