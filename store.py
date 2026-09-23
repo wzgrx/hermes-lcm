@@ -643,9 +643,11 @@ class MessageStore:
         base64 payloads into ``[Externalized LCM ingest payload: …]``
         placeholders whose filename embeds a per-pass ``time_ns`` suffix, so
         byte-exact equality would miss a replayed turn whose placeholder was
-        regenerated. The SQL range narrows on raw stored content (indexed on
-        ``idx_msg_session_source_time``), then each surviving row's content
-        and the candidate's content are compared in Python through
+        regenerated. The SQL range narrows on session/source time (indexed by
+        ``idx_msg_session_source_time``). For ordinary text the probe also
+        filters on raw content; for externalized placeholders it must NOT do
+        so because each protection pass can generate a new ref. Each surviving
+        row's content and the candidate's content are compared in Python through
         ``_restore_ingest_payload_placeholder_refs``: both sides resolve to
         the same stable identity (payload content when the ref's payload
         exists for this session, else a session-agnostic ``ref=<filename>``
@@ -683,24 +685,34 @@ class MessageStore:
             hermes_home=self._hermes_home,
             session_id=session_id,
         )
+        # The content column is an inexpensive extra filter for ordinary
+        # messages, but regenerated externalized refs differ even when their
+        # underlying payloads are identical. Keep the indexed session/source-
+        # time range and compare restored identities in Python in that case.
+        has_externalized_ref = isinstance(content, str) and any(
+            marker in content for marker in (
+                "[Externalized LCM ingest payload:",
+                "[Externalized payload:",
+                "[Externalized tool output:",
+                "[GC'd externalized payload:",
+                "[GC'd externalized tool output:",
+            )
+        )
+        content_clause = "" if has_externalized_ref else "AND content IS ?"
+        params = (session_id, role)
+        if not has_externalized_ref:
+            params += (content,)
+        params += (tool_call_id, tool_name, anchor - window, anchor + window)
         try:
             rows = self._fetchall(
                 f"""SELECT content, tool_calls FROM messages
                    WHERE session_id = ?
                      AND role = ?
-                     AND content IS ?
+                     {content_clause}
                      AND tool_call_id IS ?
                      AND tool_name IS ?
                      AND {source_time} >= ? AND {source_time} <= ?""",
-                (
-                    session_id,
-                    role,
-                    content,
-                    tool_call_id,
-                    tool_name,
-                    anchor - window,
-                    anchor + window,
-                ),
+                params,
             )
         except sqlite3.Error:
             logger.debug("Replay-duplicate probe failed; storing the message", exc_info=True)

@@ -26,6 +26,7 @@ from __future__ import annotations
 import time
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.ingest_protection import protect_messages_for_ingest
 from hermes_lcm.store import MessageStore
 from tests.test_tool_contracts import LCMEngine  # host-stub tolerant import
 
@@ -182,12 +183,62 @@ def test_reserialized_tool_calls_still_match_durable_row(tmp_path):
         store.close()
 
 
-def test_regenerated_ingest_payload_placeholder_still_dedupes(tmp_path):
-    """(P1 4043783280) Ingest protection rewrites inline payloads into
-    ``[Externalized LCM ingest payload: …]`` placeholders whose filename
-    embeds a per-pass ``time_ns`` suffix; a replayed turn whose placeholder
-    was regenerated must still dedupe against the durable row (the payload
-    sidecar content, not the generated filename, is the identity)."""
+def test_regenerated_inline_media_ref_dedupes_by_payload(tmp_path):
+    """A regenerated always-on ingest ref differs from the stored SQL text.
+
+    The generic whole-message externalizer reuses a prior sidecar and cannot
+    exercise this path; use inline media with generic externalization disabled.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    store = MessageStore(
+        tmp_path / "inline-media.db",
+        ingest_protection_config=LCMConfig(
+            database_path=str(tmp_path / "inline-media.db"),
+            large_output_externalization_enabled=False,
+            large_output_externalization_path=str(home / "externalized"),
+        ),
+        hermes_home=str(home),
+    )
+    try:
+        ts = time.time() - 1
+        body = "picture data:image/png;base64," + ("QUJDREVG" * 700)
+
+        def message(text):
+            return [{"role": "user", "content": text, "timestamp": ts}]
+
+        first = store.append_batch("sess-media", message(body))
+        assert first[0] > 0
+        original_ref = store.get_session_messages("sess-media")[0]["content"]
+        assert "[Externalized LCM ingest payload:" in original_ref
+
+        regenerated = protect_messages_for_ingest(
+            message(body),
+            config=store._ingest_protection_config,
+            hermes_home=store._hermes_home,
+            session_id="sess-media",
+        )
+        assert regenerated[0]["content"] != original_ref
+        second = store._append_protected_batch("sess-media", regenerated)
+        assert second == [-1]
+        assert store.get_session_count("sess-media") == 1
+        assert store._deduped_replay_count == 1
+
+        # Same source time and size, different payload: identity remains distinct.
+        distinct = "picture data:image/png;base64," + ("QUJDREVH" * 700)
+        third = store.append_batch("sess-media", message(distinct))
+        assert third[0] > 0
+        assert store.get_session_count("sess-media") == 2
+    finally:
+        store.close()
+
+
+def test_reused_generic_payload_placeholder_still_dedupes(tmp_path):
+    """Generic whole-message protection reuses a matching prior sidecar.
+
+    The resulting byte-identical placeholder still dedupes. The separate
+    inline-media test covers truly regenerated refs with different filenames.
+    """
     store = MessageStore(
         tmp_path / "payload-placeholder.db",
         ingest_protection_config=LCMConfig(
@@ -219,9 +270,8 @@ def test_regenerated_ingest_payload_placeholder_still_dedupes(tmp_path):
         stored_content = rows[0]["content"]
         assert stored_content.startswith("[Externalized ") and "ref=" in stored_content
 
-        # Replay with the ORIGINAL body re-protected: a NEW sidecar with a
-        # fresh time_ns filename is written, so the raw placeholder text
-        # differs byte-for-byte — the identity must still match.
+        # Replay with the original body; the generic externalizer reuses the
+        # existing sidecar and the stored placeholder remains byte-identical.
         second = store.append_batch("sess-p", msgs(payload), source="cli",
                                     conversation_id="conv-1")
         assert all(sid == -1 for sid in second), (
