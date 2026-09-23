@@ -212,7 +212,7 @@ invalid values, and unknown `lcm:` keys:
 | `LCM_AUTOMATIC_FOREGROUND_MAX_PASSES` | `12` | Pass ceiling for automatic (non-forced) foreground compaction. Values above 12 use 12; forced compaction is unaffected |
 | `LCM_AUTOMATIC_FOREGROUND_MAX_SECONDS` | `120` | Best-effort wall-clock ceiling for automatic (non-forced) foreground compaction. Provider calls share one deadline; forced compaction is unaffected. Values above 120 use 120 |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
-| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
+| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | Fallback engine-reset retention (`-1` all, `0` none); explicit `/new` hooks with a verified outgoing session clear that conversation's summaries at every depth |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
 | `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, extracted text parts for structured/multimodal content, or normalized JSON fallback when no text parts exist) is excluded from LCM storage |
@@ -324,9 +324,10 @@ a daily re-stales its containing week and month so aggregates never remain
 
 **Scope and rotation boundary.** Rollups are scoped to the LCM session id.
 Summary nodes carry no conversation-family key at this layer, so a rollup does
-not automatically span sessions across a `/new` rotation; after a rotation,
-retained higher-depth summaries are carried into the new session and remain
-retrievable, but per-period rollup rows are rebuilt under the new session scope.
+not automatically span sessions across a `/new` rotation; a verified explicit
+`/new` clears that conversation's DAG summary carry at every depth while
+preserving raw rows for explicit recall. Per-period rollup rows remain scoped
+to their original session and are rebuilt under the new session scope.
 Build-cursor state is tracked per `(period_kind, scope)` so multiple scopes
 sharing one database never share a cursor.
 

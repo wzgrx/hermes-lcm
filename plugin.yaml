@@ -21,6 +21,7 @@ provides_tools:
 # Context-engine schemas are surfaced via register_context_engine on message-blind hosts.
 # PluginContext.register_tool is conditional to avoid shadowing message-aware dispatch.
 provides_hooks:
+  - on_session_finalize
   - on_session_reset
   - pre_llm_call
   - post_llm_call

@@ -53,7 +53,7 @@ For the installed Hermes integration, also run:
     hermes plugins doctor hermes-lcm
     sqlite3 ~/.hermes/lcm.db 'PRAGMA quick_check; PRAGMA journal_mode;'
 
-On the current Hermes host, a healthy Plugin Doctor reports 15 tools and 5
+On the current Hermes host, a healthy Plugin Doctor reports 15 tools and 6
 hooks, with registration and discovery passing. Treat `--ci` warnings as a
 manifest/runtime drift signal; the count alone is not a compatibility test.
 

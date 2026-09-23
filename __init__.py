@@ -360,21 +360,27 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
     return _handler
 
 
-def _on_explicit_session_reset(engine, **payload):
+def _on_explicit_session_reset(engine, cli_pairing=None, **payload):
     """Fence the old conversation after a gateway /new hook.
 
-    Gateway supplies old_session_id; a host surface without an outgoing ID
-    leaves durable state unchanged rather than guessing another chat's owner.
+    Gateway supplies old_session_id. CLI may omit it, in which case a paired
+    finalize event and verified host session rotation prove the outgoing ID.
     """
     if str(payload.get("reason") or "") != "new_session":
         return None
     old_session_id = str(payload.get("old_session_id") or "")
+    hermes_home = str(payload.get("hermes_home") or engine._hermes_home)
+    if (not old_session_id and cli_pairing is not None
+            and str(payload.get("platform") or "").lower() == "cli"):
+        old_session_id = cli_pairing.consume_verified_old_session(
+            new_session_id=str(payload.get("session_id") or ""),
+            hermes_home=hermes_home,
+        )
     if not old_session_id:
         return None
     try:
         from .session_reset import reset_explicit_new_carry
 
-        hermes_home = str(payload.get("hermes_home") or engine._hermes_home)
         db_path = engine._resolve_db_path(hermes_home)
         return reset_explicit_new_carry(
             db_path,
@@ -472,9 +478,13 @@ def register(ctx):
                 exc,
             )
         try:
+            from .session_reset import CliNewSessionPairing
+
+            cli_pairing = CliNewSessionPairing()
+            register_hook("on_session_finalize", cli_pairing.note_finalization)
             register_hook(
                 "on_session_reset",
-                lambda **payload: _on_explicit_session_reset(engine, **payload),
+                lambda **payload: _on_explicit_session_reset(engine, cli_pairing, **payload),
             )
         except Exception as exc:
             logger.info("LCM explicit session-reset observer unavailable: %s", exc)
