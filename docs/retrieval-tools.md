@@ -4,7 +4,7 @@ Use this page when you need the exact LCM tool contract or archive-migration not
 
 ## Agent Tools
 
-Hermes-LCM's bundled skill and active recall policy route current-session,
+Hermes-LCM's bundled skill and optional, default-off recall policy route current-session,
 cross-conversation, and time-bounded questions through these tools. Use
 `session_search` for Hermes-tracked history that is not present in `lcm.db`.
 

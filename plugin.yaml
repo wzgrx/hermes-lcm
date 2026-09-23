@@ -26,3 +26,5 @@ provides_hooks:
   - post_llm_call
   - subagent_start
   - subagent_stop
+provides_middleware:
+  - llm_request

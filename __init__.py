@@ -163,7 +163,7 @@ def _effective_preanswer_mode(config) -> str:
 
 
 def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
-    """Keep ordinary baseline bytes, or add one bounded product-owned delta."""
+    """Build only per-turn evidence context; policy delivery is request-scoped."""
     enabled_toolsets = payload.get("enabled_toolsets")
     context_engine_enabled = not (
         isinstance(enabled_toolsets, (list, tuple, set, frozenset))
@@ -208,7 +208,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             context = result.get("context") if isinstance(result, dict) else None
             if not isinstance(context, str) or not context:
                 return {"context": recall_policy}
-            return {"context": f"{recall_policy}\n\n{context}"}
+            return {"context": "\n\n".join(part for part in (recall_policy, context) if part)}
 
         from .selective_recall import (
             build_selective_session_bundle,
@@ -307,7 +307,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             augmentations.append(value)
     if not augmentations:
         return {"context": recall_policy}
-    return {"context": f"{recall_policy}\n\n" + "\n\n".join(augmentations)}
+    return {"context": "\n\n".join(part for part in (recall_policy, *augmentations) if part)}
 
 
 def _session_context_value(name: str) -> str:
@@ -479,14 +479,10 @@ def register(ctx):
         except Exception as exc:
             logger.info("LCM explicit session-reset observer unavailable: %s", exc)
 
-        # Hermes invokes this hook after the context engine has received
-        # on_session_start(). Resolve through LCM's own registry so merely
-        # loading the plugin cannot inject guidance when another context
-        # engine is serving the turn. Capture one validated policy value for
-        # deterministic, byte-stable injection across eligible turns.
+        # Pre-answer evidence is a per-turn user-context augmentation. The
+        # static recall policy is intentionally excluded: Hermes persists hook
+        # context in user api_content and replays it on every subsequent turn.
         try:
-            recall_policy = get_recall_policy()
-
             def _on_pre_llm_call(**payload):
                 session_id = str(payload.get("session_id") or "")
                 conversation_id = str(
@@ -500,15 +496,52 @@ def register(ctx):
                 )
                 if active_engine is None or getattr(active_engine, "name", None) != "lcm":
                     return None
-                return _pre_llm_context(active_engine, recall_policy, payload)
+                result = _pre_llm_context(active_engine, "", payload)
+                return result if result.get("context") else None
 
             register_hook("pre_llm_call", _on_pre_llm_call)
         except Exception as exc:
             logger.warning(
-                "LCM recall-policy hook registration did not complete; "
+                "LCM pre-answer evidence hook registration did not complete; "
                 "tool schemas remain available: %s",
                 exc,
             )
+
+    # A provider request can include many historic user api_content copies of
+    # the old policy. Scrub those on the wire without changing stored history;
+    # opt-in guidance is injected once into the request's system prefix.
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if callable(register_middleware):
+        try:
+            from .recall_policy_delivery import rewrite_recall_policy_request
+
+            recall_policy = get_recall_policy()
+
+            def _on_llm_request(**payload):
+                request = payload.get("request")
+                if not isinstance(request, dict):
+                    return None
+                session_id = str(payload.get("session_id") or "")
+                active_engine = resolve_active_lcm_engine(session_id=session_id)
+                enabled = bool(
+                    active_engine is not None
+                    and getattr(active_engine, "name", None) == "lcm"
+                    and getattr(getattr(active_engine, "_config", None), "recall_policy_enabled", False)
+                )
+                rewritten = rewrite_recall_policy_request(
+                    request, recall_policy, enabled=enabled,
+                )
+                if rewritten is request:
+                    return None
+                return {
+                    "request": rewritten,
+                    "source": "hermes-lcm",
+                    "reason": "one-copy recall policy delivery",
+                }
+
+            register_middleware("llm_request", _on_llm_request)
+        except Exception as exc:
+            logger.warning("LCM recall-policy request middleware unavailable: %s", exc)
 
     # Register tools via the plugin registry only on hosts that preserve the
     # active messages=... contract for registered context-engine tools.

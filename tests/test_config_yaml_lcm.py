@@ -50,6 +50,19 @@ auxiliary:
     assert config.ignored_config_yaml_lcm_keys == ["unknown_setting"]
 
 
+def test_recall_policy_opt_in_respects_yaml_and_environment_precedence(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch, "lcm:\n  recall_policy_enabled: true\n")
+    monkeypatch.delenv("LCM_RECALL_POLICY_ENABLED", raising=False)
+    config = LCMConfig.from_env()
+    assert config.recall_policy_enabled is True
+    assert config.config_sources["recall_policy_enabled"] == "config_yaml:lcm.recall_policy_enabled"
+
+    monkeypatch.setenv("LCM_RECALL_POLICY_ENABLED", "false")
+    config = LCMConfig.from_env()
+    assert config.recall_policy_enabled is False
+    assert config.config_sources["recall_policy_enabled"] == "env:LCM_RECALL_POLICY_ENABLED"
+
+
 def test_lcm_yaml_lists_mapping_and_optional_age(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch, """lcm:
   ignore_session_patterns:

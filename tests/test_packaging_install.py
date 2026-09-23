@@ -552,11 +552,12 @@ def test_register_gracefully_degrades_when_host_lacks_register_tool():
     assert ctx.engine.name == "lcm"
 
 
-def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(tmp_path, monkeypatch):
+def test_plugin_entrypoint_registers_bundled_skill_and_request_scoped_recall_policy(tmp_path, monkeypatch):
     module = _load_plugin_entrypoint_module("hermes_lcm_packaging_skill_and_policy")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     registered_skills = []
     hooks = {}
+    middleware = {}
 
     class _Ctx:
         def __init__(self):
@@ -571,6 +572,9 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
         def register_hook(self, name, callback):
             hooks.setdefault(name, []).append(callback)
 
+        def register_middleware(self, kind, callback):
+            middleware.setdefault(kind, []).append(callback)
+
     ctx = _Ctx()
     module.register(ctx)
 
@@ -581,6 +585,7 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
     assert (path / "SKILL.md").is_file()
     assert "recall" in description.lower()
     assert len(hooks["pre_llm_call"]) == 1
+    assert len(middleware["llm_request"]) == 1
 
     policy_hook = hooks["pre_llm_call"][0]
     assert policy_hook(session_id="not-bound") is None
@@ -588,11 +593,26 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
     ctx.engine.on_session_start("active-session", platform="cli")
     first = policy_hook(session_id="active-session")
     second = policy_hook(session_id="active-session")
-    assert first == second
-    assert first == {"context": module.get_recall_policy()}
-    assert "Hermes-LCM Recall Policy" in first["context"]
-    assert "lcm_recall" in first["context"]
-    assert "lcm_expand_query" in first["context"]
+    assert first is second is None
+    policy = module.get_recall_policy()
+    request = {
+        "messages": [
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "old request\n\n" + policy},
+            {"role": "user", "content": "new request"},
+        ]
+    }
+    callback = middleware["llm_request"][0]
+    disabled = callback(session_id="active-session", request=request)
+    assert disabled["request"]["messages"][1]["content"] == "old request"
+    assert all(policy not in message["content"] for message in disabled["request"]["messages"])
+    assert ctx.engine._config.recall_policy_enabled is False
+    ctx.engine._config.recall_policy_enabled = True
+    enabled = callback(session_id="active-session", request=request)
+    assert enabled["request"]["messages"][0]["content"].endswith(policy)
+    assert enabled["request"]["messages"][0]["content"].count(policy) == 1
+    assert all(policy not in message["content"] for message in enabled["request"]["messages"][1:])
+    assert callback(session_id="not-bound", request={"messages": []}) is None
     ctx.engine.shutdown()
 
 
@@ -617,7 +637,6 @@ def test_pre_llm_hook_disabled_toolset_is_identical_and_routed_adds_exact_sessio
 
     ctx = _Ctx()
     module.register(ctx)
-    policy = module.get_recall_policy()
     hook = hooks["pre_llm_call"][0]
     ctx.engine.on_session_start("active-session", platform="cli")
     source_text = "I was preparing to move away from Austin."
@@ -658,9 +677,9 @@ def test_pre_llm_hook_disabled_toolset_is_identical_and_routed_adds_exact_sessio
         ],
     )
 
-    assert disabled == {"context": policy}
+    assert disabled is None
     assert active["context"].startswith(
-        policy + "\n\n[Hermes-LCM selective session evidence"
+        "[Hermes-LCM selective session evidence"
     ), ctx.engine._last_preanswer_evidence_trace
     assert "Denver" in active["context"]
     assert f"lcm:{current_id}:0-{len(current_text)}" in active["context"]
@@ -708,7 +727,7 @@ def test_pre_llm_hook_ordinary_path_makes_no_recall_or_selector_call(
     )
 
     assert recall_calls == []
-    assert response == {"context": module.get_recall_policy()}
+    assert response is None
     assert not hasattr(ctx.engine, "_last_preanswer_evidence_trace")
     ctx.engine.shutdown()
 
@@ -873,8 +892,7 @@ def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_
         enabled_toolsets=["context_engine"],
         baseline_refs=refs,
     )
-    assert "lcm-selective-evidence" not in fallback["context"]
-    assert fallback["context"].startswith(module.get_recall_policy())
+    assert fallback is None
     ctx.engine.shutdown()
 
 
@@ -1041,7 +1059,6 @@ def test_pre_llm_hook_requirements_ordinary_and_disabled_toolset_are_byte_identi
     monkeypatch.setattr(ctx.engine, "handle_tool_call", fail)
     ctx.engine.on_session_start("active-session", platform="cli")
     hook = hooks["pre_llm_call"][0]
-    policy = module.get_recall_policy()
     ordinary = hook(
         session_id="active-session",
         user_message="Tell me about the Atlas project",
@@ -1053,8 +1070,8 @@ def test_pre_llm_hook_requirements_ordinary_and_disabled_toolset_are_byte_identi
         enabled_toolsets=[],
     )
 
-    assert ordinary == {"context": policy}
-    assert disabled == {"context": policy}
+    assert ordinary is None
+    assert disabled is None
     ctx.engine.shutdown()
 
 

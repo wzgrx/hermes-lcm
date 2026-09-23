@@ -393,6 +393,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("proactive_recall_min_score", "LCM_PROACTIVE_RECALL_MIN_SCORE", float),
     _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
     _EnvFieldSpec("proactive_recall_provider", "LCM_PROACTIVE_RECALL_PROVIDER", str),
+    _EnvFieldSpec("recall_policy_enabled", "LCM_RECALL_POLICY_ENABLED", bool),
     _EnvFieldSpec("preanswer_evidence_enabled", "LCM_PREANSWER_EVIDENCE_ENABLED", bool),
     _EnvFieldSpec("preanswer_evidence_mode", "LCM_PREANSWER_EVIDENCE_MODE", str),
     _EnvFieldSpec("selective_compiler_enabled", "LCM_SELECTIVE_COMPILER_ENABLED", bool),
@@ -864,6 +865,10 @@ class LCMConfig:
     # keep a local fastembed provider for the offline injection path even when
     # interactive search uses voyage). Empty => reuse the main provider/model.
     proactive_recall_provider: str = ""
+    # Optional product-owned recall guidance. Delivered once per provider
+    # request through the host's LLM request middleware, never persisted in a
+    # user message. Default-off per the upstream recall-policy contract.
+    recall_policy_enabled: bool = False
     # Product-owned automatic evidence validation at the official
     # ``pre_llm_call`` seam. Default-off preserves the exact ordinary hook
     # context and performs no retrieval or computation work.

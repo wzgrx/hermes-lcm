@@ -315,10 +315,12 @@ session lifecycle. The installer links that directory into the active Hermes
 profile so it appears in ordinary skill discovery. On hosts with plugin skill
 registration, it is also available explicitly as `hermes-lcm:hermes-lcm`.
 
-When LCM is the active context engine for a bound session, the plugin registers
-one deterministic `pre_llm_call` hook. Hermes injects the canonical policy into
-the current user-message context, not the system prompt, preserving the stable
-system-prompt cache prefix. The policy:
+The canonical recall policy is **off by default**. Set
+`lcm.recall_policy_enabled: true` in `config.yaml` (or
+`LCM_RECALL_POLICY_ENABLED=true`) to deliver it once in the product-owned
+system/instructions prefix of each provider request. The plugin's
+`llm_request` middleware also removes legacy copies that older releases
+persisted in user `api_content`, without changing stored history. The policy:
 
 - treats summaries as recall cues rather than exact proof;
 - prefers newer source-backed evidence and verifies contradictions;
@@ -329,8 +331,12 @@ system-prompt cache prefix. The policy:
 
 The canonical bytes live in
 `skills/hermes-lcm/references/recall-policy.md`. Merely loading the plugin does
-not inject them when another context engine is serving the session. Older hosts
-without skill or hook registration keep their existing schema-driven behavior.
+not inject them when another context engine is serving the session. The
+`pre_llm_call` hook now carries only opt-in pre-answer evidence, not the policy.
+Hosts without request middleware keep schema/skill-driven recall and do not
+reintroduce user-role policy injection. Enabling the request-scoped policy adds
+one stable system-prefix block to the prompt cache key rather than one copy per
+historical user turn.
 
 ### Slash commands
 

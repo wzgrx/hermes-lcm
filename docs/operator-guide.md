@@ -153,11 +153,16 @@ For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
 best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
 
-The product-owned recall policy is injected through the host's ephemeral
-`pre_llm_call` user-context seam only after an LCM engine is bound to the
-session. It does not modify the system prompt or activate when another context
-engine is serving the turn. Its canonical file and digest source is
-`skills/hermes-lcm/references/recall-policy.md`.
+The product-owned recall policy defaults off. Enable `lcm.recall_policy_enabled`
+or `LCM_RECALL_POLICY_ENABLED=true` to place one canonical copy in the
+provider request's system/instructions prefix when LCM is the bound engine.
+Request middleware removes old copies from replayed user `api_content` on the
+wire without rewriting the stored transcript. Its canonical file and digest
+source is `skills/hermes-lcm/references/recall-policy.md`. This changes the
+prompt-cache prefix once on rollout or opt-in, then keeps it stable within a
+session; it avoids per-user-turn policy growth. Hosts lacking request
+middleware use the bundled skill and tool schemas instead of the old user-role
+policy hook.
 
 ## Troubleshooting
 
@@ -275,7 +280,8 @@ engine. Exposure is not activation. On a stock install:
 | `LCM_ASSERTION_EXTRACTION_TIMEOUT_SECONDS` | `30` | Timeout for each exact-source extraction call; runtime clamps to 0.1-120 seconds. |
 | `LCM_QUERY_VIEWS_ENABLED` | `false` | Create and bind demand-shaped evidence views without invoking a model or retrieval provider. |
 | `LCM_ADAPTIVE_RETRIEVAL_ENABLED` | `false` | Enable `lcm_retrieve` and bind query views for evidence reuse. Episodes are bounded to existing retrieval tools and store evidence/traces, never final prose. |
-| `LCM_PREANSWER_EVIDENCE_ENABLED` | `false` | Enable the automatic pre-answer evidence hook. Disabled preserves the ordinary hook context and performs no retrieval or computation. |
+| `LCM_RECALL_POLICY_ENABLED` | `false` | Opt into one product-owned recall policy copy per provider request; requires Hermes `llm_request` middleware. Legacy user-sidecar copies are scrubbed on the wire even when this is off. |
+| `LCM_PREANSWER_EVIDENCE_ENABLED` | `false` | Enable the automatic pre-answer evidence hook. Disabled returns no hook context and performs no retrieval or computation. |
 | `LCM_PREANSWER_EVIDENCE_MODE` | empty | When the master flag is enabled, empty selects legacy selective behavior; explicit values are `off`, `legacy_selective`, or `requirements_v1`. |
 | `LCM_SELECTIVE_COMPILER_ENABLED` | `false` | Separately opt into the semantic selector for code-derived closed operations. Disabling the selective compiler does not prevent the pre-answer hook from retrieving a baseline. |
 | `LCM_SELECTIVE_COMPILER_MODEL` | empty | Optional model override for the selective compiler. |
