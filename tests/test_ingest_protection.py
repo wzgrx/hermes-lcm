@@ -2052,6 +2052,44 @@ def test_externalized_integrity_rejects_multiply_linked_payload(tmp_path):
     assert stats["externalized_payload_count"] == 0
 
 
+def test_externalized_integrity_streams_message_cursor(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present.json").write_text(json.dumps({"content": "ok", "content_chars": 2}))
+    for ref in ("present.json", "missing-one.json", "missing-two.json"):
+        engine._store.append(
+            engine.current_session_id,
+            {
+                "role": "assistant",
+                "content": (
+                    "[Externalized LCM ingest payload: kind=ingest_payload; "
+                    f"field=content; chars=2; bytes=2; ref={ref}]"
+                ),
+            },
+        )
+
+    class StreamingOnlyConnection:
+        def execute(self, *args, **kwargs):
+            cursor = engine._store._conn.execute(*args, **kwargs)
+
+            class StreamingOnlyCursor:
+                def __iter__(self):
+                    return iter(cursor)
+
+                def fetchall(self):
+                    raise AssertionError("integrity scan materialized every matching message")
+
+            return StreamingOnlyCursor()
+
+    detail = scan_externalized_payload_integrity(
+        StreamingOnlyConnection(), engine._config, hermes_home=engine._hermes_home,
+    )
+    assert detail["externalized_payload_refs_total"] == 3
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 2
+
+
 def test_lcm_doctor_reports_externalized_payload_stats(tmp_path):
     engine = _engine(tmp_path)
     engine._ingest_messages([{"role": "user", "content": DATA_URI}])

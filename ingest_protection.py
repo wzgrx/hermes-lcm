@@ -1848,7 +1848,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
            OR COALESCE(tool_calls, '') LIKE '%ref=%]%'
         ORDER BY store_id ASC
         """
-    ).fetchall():
+    ):
         for field, value in (("content", content), ("tool_calls", tool_calls)):
             if not isinstance(value, str):
                 continue
@@ -1888,7 +1888,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
                    OR COALESCE(tool_calls, '') LIKE '%.json%'
                 ORDER BY id ASC
                 """
-            ).fetchall():
+            ):
                 for field, value in (("content", content), ("tool_calls", tool_calls)):
                     if not isinstance(value, str):
                         continue
