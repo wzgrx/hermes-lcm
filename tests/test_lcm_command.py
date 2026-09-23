@@ -256,7 +256,7 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config_sources"]["summary_spend_window_seconds"] == "env:LCM_SUMMARY_SPEND_WINDOW_SECONDS"
     assert payload["config_sources"]["summary_spend_backoff_seconds"] == "env:LCM_SUMMARY_SPEND_BACKOFF_SECONDS"
     assert engine._summary_spend_guard.max_calls == 0
-    assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
+    assert "fresh_tail_count" not in payload["ignored_config_yaml_lcm_keys"]
 
 
 def test_lcm_status_does_not_report_invalid_env_as_effective_source(tmp_path, monkeypatch):
@@ -296,7 +296,7 @@ def test_lcm_status_text_reports_config_source_for_context_threshold(tmp_path, m
     assert "context_threshold_source: config_yaml:compression.threshold" in result
 
 
-def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypatch):
+def test_lcm_doctor_accepts_supported_lcm_config_yaml_keys(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
@@ -315,9 +315,10 @@ def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypat
     payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
     config_check = next(c for c in payload["checks"] if c["check"] == "config_validation")
 
-    assert payload["overall"] == "warnings"
-    assert config_check["status"] == "warn"
-    assert any("lcm.leaf_chunk_tokens" in warning for warning in config_check["detail"])
+    assert config_check["status"] == "pass"
+    assert config.leaf_chunk_tokens == 12345
+    assert config.config_sources["leaf_chunk_tokens"] == "config_yaml:lcm.leaf_chunk_tokens"
+    assert "leaf_chunk_tokens" not in config.ignored_config_yaml_lcm_keys
 
 
 def test_lcm_status_reports_last_compression_noop_reason(engine):

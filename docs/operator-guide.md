@@ -182,7 +182,10 @@ run `lcm_status` or `/lcm status` again for live per-session fields.
 ## Configuration
 
 Most installs only need `plugins.enabled` and `context.engine: lcm`. Useful
-environment variables:
+environment variables (or matching snake_case keys under `lcm:` in
+`config.yaml`). Valid `LCM_*` environment values take precedence over YAML;
+YAML lists/maps require PyYAML. Use `lcm_status` to inspect per-field sources,
+invalid values, and unknown `lcm:` keys:
 
 | Variable | Default | Use |
 |----------|---------|-----|

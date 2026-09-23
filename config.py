@@ -1,5 +1,6 @@
-"""LCM configuration with defaults and env var overrides."""
+"""LCM configuration with typed YAML, environment, and host defaults."""
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,7 +83,8 @@ def _parse_float_env(key: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
+        parsed = float(raw)
+        return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
 
@@ -128,9 +130,12 @@ def _parse_float_env_with_source(
     if raw is None:
         return default, default_source, None
     try:
-        return float(raw), f"env:{key}", None
+        parsed = float(raw)
+        if math.isfinite(parsed):
+            return parsed, f"env:{key}", None
     except (TypeError, ValueError):
-        return default, default_source, f"invalid env {key}={raw!r} ignored"
+        pass
+    return default, default_source, f"invalid env {key} ignored"
 
 
 def _config_bool_disabled(value) -> bool:
@@ -199,9 +204,6 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
-
-
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
     cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
@@ -237,7 +239,10 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
         if isinstance(lcm_section, dict):
             lcm_val = lcm_section.get("context_threshold")
             if lcm_val is not None:
-                return float(lcm_val), "config_yaml:lcm.context_threshold"
+                try:
+                    return _coerce_lcm_yaml_scalar(lcm_val, float), "config_yaml:lcm.context_threshold"
+                except (ValueError, TypeError):
+                    pass  # invalid LCM override falls through to host compression
         compression = cfg.get("compression") or {}
         if not isinstance(compression, dict):
             return default, "default"
@@ -420,6 +425,159 @@ _PARSER_BY_TYPE = {
     bool: _parse_bool_env,
     str: _parse_str_env,
 }
+
+_YAML_LIST_FIELDS = frozenset({
+    "sensitive_patterns", "summary_fallback_models", "ignore_session_patterns",
+    "stateless_session_patterns", "ignore_message_patterns",
+})
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = (
+    {spec.name for spec in ENV_FIELD_SPECS}
+    | _YAML_LIST_FIELDS
+    | {"codex_gpt55_autoraise_enabled", "recall_arm_weights", "empty_lifecycle_gc_max_age_hours"}
+)
+
+
+def _coerce_lcm_yaml_scalar(value: Any, py_type: type) -> Any:
+    """Parse one typed YAML value without treating booleans as integers."""
+    if py_type is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        raise ValueError("expected boolean")
+    if py_type is int:
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError("expected integer")
+        return int(value)
+    if py_type is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError("expected number")
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("expected finite number")
+        return parsed
+    if py_type is str:
+        if not isinstance(value, str):
+            raise ValueError("expected string")
+        return value
+    raise ValueError("unsupported type")
+
+
+def _coerce_lcm_yaml_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return _parse_pattern_list(value)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("expected list of strings")
+    return [item.strip() for item in value if item.strip()]
+
+
+def _coerce_lcm_yaml_arm_weights(value: Any) -> dict[str, float]:
+    if isinstance(value, str):
+        return _parse_arm_weights(value, _DEFAULT_RECALL_ARM_WEIGHTS)
+    if not isinstance(value, dict):
+        raise ValueError("expected mapping")
+    weights = dict(_DEFAULT_RECALL_ARM_WEIGHTS)
+    for name, weight in value.items():
+        if name not in weights:
+            raise ValueError("unknown recall arm")
+        parsed = _coerce_lcm_yaml_scalar(weight, float)
+        if parsed < 0:
+            raise ValueError("negative recall weight")
+        weights[name] = parsed
+    return weights
+
+
+def _apply_lcm_yaml_overrides(
+    config: "LCMConfig", section: dict[str, Any],
+    sources: dict[str, str], warnings: list[str],
+) -> None:
+    """Resolve lcm.* after env parsing: valid env > YAML > host/default."""
+    for spec in ENV_FIELD_SPECS:
+        raw_env = os.environ.get(spec.env_key)
+        env_valid = False
+        if raw_env is not None:
+            try:
+                _coerce_lcm_yaml_scalar(raw_env, spec.py_type)
+                env_valid = True
+            except (ValueError, TypeError):
+                if spec.name not in _SOURCE_TRACKED_ENV_FIELDS:
+                    warnings.append(f"invalid env {spec.env_key} ignored")
+        if spec.name in section:
+            try:
+                parsed = _coerce_lcm_yaml_scalar(section[spec.name], spec.py_type)
+            except (ValueError, TypeError):
+                warnings.append(f"invalid config_yaml:lcm.{spec.name} ignored")
+            else:
+                if not env_valid:
+                    if spec.name == "fresh_tail_max_tokens":
+                        parsed = max(0, parsed)
+                    setattr(config, spec.name, parsed)
+                    sources[spec.name] = f"config_yaml:lcm.{spec.name}"
+        sources.setdefault(spec.name, f"env:{spec.env_key}" if env_valid else "default")
+
+    if "codex_gpt55_autoraise_enabled" in section:
+        try:
+            config.codex_gpt55_autoraise_enabled = _coerce_lcm_yaml_scalar(
+                section["codex_gpt55_autoraise_enabled"], bool,
+            )
+            sources["codex_gpt55_autoraise_enabled"] = "config_yaml:lcm.codex_gpt55_autoraise_enabled"
+        except (ValueError, TypeError):
+            warnings.append("invalid config_yaml:lcm.codex_gpt55_autoraise_enabled ignored")
+
+    list_env_keys = {
+        "sensitive_patterns": "LCM_SENSITIVE_PATTERNS",
+        "summary_fallback_models": "LCM_SUMMARY_FALLBACK_MODELS",
+        "ignore_session_patterns": "LCM_IGNORE_SESSION_PATTERNS",
+        "stateless_session_patterns": "LCM_STATELESS_SESSION_PATTERNS",
+        "ignore_message_patterns": "LCM_IGNORE_MESSAGE_PATTERNS",
+    }
+    for field_name, env_key in list_env_keys.items():
+        raw_env = os.environ.get(env_key)
+        if field_name in section and raw_env is None:
+            try:
+                setattr(config, field_name, _coerce_lcm_yaml_list(section[field_name]))
+                sources[field_name] = f"config_yaml:lcm.{field_name}"
+                source_field = f"{field_name}_source"
+                if hasattr(config, source_field):
+                    setattr(config, source_field, sources[field_name])
+            except ValueError:
+                warnings.append(f"invalid config_yaml:lcm.{field_name} ignored")
+        sources.setdefault(field_name, f"env:{env_key}" if raw_env is not None else "default")
+
+    if "recall_arm_weights" in section and os.environ.get("LCM_RECALL_ARM_WEIGHTS") is None:
+        try:
+            config.recall_arm_weights = _coerce_lcm_yaml_arm_weights(section["recall_arm_weights"])
+            sources["recall_arm_weights"] = "config_yaml:lcm.recall_arm_weights"
+        except (ValueError, TypeError):
+            warnings.append("invalid config_yaml:lcm.recall_arm_weights ignored")
+    sources.setdefault("recall_arm_weights", "env:LCM_RECALL_ARM_WEIGHTS" if os.environ.get("LCM_RECALL_ARM_WEIGHTS") is not None else "default")
+
+    age_env_key = "LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS"
+    raw_age_env = os.environ.get(age_env_key)
+    age_env_valid = False
+    if raw_age_env is not None:
+        try:
+            _coerce_lcm_yaml_scalar(raw_age_env, float)
+            age_env_valid = True
+        except (ValueError, TypeError):
+            warnings.append(f"invalid env {age_env_key} ignored")
+    if "empty_lifecycle_gc_max_age_hours" in section and not age_env_valid:
+        raw_age = section["empty_lifecycle_gc_max_age_hours"]
+        try:
+            config.empty_lifecycle_gc_max_age_hours = (
+                None if raw_age is None else _coerce_lcm_yaml_scalar(raw_age, float)
+            )
+            sources["empty_lifecycle_gc_max_age_hours"] = "config_yaml:lcm.empty_lifecycle_gc_max_age_hours"
+        except (ValueError, TypeError):
+            warnings.append("invalid config_yaml:lcm.empty_lifecycle_gc_max_age_hours ignored")
+    sources.setdefault(
+        "empty_lifecycle_gc_max_age_hours",
+        f"env:{age_env_key}" if age_env_valid else "default",
+    )
 
 # Fields whose env reading needs provenance tracking or a computed default;
 # ``from_env`` handles these explicitly, so the uniform loop skips them.
@@ -789,7 +947,7 @@ class LCMConfig:
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
-        """Build config from environment variables (LCM_ prefix)."""
+        """Build config from LCM_* env, lcm: YAML, and Hermes defaults."""
         c = cls()
         config_sources: dict[str, str] = {}
         config_source_warnings: list[str] = []
@@ -799,7 +957,10 @@ class LCMConfig:
             if warning:
                 config_source_warnings.append(warning)
 
-        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        hermes_yaml = _load_hermes_config_yaml()
+        lcm_yaml = hermes_yaml.get("lcm") if isinstance(hermes_yaml, dict) else None
+        lcm_yaml = lcm_yaml if isinstance(lcm_yaml, dict) else {}
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys(hermes_yaml)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
@@ -871,7 +1032,9 @@ class LCMConfig:
         raw_max_age = os.environ.get("LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS")
         if raw_max_age is not None:
             try:
-                c.empty_lifecycle_gc_max_age_hours = float(raw_max_age)
+                parsed_age = float(raw_max_age)
+                if math.isfinite(parsed_age):
+                    c.empty_lifecycle_gc_max_age_hours = parsed_age
             except (TypeError, ValueError):
                 pass
 
@@ -896,6 +1059,7 @@ class LCMConfig:
             c.ignore_message_patterns = _parse_pattern_list(raw_ignore_messages)
             c.ignore_message_patterns_source = "env"
 
+        _apply_lcm_yaml_overrides(c, lcm_yaml, config_sources, config_source_warnings)
         c.config_sources = config_sources
         c.config_source_warnings = config_source_warnings
         return c

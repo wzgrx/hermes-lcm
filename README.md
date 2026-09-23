@@ -399,6 +399,15 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 
 ### Common settings
 
+The LCM engine's public config fields also accept their snake_case field names
+under `lcm:` in `~/.hermes/config.yaml` (for example `lcm.fresh_tail_count`).
+Command-registration switches and credentials remain environment-only. Valid environment
+variables take precedence, then `lcm:` values, then Hermes-derived/default
+values. Lists such as `summary_fallback_models` and mappings such as
+`recall_arm_weights` use native YAML forms. Secrets remain in `.env`; unknown or
+invalid `lcm:` keys appear in `/lcm status` diagnostics. Full YAML parsing of
+lists and mappings requires PyYAML, which the Hermes runtime provides.
+
 | Variable | Default | Use |
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
