@@ -18,12 +18,15 @@ Invariants proven here (store-level guard in ``MessageStore``):
 (e) tool-role Hermes persisted-output markers are EXEMPT: retry semantics
     live above the store, so a replayed marker still re-appends;
 (f) the duplicate probe uses the indexed (session_id, timestamp) range, so
-    the per-message cost is an indexed seek, not a table scan.
+    the per-message cost is an indexed seek, not a table scan;
+(g) two independent SQLite connections cannot both pass the replay probe
+    before one commits its insert.
 """
 
 from __future__ import annotations
 
 import time
+import threading
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.ingest_protection import protect_messages_for_ingest
@@ -476,3 +479,56 @@ def test_dedup_probe_uses_indexed_session_timestamp_range(tmp_path):
         assert "idx_msg_session_source_time" in detail
     finally:
         store.close()
+
+
+def test_parallel_store_connections_serialize_replay_probe_and_insert(tmp_path):
+    """Two writers must not both insert the same replay timestamp/identity."""
+    path = tmp_path / "parallel-replay.db"
+    first = MessageStore(path)
+    second = MessageStore(path)
+    first_probed = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    errors = []
+    results = []
+    original_probe = first._is_duplicate_replay
+    message = {"role": "user", "content": "same host event", "timestamp": 1700000000.0}
+
+    def paused_probe(*args, **kwargs):
+        answer = original_probe(*args, **kwargs)
+        first_probed.set()
+        if not release_first.wait(5):
+            raise AssertionError("first writer was not released")
+        return answer
+
+    first._is_duplicate_replay = paused_probe
+
+    def write(store, *, signal=None):
+        try:
+            if signal is not None:
+                signal.set()
+            results.append(store.append_batch("shared-session", [message])[0])
+        except Exception as exc:
+            errors.append(exc)
+
+    one = threading.Thread(target=write, args=(first,))
+    two = threading.Thread(target=write, args=(second,), kwargs={"signal": second_started})
+    try:
+        one.start()
+        assert first_probed.wait(5)
+        two.start()
+        assert second_started.wait(5)
+        # Give the second writer an opportunity to race before releasing the first.
+        two.join(0.2)
+    finally:
+        release_first.set()
+        one.join(10)
+        two.join(10)
+        try:
+            assert not one.is_alive() and not two.is_alive()
+            assert not errors, errors
+            assert sorted(results) == [-1, 1]
+            assert first.get_session_count("shared-session") == 1
+        finally:
+            first.close()
+            second.close()

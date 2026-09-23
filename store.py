@@ -851,6 +851,11 @@ class MessageStore:
 
         ids = []
         with self._write_lock, self._conn:
+            if dedupe_replay and messages and not self._conn.in_transaction:
+                # The indexed replay probe precedes the INSERT. Acquire the
+                # cross-connection writer reservation before that SELECT, or
+                # two workers can both observe absence and append duplicates.
+                self._conn.execute("BEGIN IMMEDIATE")
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
