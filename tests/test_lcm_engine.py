@@ -27636,11 +27636,11 @@ class TestHandleExpandStoreId:
         assert result["source_type"] == "raw_message"
         assert result["from_current_session"] is False
         assert result["externalized_ref"] == "foreign_payload_ref.json"
-        # Cross-session payload metadata is intentionally omitted; an explanatory
-        # note is surfaced so callers don't treat the bare ref as expandable.
+        # Cross-session payload metadata is omitted; direct ref expansion needs
+        # a verified owner in this conversation rather than this bare row.
         assert "externalized" not in result
         assert "externalized_note" in result
-        assert "session-scoped" in result["externalized_note"].lower()
+        assert "current conversation" in result["externalized_note"].lower()
 
     def test_grep_then_expand_round_trip_cross_session(self, engine):
         store_id = engine._store.append(

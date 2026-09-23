@@ -452,6 +452,72 @@ def test_lcm_inspect_rejects_payload_refs_without_session_metadata(tmp_path):
         engine.shutdown()
 
 
+def test_direct_expand_and_describe_reject_unowned_legacy_payload(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config, hermes_home=engine._hermes_home, create=True,
+        )
+        ref = "legacy-without-owner.json"
+        (storage_dir / ref).write_text(
+            json.dumps({"kind": "tool_result", "content": "unowned payload body"}),
+            encoding="utf-8",
+        )
+
+        for tool in (lcm_tools.lcm_expand, lcm_tools.lcm_describe):
+            result = json.loads(tool({"externalized_ref": ref}, engine=engine))
+            assert "error" in result
+            assert "unowned payload body" not in json.dumps(result)
+
+        # A caller that already proved an exact stored-source reference may
+        # still hydrate a legacy sidecar without owner metadata.
+        source_bound = lcm_tools._get_externalized_payload(
+            engine, ref, allowed_session_ids={engine.current_session_id},
+        )
+        assert source_bound["content"] == "unowned payload body"
+    finally:
+        engine.shutdown()
+
+
+def test_direct_payload_ref_follows_verified_conversation_siblings_only(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        engine._store.append(
+            "sess-sibling",
+            {"role": "user", "content": "earlier turn"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+        engine._store.append(
+            "sess-other",
+            {"role": "user", "content": "other conversation"},
+            source="discord",
+            conversation_id="discord:other",
+        )
+        sibling_ref = _write_externalized_payload(
+            engine, ref="sibling.json", session_id="sess-sibling",
+        )
+        other_ref = _write_externalized_payload(
+            engine, ref="other.json", session_id="sess-other",
+        )
+
+        expanded = json.loads(lcm_tools.lcm_expand(
+            {"externalized_ref": sibling_ref}, engine=engine,
+        ))
+        described = json.loads(lcm_tools.lcm_describe(
+            {"externalized_ref": sibling_ref}, engine=engine,
+        ))
+        assert expanded["content"] == "hidden tool output"
+        assert described["content_preview"] == "hidden tool output"
+
+        for tool in (lcm_tools.lcm_expand, lcm_tools.lcm_describe):
+            result = json.loads(tool({"externalized_ref": other_ref}, engine=engine))
+            assert "error" in result
+            assert "hidden tool output" not in json.dumps(result)
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_inspect_rejects_payload_refs_when_session_metadata_is_beyond_prefix(tmp_path):
     engine = _make_engine(tmp_path)
     try:

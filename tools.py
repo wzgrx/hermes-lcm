@@ -159,22 +159,26 @@ def _get_externalized_payload(
     if payload is None:
         return None
     payload_session_id = payload.get("session_id") or ""
-    if payload_session_id:
-        if allowed_session_ids is not None:
-            if payload_session_id not in allowed_session_ids:
+    if not payload_session_id:
+        # Legacy files without an owner can be hydrated only when the caller
+        # has already followed an exact stored-message/node reference. A bare
+        # filename in a direct tool call proves no conversation ownership.
+        return payload if allowed_session_ids and any(allowed_session_ids) else None
+    if allowed_session_ids is not None:
+        if payload_session_id not in allowed_session_ids:
+            return None
+    elif payload_session_id != engine.current_session_id:
+        conversation_id = engine.current_conversation_id
+        if not conversation_id:
+            return None
+        try:
+            if not engine._store.session_belongs_to_conversation(
+                payload_session_id, conversation_id
+            ):
                 return None
-        elif payload_session_id != engine.current_session_id:
-            conversation_id = engine.current_conversation_id
-            if not conversation_id:
-                return None
-            try:
-                if not engine._store.session_belongs_to_conversation(
-                    payload_session_id, conversation_id
-                ):
-                    return None
-            except sqlite3.Error:
-                logger.debug("LCM payload conversation membership lookup failed", exc_info=True)
-                return None
+        except sqlite3.Error:
+            logger.debug("LCM payload conversation membership lookup failed", exc_info=True)
+            return None
     return payload
 
 
@@ -5318,7 +5322,7 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
-            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+            return json.dumps({"error": f"Externalized payload {externalized_ref} not found or not available to current conversation"})
         return json.dumps(
             {
                 "externalized_ref": externalized_ref,
@@ -5379,13 +5383,15 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     """Expand a summary node, externalized payload, or raw message to its content.
 
     Mode selection (exactly one is required):
-    - ``externalized_ref``: open a stored externalized payload by ref filename (current session only)
+    - ``externalized_ref``: open a payload owned by the current session or a
+      verified sibling session in the current conversation; ownerless legacy
+      payloads require an exact stored-source reference
     - ``store_id``: fetch a single raw message by store_id; works across sessions
     - ``node_id``: expand a summary node to its source content (current session only)
 
-    Only ``store_id`` mode accepts an arbitrary cross-session target. ``node_id``
-    stays current-session scoped, but carried-over current-session nodes may
-    reference raw source rows that still belong to the previous session.
+    Only ``store_id`` mode accepts an arbitrary cross-conversation target.
+    ``node_id`` stays current-session scoped, but carried-over current-session
+    nodes may reference raw source rows that still belong to the previous session.
     """
     engine = _require_engine(kwargs)
     if engine is None:
@@ -5430,7 +5436,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
-            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+            return json.dumps({"error": f"Externalized payload {externalized_ref} not found or not available to current conversation"})
         content = payload.get("content", "")
         sliced = _slice_content_for_response(content, max_tokens, content_offset)
         return json.dumps(
@@ -5525,8 +5531,9 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                     result["externalized"] = payload_summaries[0]
             else:
                 result["externalized_note"] = (
-                    "Externalized payload metadata is session-scoped; "
-                    "cross-session ref is surfaced for traceability only and cannot be expanded in this version."
+                    "This raw row is from another session. Its ref is directly expandable "
+                    "only if the payload owner belongs to the current conversation; "
+                    "refs from other conversations or without owner metadata remain trace-only."
                 )
         return json.dumps(result)
 

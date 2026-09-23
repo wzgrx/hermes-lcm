@@ -648,6 +648,11 @@ Externalization for ordinary large tool output is opt-in. When enabled,
 oversized tool results are written to plugin-managed JSON files and referenced
 from summaries. They remain inspectable later through
 `lcm_describe(externalized_ref=...)` and `lcm_expand(externalized_ref=...)`.
+Direct ref lookup verifies that the payload's writer session is the current
+session or a sibling in the same conversation. A legacy sidecar without writer
+metadata is recoverable only through an exact stored-source reference, not a
+bare filename. This permits recovery after a same-conversation session rebind
+without exposing a sidecar from another conversation.
 
 Active-replay stubbing is separately opt-in and requires ordinary large-output
 externalization. Newly ingested textual tool results above the token threshold
