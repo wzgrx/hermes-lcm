@@ -3013,6 +3013,16 @@ class TestMessageStore:
         # Strictly non-decreasing (clock may tick between rows).
         assert timestamps == sorted(timestamps)
 
+    def test_append_batch_timestamps_are_unique_with_frozen_clock(self, store, monkeypatch):
+        monkeypatch.setattr("hermes_lcm.store.time.time", lambda: 1_700_000_000.0)
+        ids = store.append_batch(
+            "frozen-clock",
+            [{"role": "user", "content": f"message {index}"} for index in range(50)],
+        )
+        timestamps = [store.get(store_id)["timestamp"] for store_id in ids]
+        assert len(set(timestamps)) == len(ids)
+        assert timestamps == sorted(timestamps)
+
     def test_search_hybrid_clamps_future_timestamps_consistently(self, store):
         now = time.time()
         future = now + (60 * 24 * 3600)
@@ -7284,7 +7294,7 @@ class TestExtraction:
         assert "[Externalized tool output" not in serialized
         assert "...[truncated]..." in serialized
 
-    def test_serialize_messages_externalized_payloads_do_not_collide_for_same_second_same_tool_id(self, tmp_path, monkeypatch):
+    def test_serialize_messages_externalized_payloads_do_not_collide_for_same_clock_tick(self, tmp_path, monkeypatch):
         from hermes_lcm.config import LCMConfig
         from hermes_lcm.engine import LCMEngine
         import hermes_lcm.externalize as ext_module
@@ -7292,6 +7302,7 @@ class TestExtraction:
         output_dir = tmp_path / "externalized"
         original_strftime = ext_module.time.strftime
         monkeypatch.setattr(ext_module.time, "strftime", lambda *args, **kwargs: "20260418_060000")
+        monkeypatch.setattr(ext_module.time, "time_ns", lambda: 1_700_000_000_000_000_000)
         try:
             first = LCMEngine(
                 config=LCMConfig(
@@ -7329,6 +7340,24 @@ class TestExtraction:
 
         payloads = [json.loads(path.read_text()) for path in payload_files]
         assert sorted(payload["session_id"] for payload in payloads) == ["telegram:first", "telegram:second"]
+
+    def test_ingest_externalized_payload_names_survive_frozen_clock_tick(self, tmp_path, monkeypatch):
+        import hermes_lcm.externalize as ext_module
+
+        monkeypatch.setattr(ext_module.time, "strftime", lambda *args, **kwargs: "20260418_060000")
+        monkeypatch.setattr(ext_module.time, "time_ns", lambda: 1_700_000_000_000_000_000)
+        config = LCMConfig(large_output_externalization_path=str(tmp_path / "payloads"))
+        first = ext_module.externalize_ingest_payload(
+            "same content", role="user", session_id="first", config=config
+        )
+        second = ext_module.externalize_ingest_payload(
+            "same content", role="user", session_id="second", config=config
+        )
+
+        assert first is not None and second is not None
+        assert first["path"] != second["path"]
+        assert json.loads(first["path"].read_text())["session_id"] == "first"
+        assert json.loads(second["path"].read_text())["session_id"] == "second"
 
     def test_serialize_messages_reuses_existing_externalized_payload_for_same_session_content_and_tool_id(self, tmp_path):
         from hermes_lcm.config import LCMConfig

@@ -116,7 +116,7 @@ def _dedupe_replay_identity_text(
     ``_restore_ingest_payload_placeholder_refs`` (payload-aware mode): a ref
     whose payload exists for this session contributes the payload content;
     anything else contributes a session-agnostic ``ref=<filename>`` token.
-    The per-pass ``time_ns`` filename inside a regenerated placeholder
+    The per-pass random filename inside a regenerated placeholder
     therefore never changes the identity.
     """
     return _restore_ingest_payload_placeholder_refs(
@@ -641,7 +641,7 @@ class MessageStore:
 
         Content comparison: ingest protection rewrites inline media / long
         base64 payloads into ``[Externalized LCM ingest payload: …]``
-        placeholders whose filename embeds a per-pass ``time_ns`` suffix, so
+        placeholders whose filename embeds a per-pass random suffix, so
         byte-exact equality would miss a replayed turn whose placeholder was
         regenerated. The SQL range narrows on session/source time (indexed by
         ``idx_msg_session_source_time``). For ordinary text the probe also
@@ -850,6 +850,7 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
+        last_inserted_ts: float | None = None
         with self._write_lock, self._conn:
             if dedupe_replay and messages and not self._conn.in_transaction:
                 # The indexed replay probe precedes the INSERT. Acquire the
@@ -859,7 +860,6 @@ class MessageStore:
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
                 if dedupe_replay and self._is_duplicate_replay(
                     session_id,
@@ -872,6 +872,13 @@ class MessageStore:
                 ):
                     ids.append(-1)
                     continue
+                ts = time.time()
+                if last_inserted_ts is not None and ts <= last_inserted_ts:
+                    # Wall-clock resolution is coarser than a large batch on
+                    # some platforms, and it may even move backwards. Keep
+                    # persisted row timestamps strictly ordered without
+                    # changing the observed source timestamp contract.
+                    ts = math.nextafter(last_inserted_ts, math.inf)
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
@@ -896,6 +903,7 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+                last_inserted_ts = ts
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:

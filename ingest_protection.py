@@ -1023,7 +1023,7 @@ def _restore_ingest_payload_placeholder_refs(
     ``[Externalized tool output: …]`` (the threshold externalizer). An
     INELIGIBLE ref is returned as its ``ref=<filename>`` token rather than
     the raw placeholder, so the identity component contributed by that
-    placeholder is the same regardless of the per-pass ``time_ns`` filename
+    placeholder is the same regardless of the per-pass random filename
     embedded in the placeholder text (dedupe-replay comparisons must not
     depend on regeneration-time uniqueness). With ``config=None`` the
     eligibility probe degrades to a token swap for every placeholder; a

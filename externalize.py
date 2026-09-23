@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import stat
 import time
 from pathlib import Path
@@ -260,7 +261,7 @@ def _replace_externalized_payload(
     dir_fd: int | None = None,
     expected_identity: tuple[int, int] | None = None,
 ) -> None:
-    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     if dir_fd is not None:
         try:
             _write_externalized_payload_at(tmp_path.name, payload, dir_fd=dir_fd)
@@ -1690,7 +1691,7 @@ def _reassign_oversize_externalized_payload(
     if opened is None:
         return False
     payload_fd, dir_fd, payload_stat = opened
-    tmp_name = f"{path.name}.{time.time_ns():x}.tmp"
+    tmp_name = f"{path.name}.{secrets.token_hex(8)}.tmp"
     tmp_path = path.with_name(tmp_name)
     tmp_fd = -1
     tmp_identity: tuple[int, int] | None = None
@@ -2055,7 +2056,7 @@ def externalize_ingest_payload(
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
+    unique_suffix = secrets.token_hex(8)
     kind_stub = _safe_stub(kind, "ingest_payload")
     field_stub = re.sub(r"[^A-Za-z0-9_.-]+", "-", field_path or "payload")[:48]
     filename = f"{timestamp}_{kind_stub}_{field_stub}_{digest_prefix}_{unique_suffix}.json"
@@ -2173,7 +2174,7 @@ def maybe_externalize_payload(
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
+    unique_suffix = secrets.token_hex(8)
     if kind == "tool_result":
         # Keep the original filename shape for compatibility with existing
         # externalized tool-output stores and tests.
