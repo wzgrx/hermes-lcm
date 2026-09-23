@@ -18,6 +18,11 @@ the current request stays in returned context, and raw rows remain recoverable.
    already summarized rows, synthetic summary scaffolding, ignored placeholders,
    or a past user request as a fresh anchor. Keep the original active message
    list as the anchor source during assembly.
+   When the active middle itself has an eligible leaf, compact it first to
+   reduce the live prompt. A newer active leaf may publish its exact D0 source
+   IDs, but it must **not** leap the monotonic lifecycle frontier across the
+   older hidden gap. A later store-backed pass covers that prefix, skipping
+   the already-published active source IDs.
 3. Load the oldest prefix in store order using a bounded page/actual-token
    budget. Preserve assistant/tool-result groups at the boundary. Resolve
    externalized payloads according to the existing ingest and pre-compaction

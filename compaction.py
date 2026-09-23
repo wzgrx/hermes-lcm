@@ -328,9 +328,21 @@ class CompactionMixin:
                     messages=replay_messages,
                 )
             )
+            active_leaf_eligible = False
+            if store_maintenance_due:
+                active_leaf_eligible, _active_leaf_reason = (
+                    self._leaf_compaction_candidate_status(
+                        replay_messages,
+                        allow_partial_leaf=bool(
+                            self._config.threshold_full_sweep_enabled
+                            and self.threshold_tokens > 0
+                            and pressure_tokens >= self.threshold_tokens
+                        ),
+                    )
+                )
             hidden_leaf = (
                 self._load_hidden_store_leaf_chunk(replay_messages)
-                if store_maintenance_due else None
+                if store_maintenance_due and not active_leaf_eligible else None
             )
             if hidden_leaf:
                 if self._config.deferred_maintenance_enabled and self._conversation_id:
@@ -716,16 +728,9 @@ class CompactionMixin:
         if post_frontier["messages"] <= 0:
             return None
 
-        # The costly identity map is only needed when the store might hold at
-        # least one leaf chunk. A positive estimate below that bar with no
-        # unknown rows can be left to the ordinary active-window path.
-        if (
-            post_frontier["missing_token_estimate_rows"] == 0
-            and post_frontier["estimated_tokens"]
-            < self._raw_backlog_threshold(post_frontier["estimated_tokens"])
-            and not self._has_raw_backlog_debt()
-        ):
-            return None
+        # Even a sub-chunk hidden gap must remain visible here: a normal
+        # active-window leaf must not advance the single lifecycle frontier
+        # past durable rows that have not yet entered any D0 node.
         active_store_ids = self._visible_store_ids_from_tail(messages)
         visible_after_frontier = [
             store_id for store_id in active_store_ids if store_id > selection_frontier_store_id
@@ -1245,9 +1250,22 @@ class CompactionMixin:
                 messages=working_messages,
             )
         )
+        active_leaf_eligible = False
+        if store_compaction_due:
+            active_leaf_eligible, _active_leaf_reason = (
+                self._leaf_compaction_candidate_status(
+                    working_messages,
+                    force_overflow=force_overflow,
+                    allow_partial_leaf=cleanup_threshold_full_sweep_active,
+                )
+            )
+        hidden_gap_bounds = (
+            self._hidden_store_prefix_upper_bound(working_messages)
+            if store_compaction_due and active_leaf_eligible else None
+        )
         hidden_leaf = (
             self._load_hidden_store_leaf_chunk(working_messages)
-            if store_compaction_due else None
+            if store_compaction_due and not active_leaf_eligible and not force_overflow else None
         )
         if hidden_leaf is not None:
             hidden_messages, hidden_direct_ids, _hidden_bounds = hidden_leaf
@@ -1702,9 +1720,15 @@ class CompactionMixin:
                 self._dag.add_node(node)
             self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            if not store_backed_leaf:
+            if store_backed_leaf:
+                self._last_compacted_store_id = max(consumed_store_ids)
+            elif not hidden_gap_bounds:
+                self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
                 self._persist_frontier_marker()
+            # An active D0 node can cover newer rows, but the monotonic cursor
+            # remains before an older hidden gap until that prefix is actually
+            # published. The DAG source IDs prevent a later store pass from
+            # summarizing the active node's rows twice.
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + [

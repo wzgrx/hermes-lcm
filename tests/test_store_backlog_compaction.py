@@ -403,6 +403,87 @@ def test_hidden_store_prefix_is_summarized_without_replaying_it_as_live_context(
         engine.shutdown()
 
 
+def test_live_window_pressure_is_compacted_before_hidden_store_debt(tmp_path, monkeypatch):
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / "lcm.db"),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=30,
+            threshold_full_sweep_enabled=False,
+        ),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start("session", platform="telegram", conversation_id="conversation")
+    try:
+        hidden_ids = engine._store.append_batch(
+            "session",
+            [{"role": "user", "content": f"hidden {n} " + "detail " * 30} for n in range(4)],
+            [50] * 4,
+            source="telegram", conversation_id="conversation",
+        )
+        active = [
+            {"role": "user", "content": "visible old one " + "context " * 30},
+            {"role": "assistant", "content": "visible old reply " + "context " * 30},
+            {"role": "user", "content": "current request"},
+        ]
+        engine.threshold_tokens = 1
+        monkeypatch.setattr(
+            engine, "_summarize_leaf_chunk_with_rescue",
+            lambda chunk, **_kwargs: (chunk, 60, "Visible old context summarized.", 1, 1),
+        )
+        assert engine.should_compress_preflight(active) is True
+        result = engine.compress(active)
+        leaves = [node for node in engine._dag.get_session_nodes("session") if node.depth == 0]
+        assert leaves
+        assert set(leaves[0].source_ids).isdisjoint(hidden_ids)
+        assert any("current request" in str(message.get("content")) for message in result)
+        assert engine._lifecycle.get_by_conversation("conversation").current_frontier_store_id == 0
+        assert engine._hidden_store_prefix_upper_bound(result) is not None
+        assert engine.should_compress_preflight(result) is True
+        engine.compress(result)
+        all_sources = {
+            store_id
+            for node in engine._dag.get_session_nodes("session") if node.depth == 0
+            for store_id in node.source_ids
+        }
+        assert hidden_ids[0] in all_sources
+    finally:
+        engine.shutdown()
+
+
+def test_subchunk_hidden_gap_cannot_be_skipped_by_newer_active_leaf(tmp_path, monkeypatch):
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / "lcm.db"),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=40,
+        ),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    engine.on_session_start("session", platform="telegram", conversation_id="conversation")
+    try:
+        hidden_id = engine._store.append(
+            "session", {"role": "user", "content": "small hidden fact"},
+            token_estimate=1, source="telegram", conversation_id="conversation",
+        )
+        active = [
+            {"role": "user", "content": "visible backlog " + "detail " * 80},
+            {"role": "user", "content": "current request"},
+        ]
+        engine.threshold_tokens = 1
+        monkeypatch.setattr(
+            engine, "_summarize_leaf_chunk_with_rescue",
+            lambda chunk, **_kwargs: (chunk, 80, "Visible backlog summarized.", 1, 1),
+        )
+        assert engine.should_compress_preflight(active) is True
+        engine.compress(active)
+        state = engine._lifecycle.get_by_conversation("conversation")
+        assert state.current_frontier_store_id < hidden_id
+        assert engine._store.get(hidden_id)["content"] == "small hidden fact"
+    finally:
+        engine.shutdown()
+
+
 def test_hidden_store_prefix_keeps_debt_until_all_rows_are_covered(tmp_path, monkeypatch):
     engine = LCMEngine(
         config=LCMConfig(
