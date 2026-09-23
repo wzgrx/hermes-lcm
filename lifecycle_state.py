@@ -178,9 +178,18 @@ class LifecycleStateStore:
         if existing is not None:
             if existing.current_session_id == session_id:
                 return existing
-            current_frontier = (
-                existing.current_frontier_store_id if existing.current_session_id == session_id else 0
+            # A graceful gateway shutdown finalizes the active session and
+            # clears its current frontier. Restarting that *same* session is
+            # continuation, not rollover: reuse its finalized checkpoint so
+            # already-published raw rows do not become fresh compaction debt.
+            # A different session (including an explicit /new, whose carry is
+            # fenced separately) must still begin at zero.
+            resuming_finalized_session = (
+                existing.current_session_id is None
+                and existing.last_finalized_session_id == session_id
             )
+            if resuming_finalized_session:
+                current_frontier = existing.last_finalized_frontier_store_id
             current_bound_at = (
                 existing.current_bound_at if existing.current_session_id == session_id else now
             )
@@ -191,6 +200,17 @@ class LifecycleStateStore:
             last_finalized_at = existing.last_finalized_at
             debt_updated_at = existing.debt_updated_at
             last_maintenance_attempt_at = existing.last_maintenance_attempt_at
+            if resuming_finalized_session:
+                # The finalized marker is a shutdown checkpoint, not carry
+                # from a different session. Leaving it attached to the now
+                # live session makes maintenance classify its own messages as
+                # unbound backlog on every preflight.
+                last_finalized_session_id = None
+                last_finalized_frontier = 0
+                last_finalized_at = None
+                debt_kind = None
+                debt_size_estimate = 0
+                debt_updated_at = None
             last_rollover_at = (
                 now
                 if (
