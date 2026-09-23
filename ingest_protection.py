@@ -1800,6 +1800,27 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     return extract_all_externalized_payload_refs(value)
 
 
+def _accessible_externalized_payload_file(path: Path) -> bool:
+    """Match the safe reader's file-type, ownership and link-count gates.
+
+    A symlink or multiply linked basename is not recoverable via
+    ``load_externalized_payload`` and must not mask a missing reference in
+    doctor output. This is a metadata check, not a substitute for the reader's
+    descriptor-backed identity validation at actual load time.
+    """
+    try:
+        entry = os.lstat(path)
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(entry, "st_file_attributes", 0) & reparse_flag:
+        return False
+    if not stat.S_ISREG(entry.st_mode) or getattr(entry, "st_nlink", 1) != 1:
+        return False
+    get_effective_uid = getattr(os, "geteuid", None)
+    return get_effective_uid is None or getattr(entry, "st_uid", None) in (None, get_effective_uid())
+
+
 def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
     """Compare externalized payload refs stored in messages with JSON files.
 
@@ -1810,8 +1831,11 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
 
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     existing_files: set[str] = set()
-    if storage_dir.exists() and storage_dir.is_dir():
-        existing_files = {path.name for path in storage_dir.glob("*.json") if path.is_file()}
+    if storage_dir.exists() and storage_dir.is_dir() and not storage_dir.is_symlink():
+        existing_files = {
+            path.name for path in storage_dir.glob("*.json")
+            if _accessible_externalized_payload_file(path)
+        }
 
     referenced_refs: set[str] = set()
     host_referenced_refs: set[str] = set()
@@ -2128,9 +2152,9 @@ def externalized_payload_stats(config, hermes_home: str = "") -> dict[str, Any]:
     total_chars = 0
     latest_path = ""
     latest_mtime = 0.0
-    if storage_dir.exists() and storage_dir.is_dir():
+    if storage_dir.exists() and storage_dir.is_dir() and not storage_dir.is_symlink():
         for path in storage_dir.glob("*.json"):
-            if not path.is_file():
+            if not _accessible_externalized_payload_file(path):
                 continue
             count += 1
             try:

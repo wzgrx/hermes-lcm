@@ -33,6 +33,7 @@ from hermes_lcm.externalize import (
 from hermes_lcm.ingest_protection import (
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
+    externalized_payload_stats,
     redact_sensitive_text,
     scan_externalized_payload_integrity,
 )
@@ -1250,6 +1251,24 @@ def test_restart_replay_does_not_skip_changed_duplicate_key_tool_argument_payloa
     assert _expand_ref(engine, refs[0])["content"] == payload_b
 
 
+def test_ingest_write_error_keeps_source_and_creates_no_dangling_ref(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("simulated payload write failure")
+
+    monkeypatch.setattr(externalize_module, "_write_externalized_payload", fail_write)
+    engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    integrity = scan_externalized_payload_integrity(
+        engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+    )
+    assert content == DATA_URI
+    assert integrity["externalized_payload_refs_missing"] == 0
+    assert _externalized_files(tmp_path) == []
+
+
 def test_ingest_preserves_inline_payload_when_externalization_fails(tmp_path, monkeypatch):
     from hermes_lcm import ingest_protection
 
@@ -1980,6 +1999,57 @@ def test_lcm_doctor_reports_embedded_generic_base64_without_raw_preview(tmp_path
     assert rows
     assert rows[0]["field"] == "tool_calls"
     assert rows[0]["suspicious_category"] == "base64_like"
+
+
+def test_externalized_integrity_rejects_symlinked_payload_basename(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"content": "outside", "content_chars": 7}))
+    (storage_dir / "linked.json").symlink_to(outside)
+    engine._store.append(
+        engine.current_session_id,
+        {
+            "role": "assistant",
+            "content": "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=7; bytes=7; ref=linked.json]",
+        },
+    )
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+    )
+    stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"][0]["externalized_ref"] == "linked.json"
+    assert stats["externalized_payload_count"] == 0
+    assert stats["externalized_payload_chars"] == 0
+
+
+def test_externalized_integrity_rejects_multiply_linked_payload(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    original = storage_dir / "original.json"
+    original.write_text(json.dumps({"content": "shared", "content_chars": 6}))
+    (storage_dir / "linked.json").hardlink_to(original)
+    engine._store.append(
+        engine.current_session_id,
+        {
+            "role": "assistant",
+            "content": "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=6; bytes=6; ref=linked.json]",
+        },
+    )
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn, engine._config, hermes_home=engine._hermes_home,
+    )
+    stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["externalized_payload_files_unreferenced"] == 0
+    assert stats["externalized_payload_count"] == 0
 
 
 def test_lcm_doctor_reports_externalized_payload_stats(tmp_path):

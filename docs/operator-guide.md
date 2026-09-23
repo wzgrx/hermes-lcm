@@ -746,6 +746,16 @@ provider — see *Embedding backfill* below).
 Apply paths are intentionally narrow and backup-first. Start with diagnostics
 before cleanup or repair.
 
+If `/lcm doctor` reports `externalized_payload_refs_missing`, inspect the
+reported ref and restore its JSON file from a matching backup before changing
+database rows. The integrity scan now excludes symlinks and multi-link files,
+matching the payload reader's acceptance rules. A payload-write `OSError` in
+the current ingest path retains the inline source text rather than persisting a
+new placeholder; missing refs therefore need file/history investigation, not
+an automatic message-row deletion. This is why the upstream
+[`doctor externalize apply` proposal](https://github.com/stephenschoettler/hermes-lcm/pull/620)
+is not treated as a lossless repair operation here.
+
 ### Rotate: in-place compact without changing session identity
 
 `/lcm rotate` lets an operator compact a long-running session in place without
