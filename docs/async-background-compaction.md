@@ -82,6 +82,7 @@ Indexes:
 
 - `(conversation_id, state, created_at)`
 - `(session_id, state, created_at)`
+- partial `(state, preparer_identity)` for active, owned claims only
 - `(next_retry_at, state)`
 
 ### `lcm_pending_summary_nodes`
@@ -151,8 +152,10 @@ pass). If the process identity cannot be verified, the lease fallback releases
 claims older than twice the provider timeout (minimum five minutes). A live
 other process is not reclaimed by the immediate dead-owner check; the
 time-based lease still applies if a provider stalls beyond its bound. Ready
-batches remain durable and are
-revalidated at promotion.
+batches remain durable and are revalidated at promotion. The immediate recovery
+probe reads active identities without a write lock and only enters a write
+transaction for a provably exited owner; that update also checks the owner
+identity has not changed since the probe.
 
 The worker can now prepare a consecutive ready chain ahead of the live frontier
 (default at most two batches; at most four preparations in one scheduled pass).

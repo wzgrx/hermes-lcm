@@ -227,6 +227,36 @@ def test_restart_recovery_releases_only_abandoned_incomplete_claims(tmp_path):
         core.close()
 
 
+def test_live_or_empty_dead_owner_probe_does_not_reserve_writer(tmp_path):
+    db_path = tmp_path / "no-dead-owner.db"
+    core = MessageStore(db_path)
+    try:
+        _seed_sources(core)
+        with AsyncCompactionStore(db_path, enabled=True) as store:
+            plan = store.connection.execute(
+                "EXPLAIN QUERY PLAN SELECT batch_id, preparer_identity "
+                "FROM lcm_compaction_batches WHERE state IN ('pending', 'preparing') "
+                "AND preparer_identity != ''"
+            ).fetchall()
+            assert any("idx_lcm_compaction_active_owner" in row[3] for row in plan)
+            queries: list[str] = []
+            store.connection.set_trace_callback(queries.append)
+            assert store._recover_provably_dead_batches() == 0
+            assert not any(
+                query.lstrip().upper().startswith(("BEGIN IMMEDIATE", "UPDATE"))
+                for query in queries
+            )
+            _create_batch(store)
+            queries.clear()
+            assert store._recover_provably_dead_batches() == 0
+            assert not any(
+                query.lstrip().upper().startswith(("BEGIN IMMEDIATE", "UPDATE"))
+                for query in queries
+            )
+    finally:
+        core.close()
+
+
 @pytest.mark.skipif(
     not _current_preparer_identity(), reason="Linux /proc process identity unavailable",
 )

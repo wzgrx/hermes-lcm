@@ -250,6 +250,11 @@ class AsyncCompactionStore:
                 "ON lcm_compaction_batches(session_id, state, created_at)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lcm_compaction_active_owner "
+                "ON lcm_compaction_batches(state, preparer_identity) "
+                "WHERE state IN ('pending', 'preparing') AND preparer_identity != ''"
+            )
+            conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_lcm_compaction_one_active_frontier "
                 "ON lcm_compaction_batches(conversation_id, session_id, "
                 "frontier_start_store_id) "
@@ -600,7 +605,7 @@ class AsyncCompactionStore:
     ) -> int:
         """Reclaim only claims whose recorded Linux process has ended."""
         conn = self.connection
-        where = "state IN ('pending', 'preparing')"
+        where = "state IN ('pending', 'preparing') AND preparer_identity != ''"
         params: list[str] = []
         if conversation_id is not None:
             where += " AND conversation_id = ?"
@@ -608,24 +613,32 @@ class AsyncCompactionStore:
         if session_id is not None:
             where += " AND session_id = ?"
             params.append(session_id)
+        # Most opens have no dead owner. Probe without reserving a SQLite
+        # writer slot; claim it only when there is actually work to reclaim.
+        rows = conn.execute(
+            "SELECT batch_id, preparer_identity FROM lcm_compaction_batches "
+            f"WHERE {where}", params,
+        ).fetchall()
+        candidates = [
+            (str(row["batch_id"]), str(row["preparer_identity"]))
+            for row in rows
+            if _preparer_provably_dead(str(row["preparer_identity"]))
+        ]
+        if not candidates:
+            return 0
         conn.execute("BEGIN IMMEDIATE")
         try:
-            rows = conn.execute(
-                "SELECT batch_id, preparer_identity FROM lcm_compaction_batches "
-                f"WHERE {where}", params,
-            ).fetchall()
             now = time.time()
             reclaimed = 0
-            for row in rows:
-                if not _preparer_provably_dead(str(row["preparer_identity"])):
-                    continue
+            for batch_id, identity in candidates:
                 reclaimed += conn.execute(
                     """UPDATE lcm_compaction_batches
                        SET state = 'failed', failure_count = failure_count + 1,
                            next_retry_at = ?, last_error = 'PreparationOwnerExited',
                            updated_at = ?
-                       WHERE batch_id = ? AND state IN ('pending', 'preparing')""",
-                    (now, now, row["batch_id"]),
+                       WHERE batch_id = ? AND preparer_identity = ?
+                         AND state IN ('pending', 'preparing')""",
+                    (now, now, batch_id, identity),
                 ).rowcount
             conn.execute("COMMIT")
             return reclaimed
