@@ -100,6 +100,25 @@ def test_manual_preparation_calls_provider_outside_sqlite_transaction(
         engine.shutdown()
 
 
+def test_pending_summary_text_is_absent_from_active_search(tmp_path, monkeypatch):
+    engine = _engine_with_stable_backlog(tmp_path)
+    marker = "PendingOnlySummaryMarker9471"
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: (marker, 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        grep = json.loads(engine.handle_tool_call("lcm_grep", {"query": marker}))
+        assert grep["total_results"] == 0
+        assert grep["results"] == []
+        assert engine._dag.get_session_node_count("session-1") == 0
+        assert engine.get_async_compaction_status()["ready_batches"] == 1
+    finally:
+        engine.shutdown()
+
+
 def test_first_leaf_skips_system_anchor_and_promotes_atomically(
     tmp_path, monkeypatch,
 ):
@@ -391,6 +410,35 @@ def test_summary_failure_records_type_only_and_enforces_backoff(tmp_path, monkey
         engine.shutdown()
 
 
+def test_background_failure_backoff_does_not_block_foreground_compaction(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path)
+    try:
+        def failed_summary(**_kwargs):
+            raise RuntimeError("background provider unavailable")
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation", failed_summary,
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "failed"
+        assert engine.prepare_background_compaction_once(host_config={}) is None
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Foreground recovery summary.", 1),
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        result = engine.compress(messages, current_tokens=900)
+        assert engine._dag.get_session_node_count("session-1") == 1
+        assert any("Foreground recovery summary." in str(msg.get("content")) for msg in result)
+    finally:
+        engine.shutdown()
+
+
 def test_foreground_compress_consumes_ready_leaf_without_provider_call(
     tmp_path, monkeypatch
 ):
@@ -661,6 +709,40 @@ def test_foreground_falls_back_when_summary_route_changes(tmp_path, monkeypatch)
             "Foreground summary after route change." in str(msg.get("content"))
             for msg in output
         )
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_uses_live_threshold_policy_over_prepared_batch(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path)
+    calls = []
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Prepared under old threshold.", 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        engine._config.context_threshold = 0.75
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+
+        def foreground_summary(**_kwargs):
+            calls.append(True)
+            return "Foreground under live threshold.", 1
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation", foreground_summary,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        result = engine.compress(messages, current_tokens=900)
+        assert calls
+        assert engine._async_compaction_store.get_batch(batch["batch_id"])["state"] == "rejected"
+        assert any("Foreground under live threshold." in str(msg.get("content")) for msg in result)
     finally:
         engine.shutdown()
 

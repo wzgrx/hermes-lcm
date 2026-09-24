@@ -177,6 +177,30 @@ plus long-session performance coverage
 before deployment. The worker flag is off by default even when the master
 feature flag is enabled.
 
+## Executable acceptance coverage
+
+The original `test_async_background_compaction_design.py` spike called an
+obsolete positional preparation API and marked every scenario as an expected
+failure. The following executable tests replace its checks against the current
+API; no design-only expected failures remain:
+
+| Scenario | Executable test |
+| --- | --- |
+| Default-off has no optional store/tables | `test_disabled_store_does_not_create_database_or_optional_tables`, `test_disabled_preparation_is_inert` |
+| Pending summary is absent from DAG/search | `test_staged_leaf_is_durable_but_invisible_to_canonical_dag`, `test_pending_summary_text_is_absent_from_active_search` |
+| Source rewrite rejects preparation/publication | `test_source_rewrite_during_summary_preparation_fails_closed`, `test_foreground_rejects_rewritten_source_then_summarizes_current_rows` |
+| Live policy and threshold beat staged metadata | `test_promotion_rejects_stale_policy_route_or_fresh_tail`, `test_foreground_uses_live_threshold_policy_over_prepared_batch` |
+| Live summary route beats staged metadata | `test_foreground_falls_back_when_summary_route_changes` |
+| Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider`, `test_two_publishers_serialize_and_publish_once` |
+| Provider failure/backoff leaves foreground usable | `test_summary_failure_records_type_only_and_enforces_backoff`, `test_background_failure_backoff_does_not_block_foreground_compaction` |
+| Restart recovery | `test_restart_recovery_releases_only_abandoned_incomplete_claims` (lease-bounded; incomplete claims are reclaimed after at least two provider timeout windows, minimum five minutes) |
+| Atomic success and rollback | `test_promotion_publishes_nodes_frontier_and_batch_in_one_transaction`, `test_mid_publication_failure_rolls_back_all_canonical_changes` |
+| Status/Doctor counters | `test_manual_preparation_calls_provider_outside_sqlite_transaction` |
+
+The remaining work is not represented as a passing claim: immediate recovery
+of an incomplete claim from a provably dead process, broader multi-process
+stress, and long-session latency/quality measurements still require evidence.
+
 ## Fingerprints and validation inputs
 
 A prepared batch is valid only for the exact policy and source frontier it was created for.
