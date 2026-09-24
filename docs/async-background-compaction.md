@@ -200,7 +200,7 @@ API; no design-only expected failures remain:
 | Source rewrite rejects preparation/publication | `test_source_rewrite_during_summary_preparation_fails_closed`, `test_foreground_rejects_rewritten_source_then_summarizes_current_rows` |
 | Live policy and threshold beat staged metadata | `test_promotion_rejects_stale_policy_route_or_fresh_tail`, `test_foreground_uses_live_threshold_policy_over_prepared_batch` |
 | Live summary route beats staged metadata | `test_foreground_falls_back_when_summary_route_changes` |
-| Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider`, `test_two_publishers_serialize_and_publish_once` |
+| Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider`, `test_two_publishers_serialize_and_publish_once`, `test_two_processes_publish_once_without_partial_canonical_state` (three independent databases with a simultaneous release gate) |
 | Provider failure/backoff leaves foreground usable | `test_summary_failure_records_type_only_and_enforces_backoff`, `test_background_failure_backoff_does_not_block_foreground_compaction` |
 | Restart recovery | `test_live_other_process_is_preserved_then_dead_owner_recovers_on_open` (Linux dead-owner immediate recovery; live owner preserved), `test_restart_recovery_releases_only_abandoned_incomplete_claims` (lease fallback for unknown ownership) |
 | Atomic success and rollback | `test_promotion_publishes_nodes_frontier_and_batch_in_one_transaction`, `test_mid_publication_failure_rolls_back_all_canonical_changes` |

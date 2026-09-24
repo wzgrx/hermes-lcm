@@ -58,6 +58,23 @@ def _hold_preparing_claim(db_path: str, ready, release) -> None:
         assert release.wait(15)
 
 
+def _publish_in_process(db_path: str, ready, release, results) -> None:
+    try:
+        with AsyncCompactionStore(db_path, enabled=True) as store:
+            ready.set()
+            if not release.wait(15):
+                raise TimeoutError("publication start gate timed out")
+            outcome = store.promote_batch(
+                "batch-1",
+                live_policy_fingerprint="policy-hash",
+                live_summary_route_fingerprint="route-hash",
+                max_publishable_store_id=10,
+            )
+            results.put(("ok", outcome.reason))
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
 def test_disabled_store_does_not_create_database_or_optional_tables(tmp_path):
     db_path = tmp_path / "disabled.db"
     with AsyncCompactionStore(db_path) as store:
@@ -634,6 +651,64 @@ def test_two_publishers_serialize_and_publish_once(tmp_path):
     finally:
         second_store.close()
         engine.shutdown()
+
+
+@pytest.mark.skipif(
+    not _current_preparer_identity(), reason="Linux /proc process identity unavailable",
+)
+def test_two_processes_publish_once_without_partial_canonical_state(tmp_path):
+    # An actual process boundary catches SQLite locking/connection assumptions
+    # that the same-process thread race cannot exercise.
+    context = multiprocessing.get_context("fork")
+    for attempt in range(3):
+        case_dir = tmp_path / str(attempt)
+        case_dir.mkdir()
+        engine = _ready_engine(case_dir)
+        engine.shutdown()
+        db_path = str(case_dir / "publish.db")
+        first_ready = context.Event()
+        second_ready = context.Event()
+        release = context.Event()
+        results = context.Queue()
+        first = context.Process(
+            target=_publish_in_process,
+            args=(db_path, first_ready, release, results),
+        )
+        second = context.Process(
+            target=_publish_in_process,
+            args=(db_path, second_ready, release, results),
+        )
+        first.start()
+        second.start()
+        try:
+            assert first_ready.wait(15)
+            assert second_ready.wait(15)
+            release.set()
+            outcomes = [results.get(timeout=15), results.get(timeout=15)]
+            first.join(15)
+            second.join(15)
+            assert first.exitcode == second.exitcode == 0
+            assert sorted(outcomes) == [
+                ("ok", "already_promoted"), ("ok", "promoted"),
+            ]
+            with AsyncCompactionStore(db_path, enabled=True) as observer:
+                rows = observer.connection.execute(
+                    "SELECT source_ids FROM summary_nodes ORDER BY node_id"
+                ).fetchall()
+                frontier = observer.connection.execute(
+                    "SELECT current_frontier_store_id FROM lcm_lifecycle_state "
+                    "WHERE conversation_id = 'conversation-1'"
+                ).fetchone()[0]
+                assert len(rows) == 2
+                assert frontier == 10
+                assert observer.get_batch("batch-1")["state"] == "promoted"
+        finally:
+            release.set()
+            for child in (first, second):
+                if child.is_alive():
+                    child.terminate()
+                    child.join(5)
+            results.close()
 
 
 def test_schema_incompatibility_does_not_leave_partial_optional_tables(tmp_path):
