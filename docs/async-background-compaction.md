@@ -56,6 +56,9 @@ Suggested columns:
 - `session_id TEXT NOT NULL`
 - `state TEXT NOT NULL` — `pending`, `preparing`, `ready`, `promoting`, `promoted`, `rejected`, `failed`, `superseded`
 - `frontier_start_store_id INTEGER NOT NULL`
+- `source_frontier_start_store_id INTEGER NOT NULL` — normally the same as the
+  lifecycle frontier; for the first leaf it may skip only a contiguous leading
+  system-anchor prefix, which is not summary source material.
 - `frontier_end_store_id INTEGER NOT NULL`
 - `fresh_tail_count INTEGER NOT NULL`
 - `leaf_chunk_tokens INTEGER NOT NULL`
@@ -145,11 +148,17 @@ already accepted preparation intact. Incomplete claims older than twice the
 provider timeout (minimum five minutes) are released for retry after process
 restart. Ready batches remain durable and are revalidated at promotion.
 
+The first leaf can now prepare behind a stored system anchor without advancing
+the lifecycle frontier early: the batch records a separate source-selection
+frontier, and both readiness and publication revalidate that every skipped row
+is still a system anchor. The one publication transaction still moves the
+canonical frontier from its original value to the leaf end.
+
 This remains an **experimental isolated branch**, not installed in the live
-Gateway. It still needs multi-leaf queue advancement, reset fences, first-leaf
-system-anchor handling, emergency/partial-emergency paths, and broader race and
-long-session performance coverage before deployment. The worker flag is off by
-default even when the master feature flag is enabled.
+Gateway. It still needs multi-leaf queue advancement, reset fences,
+emergency/partial-emergency paths, and broader race and long-session
+performance coverage before deployment. The worker flag is off by default
+even when the master feature flag is enabled.
 
 ## Fingerprints and validation inputs
 

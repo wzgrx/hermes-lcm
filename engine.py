@@ -2371,11 +2371,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if state is None or state.current_session_id != self._session_id:
             return None
         frontier = int(state.current_frontier_store_id or 0)
-        # A stored system anchor before the first leaf is intentionally outside
-        # the compactable source range. Wait for an existing foreground leaf to
-        # establish a cursor beyond it rather than pretending it was summarized.
-        if frontier <= 0:
-            return None
 
         if host_config is None:
             try:
@@ -2440,10 +2435,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             before_store_id=first_tail_id,
             limit=512,
         )
-        if not rows or rows[0]["role"] in {"system", "tool"}:
+        if not rows:
+            return None
+        source_frontier = frontier
+        while rows and rows[0]["role"] == "system":
+            source_frontier = int(rows.pop(0)["store_id"])
+        if not rows or rows[0]["role"] == "tool":
             return None
         stats = self._store.get_session_post_frontier_stats(
-            self._session_id, frontier, before_store_id=first_tail_id,
+            self._session_id, source_frontier, before_store_id=first_tail_id,
         )
         target_tokens = self._working_leaf_chunk_tokens(stats["estimated_tokens"])
         selected_rows: list[dict[str, Any]] = []
@@ -2480,7 +2480,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source_ids = [int(row["store_id"]) for row in selected_rows]
         if self._dag.get_covered_message_ids(
             self._session_id,
-            after_store_id=frontier,
+            after_store_id=source_frontier,
             before_store_id=source_ids[-1] + 1,
         ):
             return None
@@ -2492,6 +2492,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 conversation_id=self._conversation_id,
                 session_id=self._session_id,
                 frontier_start_store_id=frontier,
+                source_frontier_start_store_id=source_frontier,
                 frontier_end_store_id=source_ids[-1],
                 fresh_tail_count=self._config.fresh_tail_count,
                 leaf_chunk_tokens=target_tokens,

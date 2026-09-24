@@ -10,7 +10,7 @@ from threading import Barrier
 
 import pytest
 
-from hermes_lcm.async_compaction_store import AsyncCompactionStore
+from hermes_lcm.async_compaction_store import AsyncCompactionStore, _CREATE_BATCHES
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.store import MessageStore
@@ -566,6 +566,37 @@ def test_schema_incompatibility_does_not_leave_partial_optional_tables(tmp_path)
             )
         }
         assert "lcm_pending_summary_nodes" not in names
+    finally:
+        core.close()
+
+
+def test_existing_optional_batch_schema_gains_source_frontier(tmp_path):
+    db_path = tmp_path / "legacy-optional.db"
+    core = MessageStore(db_path)
+    try:
+        legacy_schema = _CREATE_BATCHES.replace(
+            "    source_frontier_start_store_id INTEGER NOT NULL CHECK (\n"
+            "        source_frontier_start_store_id >= frontier_start_store_id\n"
+            "    ),\n",
+            "",
+        )
+        core._conn.execute(legacy_schema)
+        core._conn.execute(
+            """INSERT INTO lcm_compaction_batches (
+                batch_id, conversation_id, session_id, state,
+                frontier_start_store_id, frontier_end_store_id,
+                fresh_tail_count, leaf_chunk_tokens, policy_fingerprint,
+                summary_route_fingerprint, source_coverage_hash,
+                source_ids_json, source_identity_hashes_json,
+                expected_leaf_count, created_at, updated_at
+            ) VALUES ('old', 'conversation-1', 'session-1', 'pending',
+                      1, 2, 1, 64, 'policy', 'route', 'coverage',
+                      '[2]', '["digest"]', 1, 1, 1)"""
+        )
+        core._conn.commit()
+        with AsyncCompactionStore(db_path, enabled=True) as upgraded:
+            assert upgraded.get_batch("old")["source_frontier_start_store_id"] == 1
+            assert upgraded.counts()["pending"] == 1
     finally:
         core.close()
 

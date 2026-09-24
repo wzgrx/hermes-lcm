@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS lcm_compaction_batches (
         'rejected', 'failed', 'superseded'
     )),
     frontier_start_store_id INTEGER NOT NULL CHECK (frontier_start_store_id >= 0),
+    source_frontier_start_store_id INTEGER NOT NULL CHECK (
+        source_frontier_start_store_id >= frontier_start_store_id
+    ),
     frontier_end_store_id INTEGER NOT NULL CHECK (frontier_end_store_id > frontier_start_store_id),
     fresh_tail_count INTEGER NOT NULL CHECK (fresh_tail_count >= 0),
     leaf_chunk_tokens INTEGER NOT NULL CHECK (leaf_chunk_tokens > 0),
@@ -155,6 +158,22 @@ class AsyncCompactionStore:
         try:
             conn.execute(_CREATE_BATCHES)
             conn.execute(_CREATE_PENDING)
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(lcm_compaction_batches)")
+            }
+            if "source_frontier_start_store_id" not in columns:
+                if "frontier_start_store_id" not in columns:
+                    raise sqlite3.OperationalError(
+                        "incompatible async compaction table: lcm_compaction_batches"
+                    )
+                conn.execute(
+                    "ALTER TABLE lcm_compaction_batches ADD COLUMN "
+                    "source_frontier_start_store_id INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.execute(
+                    "UPDATE lcm_compaction_batches SET "
+                    "source_frontier_start_store_id = frontier_start_store_id"
+                )
             self._verify_schema(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_lcm_compaction_batches_conversation "
@@ -188,6 +207,7 @@ class AsyncCompactionStore:
         required = {
             "lcm_compaction_batches": {
                 "batch_id",
+                "source_frontier_start_store_id",
                 "conversation_id",
                 "session_id",
                 "state",
@@ -228,6 +248,7 @@ class AsyncCompactionStore:
         conversation_id: str,
         session_id: str,
         frontier_start_store_id: int,
+        source_frontier_start_store_id: int | None = None,
         frontier_end_store_id: int,
         fresh_tail_count: int,
         leaf_chunk_tokens: int,
@@ -249,14 +270,26 @@ class AsyncCompactionStore:
             or expected_leaf_count <= 0
         ):
             raise ValueError("invalid compaction batch identity or policy")
+        source_start = (
+            frontier_start_store_id if source_frontier_start_store_id is None
+            else int(source_frontier_start_store_id)
+        )
+        if not frontier_start_store_id <= source_start < frontier_end_store_id:
+            raise ValueError("invalid source frontier")
         conn = self.connection
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if not self._skipped_system_prefix_matches(
+                conn, conversation_id=conversation_id, session_id=session_id,
+                frontier_start_store_id=frontier_start_store_id,
+                source_frontier_start_store_id=source_start,
+            ):
+                raise ValueError("skipped source prefix is not a system anchor")
             source_ids, identity_hashes = self._source_snapshot(
                 conn,
                 conversation_id=conversation_id,
                 session_id=session_id,
-                frontier_start_store_id=frontier_start_store_id,
+                frontier_start_store_id=source_start,
                 frontier_end_store_id=frontier_end_store_id,
             )
             if (
@@ -270,17 +303,19 @@ class AsyncCompactionStore:
             conn.execute(
                 """INSERT INTO lcm_compaction_batches (
                     batch_id, conversation_id, session_id, state,
-                    frontier_start_store_id, frontier_end_store_id,
+                    frontier_start_store_id, source_frontier_start_store_id,
+                    frontier_end_store_id,
                     fresh_tail_count, leaf_chunk_tokens, policy_fingerprint,
                     summary_route_fingerprint, source_coverage_hash,
                     source_ids_json, source_identity_hashes_json,
                     expected_leaf_count, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     batch_id,
                     conversation_id,
                     session_id,
                     frontier_start_store_id,
+                    source_start,
                     frontier_end_store_id,
                     fresh_tail_count,
                     leaf_chunk_tokens,
@@ -304,6 +339,26 @@ class AsyncCompactionStore:
         except BaseException:
             conn.execute("ROLLBACK")
             raise
+
+    @staticmethod
+    def _skipped_system_prefix_matches(
+        conn: sqlite3.Connection, *, conversation_id: str, session_id: str,
+        frontier_start_store_id: int, source_frontier_start_store_id: int,
+    ) -> bool:
+        """Allow only leading system anchors outside prepared source coverage."""
+        if source_frontier_start_store_id == frontier_start_store_id:
+            return True
+        rows = conn.execute(
+            """SELECT store_id, role FROM messages
+               WHERE conversation_id = ? AND session_id = ?
+                 AND store_id > ? AND store_id <= ? ORDER BY store_id""",
+            (conversation_id, session_id, frontier_start_store_id,
+             source_frontier_start_store_id),
+        ).fetchall()
+        return bool(
+            rows and int(rows[-1][0]) == source_frontier_start_store_id
+            and all(row[1] == "system" for row in rows)
+        )
 
     @staticmethod
     def _source_snapshot(
@@ -469,10 +524,18 @@ class AsyncCompactionStore:
                 conn,
                 conversation_id=batch["conversation_id"],
                 session_id=batch["session_id"],
-                frontier_start_store_id=batch["frontier_start_store_id"],
+                frontier_start_store_id=batch["source_frontier_start_store_id"],
                 frontier_end_store_id=batch["frontier_end_store_id"],
             )
             return (
+                self._skipped_system_prefix_matches(
+                    conn,
+                    conversation_id=batch["conversation_id"],
+                    session_id=batch["session_id"],
+                    frontier_start_store_id=batch["frontier_start_store_id"],
+                    source_frontier_start_store_id=batch["source_frontier_start_store_id"],
+                )
+                and
                 ids == json.loads(batch["source_ids_json"])
                 and hashes == json.loads(batch["source_identity_hashes_json"])
                 and self._coverage_hash(ids, hashes) == batch["source_coverage_hash"]
@@ -666,10 +729,19 @@ class AsyncCompactionStore:
                 conn,
                 conversation_id=batch["conversation_id"],
                 session_id=batch["session_id"],
-                frontier_start_store_id=batch["frontier_start_store_id"],
+                frontier_start_store_id=batch["source_frontier_start_store_id"],
                 frontier_end_store_id=batch["frontier_end_store_id"],
             )
-            if list(zip(current_ids, current_hashes)) != planned:
+            if (
+                not self._skipped_system_prefix_matches(
+                    conn,
+                    conversation_id=batch["conversation_id"],
+                    session_id=batch["session_id"],
+                    frontier_start_store_id=batch["frontier_start_store_id"],
+                    source_frontier_start_store_id=batch["source_frontier_start_store_id"],
+                )
+                or list(zip(current_ids, current_hashes)) != planned
+            ):
                 raise ValueError(
                     "source identity changed during background preparation"
                 )
@@ -762,11 +834,18 @@ class AsyncCompactionStore:
                 conn,
                 conversation_id=batch["conversation_id"],
                 session_id=batch["session_id"],
-                frontier_start_store_id=batch["frontier_start_store_id"],
+                frontier_start_store_id=batch["source_frontier_start_store_id"],
                 frontier_end_store_id=batch["frontier_end_store_id"],
             )
             if (
-                list(zip(current_ids, current_hashes)) != planned
+                not self._skipped_system_prefix_matches(
+                    conn,
+                    conversation_id=batch["conversation_id"],
+                    session_id=batch["session_id"],
+                    frontier_start_store_id=batch["frontier_start_store_id"],
+                    source_frontier_start_store_id=batch["source_frontier_start_store_id"],
+                )
+                or list(zip(current_ids, current_hashes)) != planned
                 or self._coverage_hash(current_ids, current_hashes)
                 != batch["source_coverage_hash"]
             ):
