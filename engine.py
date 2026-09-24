@@ -2484,7 +2484,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         stats = self._store.get_session_post_frontier_stats(
             self._session_id, source_frontier, before_store_id=first_tail_id,
         )
-        target_tokens = self._working_leaf_chunk_tokens(stats["estimated_tokens"])
+        backlog_tokens = stats["estimated_tokens"]
+        if (
+            self._config.dynamic_leaf_chunk_enabled
+            and stats["missing_token_estimate_rows"]
+        ):
+            # Legacy/directly imported rows may have token_estimate=0. Using
+            # only the stored SUM then makes every prepared leaf fall back to
+            # the minimum chunk size, causing many needless provider calls.
+            # Sample only the already-bounded oldest rows; never scan the
+            # entire historical transcript just to plan one off-turn leaf.
+            sampled_chars = 0
+            for row in rows[:64]:
+                if int(row.get("token_estimate") or 0) > 0:
+                    continue
+                content_chars = len(str(row.get("content") or ""))
+                if sampled_chars + content_chars > 1_000_000:
+                    break
+                sampled_chars += content_chars
+                backlog_tokens += count_message_tokens(self._store.to_openai_msg(row))
+        target_tokens = self._working_leaf_chunk_tokens(backlog_tokens)
         selected_rows: list[dict[str, Any]] = []
         selected_messages: list[dict[str, Any]] = []
         pending_tool_calls: set[str] = set()

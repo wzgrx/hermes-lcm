@@ -9,7 +9,7 @@ from typing import Any, Mapping
 from .config import LCMConfig
 
 
-_PROTOCOL = "lcm-async-leaf-v1"
+_PROTOCOL = "lcm-async-leaf-v2"
 
 
 def _digest(value: Mapping[str, Any]) -> str:

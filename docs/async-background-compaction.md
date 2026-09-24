@@ -189,36 +189,40 @@ move from one per run to zero when a complete ready leaf exists; it is not a
 long-session quality or real-provider measurement. The worker flag is off by
 default even when the master feature flag is enabled.
 
-The same offline harness also accepts `--old-messages` and `--max-batches` to
-stress a multi-leaf backlog. It compares timings only when both modes cover
+The same offline harness accepts `--old-messages`, `--max-batches`, and
+`--turns` to stress a multi-leaf backlog across successive turn boundaries.
+It compares cumulative foreground time only when both modes cover
 the same raw source IDs **and every requested old source**; matching partial
 coverage is not a valid speedup comparison. Neither check establishes equal
 summary quality. The report distinguishes coverage parity from completeness
 and leaves `foreground_median_reduction_percent` unset when either fails.
-On 2026-09-24, five runs with four 3,000-token synthetic old messages, a
-fixed 50 ms summarizer stub, and dynamic four-pass leaf compaction yielded:
+The initial multi-leaf fixture inserted rows with `token_estimate=0` (the
+`MessageStore.append()` default), unlike the production ingest path, which
+persists per-message estimates. Dynamic preparation therefore saw a zero-token
+backlog, selected its minimum 256-token target, and wasted one provider call
+per old message. The previous four-message cap-2/cap-4 table was a legacy-row
+stress case, **not** a representative production performance comparison. The
+preparer now adds a bounded, read-only token count from at most 64 of the
+already-fetched oldest unstamped rows (up to one million content characters) before choosing
+its dynamic target. It does not rewrite historical rows or scan the full
+transcript. The preparation policy fingerprint changed to v2, so old planned
+batches are revalidated rather than silently reused after this selection change.
 
-| Prepared queue cap | Foreground provider calls (five runs) | Foreground median | Off-turn preparation median |
-| ---: | ---: | ---: | ---: |
-| 2 | 15 staged / 15 synchronous | 159.9 ms staged / 157.1 ms synchronous | 104.4 ms |
-| 4 | 5 staged / 15 synchronous | 56.2 ms staged / 156.4 ms synchronous | 208.4 ms |
+On 2026-09-24, five runs of **two turns** with eight approximately 3,000-token
+old messages, a queue cap of two, and a fixed 50 ms summarizer stub yielded:
 
-Both configurations retained all raw rows and matched baseline source
-coverage. The default cap of two offered no median latency improvement in this
-specific backlog; a cap of four moved more leaf work off-turn but still left
-one foreground provider call per run, principally for condensation. This is a
-queue-capacity/latency tradeoff, not a recommendation to raise the global
-default without measuring provider spend, real long-session quality, and
-production queue pressure. The multi-leaf stress fixture deliberately uses a
-low threshold to force compaction and does not forecast the live Hermes
-threshold or network latency.
+| Initial old-row estimates | Cumulative foreground median, staged / sync | Off-turn preparation median | Provider calls over five runs, staged / sync |
+| --- | ---: | ---: | ---: |
+| Present (normal ingest) | 6.0 / 159.8 ms | 105.8 ms | 10 (all off-turn) / 15 |
+| Missing (legacy/direct insert) | 6.1 / 160.6 ms | 105.9 ms | 10 (all off-turn) / 15 |
 
-An eight-message stress probe with a queue cap of eight prepared all eight
-batches, but its single staged foreground pass covered only four old messages
-while the synchronous pass covered eight. The harness therefore withholds a
-speedup percentage for that probe. Prepared batch count is not equivalent to
-same-turn publication or equal work done; a multi-turn replay is needed before
-drawing a larger-backlog latency conclusion.
+Both modes covered all eight old source IDs by the first turn and retained all
+raw rows; the second turn adds a fresh synthetic reply/request. These are
+fixed-delay scheduling numbers, not real-provider latency, summary quality,
+token spend, or a recommendation to enable the worker globally. A run with
+`--missing-token-estimates` exercises the legacy case explicitly; the default
+models production ingest. The deliberately low threshold forces compaction and
+does not forecast the live Hermes threshold or network latency.
 
 ## Executable acceptance coverage
 
