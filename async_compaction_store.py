@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import json
 import hashlib
 from pathlib import Path
+import re
 import sqlite3
 import time
 
@@ -149,6 +150,12 @@ class AsyncCompactionStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_lcm_compaction_batches_session "
                 "ON lcm_compaction_batches(session_id, state, created_at)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_lcm_compaction_one_active_frontier "
+                "ON lcm_compaction_batches(conversation_id, session_id, "
+                "frontier_start_store_id) "
+                "WHERE state IN ('pending', 'preparing', 'ready')"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_lcm_compaction_batches_retry "
@@ -355,6 +362,55 @@ class AsyncCompactionStore:
             (batch_id,),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def active_batch_for_frontier(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> dict | None:
+        row = self.connection.execute(
+            """SELECT * FROM lcm_compaction_batches
+               WHERE conversation_id = ? AND session_id = ?
+                 AND frontier_start_store_id = ?
+                 AND state IN ('pending', 'preparing', 'ready')
+               ORDER BY created_at DESC LIMIT 1""",
+            (conversation_id, session_id, frontier_store_id),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def retry_blocked_until(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        frontier_store_id: int,
+    ) -> float | None:
+        row = self.connection.execute(
+            """SELECT MAX(next_retry_at) FROM lcm_compaction_batches
+               WHERE conversation_id = ? AND session_id = ?
+                 AND frontier_start_store_id = ? AND state = 'failed'""",
+            (conversation_id, session_id, frontier_store_id),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def fail_batch(
+        self, batch_id: str, *, error_type: str, backoff_seconds: float
+    ) -> None:
+        """Record a compact, secret-free failure without touching canonical state."""
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_.]{0,79}", str(error_type))
+        safe_type = match.group(0) if match else "SummaryError"
+        now = time.time()
+        updated = self.connection.execute(
+            """UPDATE lcm_compaction_batches
+               SET state = 'failed', failure_count = failure_count + 1,
+                   next_retry_at = ?, last_error = ?, updated_at = ?
+               WHERE batch_id = ? AND state IN ('pending', 'preparing')""",
+            (now + max(0.0, float(backoff_seconds)), safe_type, now, batch_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("batch is not eligible for failure recording")
 
     def stage_leaf(
         self,

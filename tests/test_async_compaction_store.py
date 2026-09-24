@@ -263,6 +263,38 @@ def test_ready_rejects_source_rewrite_after_provider_work(tmp_path):
         core.close()
 
 
+def test_only_one_active_batch_claims_a_frontier_and_failure_backs_off(tmp_path):
+    db_path = tmp_path / "claim.db"
+    core = MessageStore(db_path)
+    try:
+        _seed_sources(core)
+        with AsyncCompactionStore(db_path, enabled=True) as store:
+            _create_batch(store)
+            with pytest.raises(sqlite3.IntegrityError):
+                _create_batch(store, batch_id="batch-2")
+            store.fail_batch(
+                "batch-1",
+                error_type="RuntimeError: secret=TOKEN",
+                backoff_seconds=30,
+            )
+            failed = store.get_batch("batch-1")
+            assert failed["state"] == "failed"
+            assert failed["failure_count"] == 1
+            assert "TOKEN" not in failed["last_error"]
+            assert failed["next_retry_at"] > failed["updated_at"]
+            _create_batch(store, batch_id="batch-2")
+            assert (
+                store.active_batch_for_frontier(
+                    conversation_id="conversation-1",
+                    session_id="session-1",
+                    frontier_store_id=0,
+                )["batch_id"]
+                == "batch-2"
+            )
+    finally:
+        core.close()
+
+
 def _ready_engine(tmp_path):
     db_path = tmp_path / "publish.db"
     engine = LCMEngine(

@@ -119,14 +119,22 @@ staging with overlap checks, exact ready-state coverage validation, and a
 single-transaction canonical publisher with frontier compare-and-swap. The
 publisher rejects stale source/policy/route/fresh-tail inputs and canonical
 overlap; publication failure rolls back nodes, frontier, and batch state.
-Seventeen focused tests include concurrent publishers and injected failure.
 
-This is **not yet a usable background compactor**: engine-owned preparation,
-live policy/route fingerprint generation, foreground promotion integration,
-worker scheduling, status/doctor wiring, and the design-spike acceptance tests
-remain. The low-level publisher takes a caller-supplied fresh-tail boundary,
-so it must not be exposed until the engine computes that boundary from the
-current turn. The branch is not installed in the live Gateway.
+`LCMEngine.prepare_background_compaction_once()` is a manual, off-turn
+entry point for one old leaf. It fences live policy and Hermes' compression
+route, claims one active batch per frontier, calls the summarizer outside any
+SQLite transaction, and records typed failures with backoff. Its first slice
+is conservative: it requires an established frontier beyond any leading
+system anchor, excludes ignored-message-pattern sessions and unresolved
+externalized refs, and only prepares a complete tool-call group outside the
+stored fresh tail. It leaves the canonical DAG and active context unchanged.
+
+This is **not yet an automatically usable background compactor**: foreground
+promotion integration, current-turn fresh-tail validation, worker scheduling,
+status/doctor wiring, and the remaining design-spike acceptance tests remain.
+The low-level publisher takes a caller-supplied fresh-tail boundary, so it
+must not be exposed until the engine derives that boundary. The branch is not
+installed in the live Gateway.
 
 ## Fingerprints and validation inputs
 

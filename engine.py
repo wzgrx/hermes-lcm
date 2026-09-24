@@ -30,6 +30,7 @@ from .codex_routing import (
 )
 from .config import LCMConfig
 from .async_compaction_store import AsyncCompactionStore
+from .async_compaction_policy import policy_fingerprint, route_fingerprint
 from .db_bootstrap import join_background_integrity_scans
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment, inspect_orphaned_sqlite_handles
@@ -2288,6 +2289,213 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 attempt_chunk = smaller_chunk
 
         raise RuntimeError("adaptive leaf rescue exhausted without a valid chunk")
+
+    def prepare_background_compaction_once(
+        self, *, host_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Prepare one old, store-backed leaf; never publish active context.
+
+        This is an explicit off-turn entry point. The automatic worker is a
+        separate stage. Provider work runs after ``create_batch`` has committed
+        and before ``stage_leaf`` opens its short write transaction.
+        """
+        if not self._config.async_background_compaction_enabled:
+            return None
+        self._ensure_storage()
+        store = self._async_compaction_store
+        if (
+            store is None or not self._session_id or not self._conversation_id
+            or self._session_ignored or self._session_stateless
+            or self._compiled_ignore_message_patterns
+        ):
+            return None
+        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        if state is None or state.current_session_id != self._session_id:
+            return None
+        frontier = int(state.current_frontier_store_id or 0)
+        # A stored system anchor before the first leaf is intentionally outside
+        # the compactable source range. Wait for an existing foreground leaf to
+        # establish a cursor beyond it rather than pretending it was summarized.
+        if frontier <= 0:
+            return None
+
+        if host_config is None:
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                host_config = load_config_readonly()
+            except Exception:
+                return None
+        if not isinstance(host_config, dict):
+            return None
+        try:
+            policy_hash = policy_fingerprint(self._config)
+            route_hash = route_fingerprint(self._config, host_config)
+        except (TypeError, ValueError):
+            return None
+
+        existing = store.active_batch_for_frontier(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            frontier_store_id=frontier,
+        )
+        if existing is not None:
+            return (
+                existing
+                if existing["policy_fingerprint"] == policy_hash
+                and existing["summary_route_fingerprint"] == route_hash
+                else None
+            )
+        blocked_until = store.retry_blocked_until(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            frontier_store_id=frontier,
+        )
+        if blocked_until is not None and blocked_until > time.time():
+            return None
+        counts = store.counts(conversation_id=self._conversation_id)
+        if sum(counts[key] for key in ("pending", "preparing", "ready")) >= max(
+            1, int(self._config.async_background_compaction_max_batches)
+        ):
+            return None
+
+        fresh_tail, _boundary = self._get_session_fresh_tail(
+            self._session_id, minimum_count=1,
+        )
+        if not fresh_tail:
+            return None
+        first_tail_id = int(fresh_tail[0].get("store_id") or 0)
+        rows = self._store.get_session_messages_between(
+            self._session_id,
+            after_store_id=frontier,
+            before_store_id=first_tail_id,
+            limit=512,
+        )
+        if not rows or rows[0]["role"] in {"system", "tool"}:
+            return None
+        stats = self._store.get_session_post_frontier_stats(
+            self._session_id, frontier, before_store_id=first_tail_id,
+        )
+        target_tokens = self._working_leaf_chunk_tokens(stats["estimated_tokens"])
+        selected_rows: list[dict[str, Any]] = []
+        selected_messages: list[dict[str, Any]] = []
+        pending_tool_calls: set[str] = set()
+        used_tokens = 0
+        used_chars = 0
+        for row in rows:
+            if row["role"] == "system" or row.get("pinned"):
+                return None
+            message = self._store.to_openai_msg(row)
+            content = str(message.get("content") or "")
+            if self._content_has_externalized_placeholder_ref(content):
+                return None
+            used_chars += len(content)
+            if used_chars > 4_000_000:
+                return None
+            selected_rows.append(row)
+            selected_messages.append(message)
+            used_tokens += count_message_tokens(message)
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if isinstance(call, dict) and call.get("id"):
+                        pending_tool_calls.add(str(call["id"]))
+            elif message.get("role") == "tool":
+                tool_call_id = str(message.get("tool_call_id") or "")
+                if not tool_call_id or tool_call_id not in pending_tool_calls:
+                    return None
+                pending_tool_calls.discard(tool_call_id)
+            if used_tokens >= target_tokens and not pending_tool_calls:
+                break
+        if used_tokens < target_tokens or pending_tool_calls:
+            return None
+        source_ids = [int(row["store_id"]) for row in selected_rows]
+        if self._dag.get_covered_message_ids(
+            self._session_id,
+            after_store_id=frontier,
+            before_store_id=source_ids[-1] + 1,
+        ):
+            return None
+
+        batch_id = uuid.uuid4().hex
+        try:
+            plan = store.create_batch(
+                batch_id=batch_id,
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                frontier_start_store_id=frontier,
+                frontier_end_store_id=source_ids[-1],
+                fresh_tail_count=self._config.fresh_tail_count,
+                leaf_chunk_tokens=target_tokens,
+                policy_fingerprint=policy_hash,
+                summary_route_fingerprint=route_hash,
+                expected_leaf_count=1,
+            )
+        except sqlite3.IntegrityError:
+            # Another preparer won the durable frontier claim. Reuse its work
+            # rather than initiating a second provider call for the same range.
+            existing = store.active_batch_for_frontier(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                frontier_store_id=frontier,
+            )
+            return (
+                existing
+                if existing and existing["policy_fingerprint"] == policy_hash
+                and existing["summary_route_fingerprint"] == route_hash
+                else None
+            )
+        if plan["source_ids"] != source_ids:
+            store.fail_batch(
+                batch_id, error_type="SourceSnapshotChanged", backoff_seconds=0,
+            )
+            return None
+
+        # The model call is deliberately outside every SQLite transaction.
+        try:
+            summary_text, level = summarize_with_escalation(
+                text=self._serialize_messages(selected_messages),
+                source_tokens=used_tokens,
+                token_budget=min(12_000, max(2_000, int(used_tokens * 0.20))),
+                depth=0,
+                model=self._config.summary_model,
+                fallback_models=self._config.summary_fallback_models,
+                circuit_breaker=self._summary_circuit_breaker,
+                spend_guard=self._summary_spend_guard,
+                timeout=self._config.summary_timeout_ms / 1000,
+                l2_budget_ratio=self._config.l2_budget_ratio,
+                l3_truncate_tokens=self._config.l3_truncate_tokens,
+                focus_topic="",
+                custom_instructions=self._config.custom_instructions,
+                source_provenance={
+                    "source_type": "messages",
+                    "store_ids": source_ids,
+                    "message_count": len(selected_messages),
+                },
+            )
+            summary_tokens = count_tokens(summary_text)
+            if level >= 3 or not summary_text.strip() or summary_tokens >= used_tokens:
+                raise RuntimeError("summary provider produced no accepted leaf")
+            earliest_at, latest_at = self._store.get_time_bounds(source_ids)
+            store.stage_leaf(
+                pending_id=uuid.uuid4().hex,
+                batch_id=batch_id,
+                summary=summary_text,
+                token_count=summary_tokens,
+                source_token_count=used_tokens,
+                source_ids=source_ids,
+                source_identity_hashes=plan["source_identity_hashes"],
+                earliest_at=earliest_at,
+                latest_at=latest_at,
+                expand_hint=self._extract_expand_hint(summary_text),
+            )
+            store.mark_ready(batch_id)
+        except Exception as exc:
+            store.fail_batch(
+                batch_id,
+                error_type=type(exc).__name__,
+                backoff_seconds=self._config.async_background_compaction_retry_backoff_seconds,
+            )
+        return store.get_batch(batch_id)
 
     # -- ContextEngine optional methods ------------------------------------
 
