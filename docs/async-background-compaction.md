@@ -157,6 +157,15 @@ probe reads active identities without a write lock and only enters a write
 transaction for a provably exited owner; that update also checks the owner
 identity has not changed since the probe.
 
+Before the automatic worker opens its private SQLite connection, it shares the
+read-only background-write preflight used by temporal rollups: same-UID
+deleted-handle scan plus targeted integrity checks for `metadata` and
+`lcm_migration_state`. A failed or inconclusive check defers preparation and
+backs off repeated attempts for five minutes; a transient SQLite lock skips
+that pass. This contains the upstream #601 failure class but does not establish
+its full root cause. The explicit one-shot preparation API remains a separate
+operator/test seam; the automatic worker is the guarded path.
+
 The worker can now prepare a consecutive ready chain ahead of the live frontier
 (default at most two batches; at most four preparations in one scheduled pass).
 Each future claim validates a ready predecessor and source identities inside
@@ -240,6 +249,7 @@ API; no design-only expected failures remain:
 | Live summary route beats staged metadata | `test_foreground_falls_back_when_summary_route_changes` |
 | Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider`, `test_two_publishers_serialize_and_publish_once`, `test_two_processes_publish_once_without_partial_canonical_state` (three independent databases with a simultaneous release gate) |
 | Provider failure/backoff leaves foreground usable | `test_summary_failure_records_type_only_and_enforces_backoff`, `test_background_failure_backoff_does_not_block_foreground_compaction` |
+| Automatic worker skips unsafe SQLite state, then resumes after recovery | `test_background_preparation_honors_sqlite_integrity_gate` |
 | Restart recovery | `test_live_other_process_is_preserved_then_dead_owner_recovers_on_open` (Linux dead-owner immediate recovery; live owner preserved), `test_restart_recovery_releases_only_abandoned_incomplete_claims` (lease fallback for unknown ownership) |
 | Atomic success and rollback | `test_promotion_publishes_nodes_frontier_and_batch_in_one_transaction`, `test_mid_publication_failure_rolls_back_all_canonical_changes` |
 | Status/Doctor counters | `test_manual_preparation_calls_provider_outside_sqlite_transaction` |
@@ -255,7 +265,7 @@ A prepared batch is valid only for the exact policy and source frontier it was c
 
 Hash a normalized JSON object of compaction policy inputs that affect chunking or active-context semantics:
 
-- schema/protocol version, e.g. `async_compaction_protocol_v1`
+- schema/protocol version (`lcm-async-leaf-v2`)
 - `fresh_tail_count`
 - `leaf_chunk_tokens`
 - `context_threshold` / effective preflight threshold policy

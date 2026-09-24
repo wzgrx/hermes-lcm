@@ -214,6 +214,56 @@ def test_ingest_schedules_private_background_preparation(tmp_path, monkeypatch):
         engine.shutdown(wait_for_background_work=True)
 
 
+def test_background_preparation_honors_sqlite_integrity_gate(
+    tmp_path, monkeypatch,
+):
+    import hermes_lcm.engine as engine_module
+
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    engine._config.async_background_compaction_worker_enabled = True
+    checks = []
+    from hermes_lcm.engine import _ASYNC_COMPACTION_SCHEDULER
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+    monkeypatch.setattr(
+        engine_module, "inspect_orphaned_sqlite_handles",
+        lambda path: checks.append(path) or {"status": "fail"},
+    )
+
+    def unexpected_summary(**_kwargs):
+        raise AssertionError("provider ran after a failed SQLite preflight")
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", unexpected_summary)
+    try:
+        engine.ingest([{"role": "user", "content": "schedule after old backlog"}])
+        assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(
+            engine._rollup_maintenance_owner, timeout=10,
+        )
+        assert checks == [engine._storage_db_path.resolve()]
+        assert engine._async_compaction_store.counts()["ready"] == 0
+        assert str(engine._storage_db_path.resolve()) in engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL
+
+        monkeypatch.setattr(
+            engine_module, "inspect_orphaned_sqlite_handles",
+            lambda _path: {"status": "pass"},
+        )
+        engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL.pop(str(engine._storage_db_path.resolve()))
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Prepared after integrity gate recovered.", 1),
+        )
+        assert engine._schedule_background_compaction()
+        assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(
+            engine._rollup_maintenance_owner, timeout=10,
+        )
+        assert engine._async_compaction_store.counts()["ready"] == 2
+    finally:
+        engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL.pop(
+            str(engine._storage_db_path.resolve()), None,
+        )
+        engine.shutdown(wait_for_background_work=True)
+
+
 def test_background_provider_survives_foreground_engine_retirement(
     tmp_path, monkeypatch,
 ):

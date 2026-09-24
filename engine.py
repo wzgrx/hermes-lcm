@@ -160,7 +160,7 @@ class _RollupPreflightFailure(RuntimeError):
     """An actionable background-only maintenance gate, not a turn failure."""
 
 
-def _rollup_integrity_preflight(database_path: Path) -> bool:
+def _background_sqlite_write_preflight(database_path: Path, *, operation: str) -> bool:
     """Check SQLite handles and incident-critical tables before background writes.
 
     A partial integrity check is fast on a large message corpus while covering
@@ -187,7 +187,7 @@ def _rollup_integrity_preflight(database_path: Path) -> bool:
                     raise sqlite3.DatabaseError(f"{table} integrity check failed")
     except (OSError, sqlite3.Error, _RollupPreflightFailure) as exc:
         if isinstance(exc, sqlite3.Error) and _is_sqlite_locked_error(exc):
-            logger.debug("LCM rollup integrity preflight deferred by a transient SQLite lock")
+            logger.debug("LCM %s integrity preflight deferred by a transient SQLite lock", operation)
             return False
         with _ROLLUP_INTEGRITY_RETRY_LOCK:
             if len(_ROLLUP_INTEGRITY_RETRY_UNTIL) >= 256:
@@ -200,13 +200,21 @@ def _rollup_integrity_preflight(database_path: Path) -> bool:
             _ROLLUP_INTEGRITY_RETRY_UNTIL[key] = now + _ROLLUP_INTEGRITY_RETRY_SECONDS
         detail = str(exc) if isinstance(exc, _RollupPreflightFailure) else type(exc).__name__
         logger.error(
-            "LCM background rollup maintenance deferred for %.0fs: SQLite integrity/handle preflight failed "
+            "LCM background %s deferred for %.0fs: SQLite integrity/handle preflight failed "
             "(%s); inspect with /lcm doctor before further maintenance",
+            operation,
             _ROLLUP_INTEGRITY_RETRY_SECONDS,
             detail,
         )
         return False
     return True
+
+
+def _rollup_integrity_preflight(database_path: Path) -> bool:
+    """Keep the established rollup seam while sharing its database guard."""
+    return _background_sqlite_write_preflight(
+        database_path, operation="rollup maintenance",
+    )
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
 
@@ -2212,6 +2220,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # Never use the foreground engine's mutable session binding or
                 # SQLite connections from this worker. The durable lifecycle and
                 # source snapshot are rechecked by the private preparer.
+                if not _background_sqlite_write_preflight(
+                    database_path, operation="async compaction preparation",
+                ):
+                    return
                 worker = None
                 try:
                     worker = engine_type(config=config, hermes_home=hermes_home,
