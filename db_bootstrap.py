@@ -33,8 +33,6 @@ def inspect_host_journal_config() -> dict[str, str]:
     """
     try:
         from hermes_cli.config import load_config_readonly
-
-        config = load_config_readonly() or {}
     except ImportError as exc:
         try:
             import hermes_state_wal  # noqa: F401 - distinguish host fallback from broken config import
@@ -45,14 +43,22 @@ def inspect_host_journal_config() -> dict[str, str]:
             "requested_mode": "unknown",
             "error_type": type(exc).__name__,
         }
+    try:
+        config = load_config_readonly()
     except Exception as exc:
         return {
             "status": "unreadable",
             "requested_mode": "unknown",
             "error_type": type(exc).__name__,
         }
-    database = config.get("database", {}) if isinstance(config, dict) else {}
-    if not isinstance(database, dict) or "journal_mode" not in database:
+    if not isinstance(config, dict):
+        return {"status": "invalid", "requested_mode": "unknown"}
+    if "database" not in config:
+        return {"status": "default", "requested_mode": "wal"}
+    database = config["database"]
+    if not isinstance(database, dict):
+        return {"status": "invalid", "requested_mode": "unknown"}
+    if "journal_mode" not in database:
         return {"status": "default", "requested_mode": "wal"}
     raw = database["journal_mode"]
     mode = raw.strip().lower() if isinstance(raw, str) else ""
@@ -188,15 +194,21 @@ def configure_connection(conn: sqlite3.Connection) -> None:
         mode = "wal"
     else:
         config_read = inspect_host_journal_config()
-        if config_read["status"] == "unreadable":
+        if config_read["status"] in {"unreadable", "invalid"}:
             global _journal_config_warned
             with _journal_config_warn_lock:
                 if not _journal_config_warned:
-                    logger.warning(
-                        "database.journal_mode config unreadable (%s); "
-                        "Hermes may use default WAL instead of the requested mode",
-                        config_read["error_type"],
-                    )
+                    if config_read["status"] == "unreadable":
+                        logger.warning(
+                            "database.journal_mode config unreadable (%s); "
+                            "Hermes may use default WAL instead of the requested mode",
+                            config_read["error_type"],
+                        )
+                    else:
+                        logger.warning(
+                            "database.journal_mode config invalid; "
+                            "Hermes may use default WAL instead of the requested mode"
+                        )
                     _journal_config_warned = True
         mode = _apply_host_journal_mode_with_lock_retry(
             conn, apply_wal_with_fallback,

@@ -136,6 +136,56 @@ class TestConfigureConnectionPragmas:
             "status": "unreadable", "requested_mode": "unknown", "error_type": "ModuleNotFoundError",
         }
 
+    def test_config_loader_import_error_is_not_standalone_unavailable(self, monkeypatch):
+        config_module = ModuleType("hermes_cli.config")
+
+        def broken_loader():
+            raise ImportError("synthetic dependency failure")
+
+        config_module.load_config_readonly = broken_loader
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", None)
+
+        assert db_bootstrap.inspect_host_journal_config() == {
+            "status": "unreadable", "requested_mode": "unknown", "error_type": "ImportError",
+        }
+
+    @pytest.mark.parametrize("config", [[], "broken", {"database": []}, {"database": None}])
+    def test_malformed_config_structure_is_not_healthy_default(self, monkeypatch, config):
+        config_module = ModuleType("hermes_cli.config")
+        config_module.load_config_readonly = lambda: config
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
+
+        assert db_bootstrap.inspect_host_journal_config() == {
+            "status": "invalid", "requested_mode": "unknown",
+        }
+
+    def test_invalid_config_warning_is_latched_without_echoing_values(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ):
+        host_module = ModuleType("hermes_state_wal")
+        host_module.apply_wal_with_fallback = lambda conn, **kwargs: conn.execute(
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0].lower()
+        config_module = ModuleType("hermes_cli.config")
+        config_module.load_config_readonly = lambda: {"database": "secret-synthetic-value"}
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", host_module)
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
+        monkeypatch.setattr(db_bootstrap, "_journal_config_warned", False, raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(2):
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    configure_connection(conn)
+                finally:
+                    conn.close()
+
+        warnings = [record.message for record in caplog.records if "database.journal_mode" in record.message]
+        assert len(warnings) == 1
+        assert "invalid" in warnings[0]
+        assert "secret-synthetic-value" not in warnings[0]
+
     def test_host_journal_mode_retries_transient_startup_lock(
         self, db_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
