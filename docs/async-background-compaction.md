@@ -173,9 +173,12 @@ canonical frontier from its original value to the leaf end.
 
 This remains an **experimental isolated branch**, not installed in the live
 Gateway. It still needs broader queue-race and partial-emergency stress tests,
-plus long-session performance coverage
-before deployment. The worker flag is off by default even when the master
-feature flag is enabled.
+plus long-session performance coverage before deployment. The offline
+single-leaf scheduling microbenchmark in
+`benchmarks/benchmark_async_compaction.py` verifies foreground provider calls
+move from one per run to zero when a complete ready leaf exists; it is not a
+long-session quality or real-provider measurement. The worker flag is off by
+default even when the master feature flag is enabled.
 
 ## Executable acceptance coverage
 

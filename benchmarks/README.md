@@ -9,6 +9,27 @@ The benchmark harness is offline by default:
 - no live Hermes config mutation
 - writes isolated to the requested output directory
 
+## Async leaf-preparation latency microbenchmark
+
+`benchmark_async_compaction.py` compares one identical near-10K-token synthetic old
+source with synchronous foreground summarization versus a summary prepared
+before the turn. It uses fresh temporary databases, a fixed-sleep summarizer,
+alternating run order, and validates that both modes publish the same single
+source while retaining all raw rows. It never calls a model or reads a live
+Hermes profile:
+
+```bash
+python benchmarks/benchmark_async_compaction.py \
+  --repeats 5 --source-tokens 10000 --provider-delay-ms 100
+```
+
+On the local WSL fixture (2026-09-24), the five-run median foreground time was
+105.275 ms synchronous versus 3.708 ms staged; staged preparation itself took
+102.436 ms off-turn. Foreground provider calls were 5 versus 0. This measures
+where a fixed 100 ms provider delay is paid, **not** actual provider latency,
+summary quality, or end-to-end long-session behavior. The script prints only
+aggregate JSON; individual runs and temporary paths are not retained.
+
 ## Active tool-result stubbing benchmark
 
 The focused active-replay benchmark builds ten deterministic synthetic tool
