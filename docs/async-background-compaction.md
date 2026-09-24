@@ -247,15 +247,17 @@ API; no design-only expected failures remain:
 | Source rewrite rejects preparation/publication | `test_source_rewrite_during_summary_preparation_fails_closed`, `test_foreground_rejects_rewritten_source_then_summarizes_current_rows` |
 | Live policy and threshold beat staged metadata | `test_promotion_rejects_stale_policy_route_or_fresh_tail`, `test_foreground_uses_live_threshold_policy_over_prepared_batch` |
 | Live summary route beats staged metadata | `test_foreground_falls_back_when_summary_route_changes` |
-| Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider`, `test_two_publishers_serialize_and_publish_once`, `test_two_processes_publish_once_without_partial_canonical_state` (three independent databases with a simultaneous release gate) |
+| Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider` (ordinary and forced-overflow foreground winners), `test_two_publishers_serialize_and_publish_once`, `test_two_processes_publish_once_without_partial_canonical_state` (three independent databases with a simultaneous release gate) |
+| Cross-process preparation claim | `test_two_processes_prepare_one_frontier_with_one_provider_call` (three independent databases; winner's provider held while the other process observes the preparing claim) |
 | Provider failure/backoff leaves foreground usable | `test_summary_failure_records_type_only_and_enforces_backoff`, `test_background_failure_backoff_does_not_block_foreground_compaction` |
 | Automatic worker skips unsafe SQLite state, then resumes after recovery | `test_background_preparation_honors_sqlite_integrity_gate` |
 | Restart recovery | `test_live_other_process_is_preserved_then_dead_owner_recovers_on_open` (Linux dead-owner immediate recovery; live owner preserved), `test_restart_recovery_releases_only_abandoned_incomplete_claims` (lease fallback for unknown ownership) |
 | Atomic success and rollback | `test_promotion_publishes_nodes_frontier_and_batch_in_one_transaction`, `test_mid_publication_failure_rolls_back_all_canonical_changes` |
 | Status/Doctor counters | `test_manual_preparation_calls_provider_outside_sqlite_transaction` |
 
-The remaining work is not represented as a passing claim: broader multi-process
-stress and long-session latency/quality measurements still require evidence.
+The remaining work is not represented as a passing claim: these controlled
+two-process races do not establish behavior under sustained multi-process load;
+long-session latency and summary-quality measurements still require evidence.
 
 ## Fingerprints and validation inputs
 

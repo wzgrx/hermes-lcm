@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import threading
 import copy
+import json
+import multiprocessing
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -44,6 +46,35 @@ def _engine_with_stable_backlog(tmp_path, *, advance_anchor=True):
             conversation_id="conversation-1",
         )
     return engine
+
+
+def _prepare_in_process(config, ready, release, provider_release, events, results):
+    import hermes_lcm.engine as engine_module
+
+    engine = None
+    try:
+        def summarize(**_kwargs):
+            events.put("provider")
+            if not provider_release.wait(15):
+                raise TimeoutError("provider release gate timed out")
+            return "Cross-process prepared summary.", 1
+
+        engine_module.summarize_with_escalation = summarize
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "session-1", conversation_id="conversation-1",
+            platform="test", context_length=1000,
+        )
+        ready.set()
+        if not release.wait(15):
+            raise TimeoutError("preparation start gate timed out")
+        batch = engine.prepare_background_compaction_once(host_config={})
+        results.put(("ok", batch["state"] if batch else None))
+    except BaseException as exc:
+        results.put(("error", type(exc).__name__))
+    finally:
+        if engine is not None:
+            engine.shutdown()
 
 
 def test_manual_preparation_calls_provider_outside_sqlite_transaction(
@@ -339,8 +370,60 @@ def test_competing_preparers_claim_one_frontier_and_call_provider_once(
         first.shutdown()
 
 
+@pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="fork unavailable")
+def test_two_processes_prepare_one_frontier_with_one_provider_call(tmp_path):
+    context = multiprocessing.get_context("fork")
+    for attempt in range(3):
+        case_dir = tmp_path / str(attempt)
+        case_dir.mkdir()
+        seed = _engine_with_stable_backlog(case_dir, advance_anchor=False)
+        config = copy.deepcopy(seed._config)
+        seed.shutdown()
+        ready = [context.Event(), context.Event()]
+        release = context.Event()
+        provider_release = context.Event()
+        events = context.Queue()
+        results = context.Queue()
+        workers = [
+            context.Process(
+                target=_prepare_in_process,
+                args=(config, gate, release, provider_release, events, results),
+            )
+            for gate in ready
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            assert all(gate.wait(15) for gate in ready)
+            release.set()
+            assert events.get(timeout=15) == "provider"
+            assert results.get(timeout=15) in {("ok", "pending"), ("ok", "preparing")}
+            provider_release.set()
+            assert results.get(timeout=15) == ("ok", "ready")
+            for worker in workers:
+                worker.join(15)
+                assert worker.exitcode == 0
+            with pytest.raises(queue.Empty):
+                events.get(timeout=0.1)
+            with AsyncCompactionStore(config.database_path, enabled=True) as observer:
+                assert observer.counts()["ready"] == 1
+                assert observer.counts()["preparing"] == 0
+                assert observer.connection.execute(
+                    "SELECT COUNT(*) FROM summary_nodes"
+                ).fetchone()[0] == 0
+        finally:
+            provider_release.set()
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(5)
+            events.close()
+            results.close()
+
+
+@pytest.mark.parametrize("force_overflow", [False, True])
 def test_foreground_winner_fences_inflight_background_provider(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, force_overflow,
 ):
     foreground = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
     background = LCMEngine(config=copy.deepcopy(foreground._config))
@@ -351,6 +434,10 @@ def test_foreground_winner_fences_inflight_background_provider(
     entered = threading.Event()
     release = threading.Event()
     try:
+        if force_overflow:
+            monkeypatch.setattr(
+                foreground, "_should_force_overflow_recovery", lambda **_kwargs: True,
+            )
         def summarize(**_kwargs):
             if threading.current_thread() is threading.main_thread():
                 return "Foreground winner summary.", 1
@@ -642,6 +729,9 @@ def test_overflow_keeps_full_foreground_summary_for_partial_ready_leaf(
         engine.compress(messages, current_tokens=900)
         assert calls
         assert engine._async_compaction_store.get_batch(batch["batch_id"])["state"] != "promoted"
+        assert len(engine._store.get_session_messages("session-1")) == 11
+        engine.prepare_background_compaction_once(host_config={})
+        assert engine._async_compaction_store.get_batch(batch["batch_id"])["state"] == "superseded"
     finally:
         engine.shutdown()
 
