@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
+import copy
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -228,6 +230,88 @@ def test_background_provider_survives_foreground_engine_retirement(
         engine.shutdown(wait_for_background_work=True)
 
 
+@pytest.mark.parametrize("run", range(5))
+def test_competing_preparers_claim_one_frontier_and_call_provider_once(
+    tmp_path, monkeypatch, run,
+):
+    first = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    second = LCMEngine(config=copy.deepcopy(first._config))
+    second.on_session_start(
+        "session-1", conversation_id="conversation-1",
+        platform="test", context_length=1000,
+    )
+    barrier = threading.Barrier(2)
+    calls = []
+    original_create = AsyncCompactionStore.create_batch
+    try:
+        def competing_create(store, **kwargs):
+            barrier.wait(timeout=10)
+            return original_create(store, **kwargs)
+
+        monkeypatch.setattr(AsyncCompactionStore, "create_batch", competing_create)
+
+        def summarize(**_kwargs):
+            calls.append(True)
+            return f"One summary for race {run}.", 1
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(engine.prepare_background_compaction_once, host_config={})
+                for engine in (first, second)
+            ]
+            results = [future.result(timeout=15) for future in futures]
+        assert all(result is not None for result in results)
+        assert len(calls) == 1
+        assert first._async_compaction_store.counts()["ready"] == 1
+        assert first._dag.get_session_node_count("session-1") == 0
+    finally:
+        second.shutdown()
+        first.shutdown()
+
+
+def test_foreground_winner_fences_inflight_background_provider(
+    tmp_path, monkeypatch,
+):
+    foreground = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    background = LCMEngine(config=copy.deepcopy(foreground._config))
+    background.on_session_start(
+        "session-1", conversation_id="conversation-1",
+        platform="test", context_length=1000,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    try:
+        def summarize(**_kwargs):
+            if threading.current_thread() is threading.main_thread():
+                return "Foreground winner summary.", 1
+            entered.set()
+            assert release.wait(10)
+            return "Late background summary.", 1
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                background.prepare_background_compaction_once, host_config={},
+            )
+            assert entered.wait(10)
+            messages = [
+                foreground._store.to_openai_msg(row)
+                for row in foreground._store.get_session_messages("session-1")
+            ]
+            foreground.compress(messages, current_tokens=900)
+            release.set()
+            batch = future.result(timeout=10)
+        assert batch["state"] == "failed"
+        assert background._async_compaction_store.counts()["ready"] == 0
+        assert foreground._dag.get_session_node_count("session-1") == 1
+        assert foreground._lifecycle.get_by_conversation("conversation-1").current_frontier_store_id > 0
+    finally:
+        release.set()
+        background.shutdown()
+        foreground.shutdown()
+
+
 def test_source_rewrite_during_summary_preparation_fails_closed(tmp_path, monkeypatch):
     engine = _engine_with_stable_backlog(tmp_path)
     try:
@@ -390,6 +474,76 @@ def test_two_prepared_leaves_publish_in_frontier_order(tmp_path, monkeypatch):
         assert store.get_batch(second["batch_id"])["state"] == "promoted"
         assert engine._lifecycle.get_by_conversation("conversation-1").current_frontier_store_id == second["frontier_end_store_id"]
         assert any("Prepared leaf 2." in str(msg.get("content")) for msg in after_second)
+    finally:
+        engine.shutdown()
+
+
+def test_overflow_reuses_ready_leaf_only_when_it_covers_all_old_raw(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    engine._config.fresh_tail_count = 9
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Complete old-prefix summary.", 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        assert len(json.loads(batch["source_ids_json"])) == 1
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        monkeypatch.setattr(
+            engine, "_should_force_overflow_recovery", lambda **_kwargs: True,
+        )
+
+        def unexpected_provider(**_kwargs):
+            raise AssertionError("complete prepared prefix should avoid emergency provider")
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation", unexpected_provider,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        engine.compress(messages, current_tokens=900)
+        assert engine._async_compaction_store.get_batch(batch["batch_id"])["state"] == "promoted"
+    finally:
+        engine.shutdown()
+
+
+def test_overflow_keeps_full_foreground_summary_for_partial_ready_leaf(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    calls = []
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Partial prepared prefix.", 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        assert len(json.loads(batch["source_ids_json"])) < 8
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        monkeypatch.setattr(
+            engine, "_should_force_overflow_recovery", lambda **_kwargs: True,
+        )
+
+        def foreground_summary(**_kwargs):
+            calls.append(True)
+            return "Full emergency foreground summary.", 1
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation", foreground_summary,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        engine.compress(messages, current_tokens=900)
+        assert calls
+        assert engine._async_compaction_store.get_batch(batch["batch_id"])["state"] != "promoted"
     finally:
         engine.shutdown()
 

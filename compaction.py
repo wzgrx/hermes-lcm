@@ -1565,8 +1565,9 @@ class CompactionMixin:
                     candidate_raw,
                     dependent_reply_message_ids,
                     hidden_direct_ids,
+                    require_full_candidate=force_overflow,
                 )
-                if not force and not force_overflow and not explicit_focus_topic
+                if not force and not explicit_focus_topic
                 else None
             )
             if prepared_promotion is not None:

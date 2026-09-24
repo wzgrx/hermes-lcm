@@ -2623,6 +2623,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         candidate_raw: list[dict[str, Any]],
         dependent_reply_message_ids: set[int],
         hidden_direct_ids: dict[int, int],
+        *,
+        require_full_candidate: bool = False,
     ) -> tuple[int, SummaryNode] | None:
         """Publish one exact old prefix, or leave the foreground path intact."""
         store = self._async_compaction_store
@@ -2644,7 +2646,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if batch is None or batch["state"] != "ready" or batch["expected_leaf_count"] != 1:
             return None
         source_ids = json.loads(batch["source_ids_json"])
-        if not source_ids or len(candidate_raw) < len(source_ids):
+        if (
+            not source_ids
+            or len(candidate_raw) < len(source_ids)
+            or (require_full_candidate and len(candidate_raw) != len(source_ids))
+        ):
             return None
         prefix = candidate_raw[:len(source_ids)]
         if any(id(message) in dependent_reply_message_ids for message in prefix):

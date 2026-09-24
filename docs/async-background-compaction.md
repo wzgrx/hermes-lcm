@@ -157,6 +157,14 @@ committed. The next preparation pass retires queue claims left unreachable by
 a session reset, failed preparation, or rejected ancestor. A provider result
 arriving after a reset or predecessor rejection cannot become ready.
 
+Emergency overflow recovery may reuse a ready leaf only when that leaf covers
+the **entire** old raw candidate outside the protected fresh tail. If it covers
+only a prefix, the existing bounded foreground emergency summary path remains
+in charge so the rest of the old candidate is not silently dropped from the
+emergency summary. Simultaneous preparers are fenced by the unique active
+frontier claim, and a foreground publisher that wins while a provider is still
+running prevents that late result from becoming ready.
+
 The first leaf can now prepare behind a stored system anchor without advancing
 the lifecycle frontier early: the batch records a separate source-selection
 frontier, and both readiness and publication revalidate that every skipped row
@@ -164,8 +172,8 @@ is still a system anchor. The one publication transaction still moves the
 canonical frontier from its original value to the leaf end.
 
 This remains an **experimental isolated branch**, not installed in the live
-Gateway. It still needs deeper queue-race stress tests,
-emergency/partial-emergency paths, and long-session performance coverage
+Gateway. It still needs broader queue-race and partial-emergency stress tests,
+plus long-session performance coverage
 before deployment. The worker flag is off by default even when the master
 feature flag is enabled.
 
