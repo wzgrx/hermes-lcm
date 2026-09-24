@@ -4,6 +4,7 @@ Design spike for preparing old stable chunks off the turn-critical path while ke
 
 Refs:
 
+- Hermes LCM #622 — opt-in async background compaction and five publication invariants
 - Lossless Claw #807 — prepare incremental summaries in the background and publish atomically
 - Lossless Claw #942 — live config must beat stale persisted thresholds/debt
 - Lossless Claw #902 — summary failure/backoff must not wedge compaction debt forever
@@ -44,7 +45,7 @@ The enable flag should guard all writes to the new tables and all promotion atte
 
 Add tables separate from canonical `summary_nodes`:
 
-### `compaction_batches`
+### `lcm_compaction_batches`
 
 One row per prepared generation.
 
@@ -77,7 +78,7 @@ Indexes:
 - `(session_id, state, created_at)`
 - `(next_retry_at, state)`
 
-### `pending_summary_nodes`
+### `lcm_pending_summary_nodes`
 
 Prepared but non-canonical leaf summaries.
 
@@ -107,6 +108,19 @@ Indexes:
 - `(conversation_id, state)` is intentionally on the batch table; pending nodes should not have independent canonical state.
 
 Do **not** add pending rows to `summary_nodes`. Reusing the canonical table with a lifecycle flag would make every reader, FTS query, and integrity check a footgun. Keeping pending rows in a separate table gives active-only defaults naturally.
+
+### Implementation status on `feature/async-background-compaction`
+
+The first, isolated slice now has default-off config flags, an optional store
+bound only when enabled, transactional creation of these two tables, staging
+of leaf rows with overlap/shape checks, and read-only batch counts. Seven
+focused tests cover default-off inertia, binding, durability, canonical
+invisibility, rollback, incompatible schema, and environment parsing.
+
+This is **not yet a usable background compactor**: preparation, source/policy
+fingerprinting, ready-state validation, atomic canonical publication, worker
+scheduling, status/doctor wiring, and all design-spike acceptance tests remain
+to be implemented. The branch is not installed in the live Gateway.
 
 ## Fingerprints and validation inputs
 

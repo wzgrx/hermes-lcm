@@ -29,6 +29,7 @@ from .codex_routing import (
     _minimum_viable_threshold,
 )
 from .config import LCMConfig
+from .async_compaction_store import AsyncCompactionStore
 from .db_bootstrap import join_background_integrity_scans
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment, inspect_orphaned_sqlite_handles
@@ -686,6 +687,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._dag = None
         self._lifecycle = None
         self._assertions = None
+        self._async_compaction_store = None
         self._query_views = None
         self._adaptive_retrieval = None
         self._assertion_extractor = None
@@ -1034,6 +1036,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_binding = True
         self._storage_binding_thread_id = threading.get_ident()
         self._assertions = None
+        self._async_compaction_store = None
         self._query_views = None
         self._adaptive_retrieval = None
         self._assertion_extractor = None
@@ -1049,6 +1052,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
+            self._async_compaction_store = (
+                AsyncCompactionStore(db_path, enabled=True)
+                if self._config.async_background_compaction_enabled
+                else None
+            )
             self._assertions = (
                 AssertionStore(db_path)
                 if bool(getattr(self._config, "assertions_enabled", False))
@@ -1102,6 +1110,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_dag",
             "_lifecycle",
             "_assertions",
+            "_async_compaction_store",
             "_query_views",
         ):
             helper = state.get(attr)

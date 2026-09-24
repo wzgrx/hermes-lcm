@@ -337,6 +337,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("automatic_foreground_max_passes", "LCM_AUTOMATIC_FOREGROUND_MAX_PASSES", int),
     _EnvFieldSpec("automatic_foreground_max_seconds", "LCM_AUTOMATIC_FOREGROUND_MAX_SECONDS", float),
+    _EnvFieldSpec("async_background_compaction_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_max_batches", "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", int),
+    _EnvFieldSpec("async_background_compaction_retry_backoff_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", float),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
@@ -660,6 +664,11 @@ class LCMConfig:
     # an operator lowers them to keep automatic compaction off the critical path.
     automatic_foreground_max_passes: int = 12
     automatic_foreground_max_seconds: float = 120.0
+    # Opt-in background preparation; no store or worker is created by default.
+    async_background_compaction_enabled: bool = False
+    async_background_compaction_worker_enabled: bool = False
+    async_background_compaction_max_batches: int = 2
+    async_background_compaction_retry_backoff_seconds: float = 300.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
 
