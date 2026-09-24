@@ -189,6 +189,27 @@ move from one per run to zero when a complete ready leaf exists; it is not a
 long-session quality or real-provider measurement. The worker flag is off by
 default even when the master feature flag is enabled.
 
+The same offline harness also accepts `--old-messages` and `--max-batches` to
+stress a multi-leaf backlog. It compares timings only when both modes cover
+the same raw source IDs; that check does not establish equal summary quality.
+On 2026-09-24, five runs with four 3,000-token synthetic old messages, a
+fixed 50 ms summarizer stub, and dynamic four-pass leaf compaction yielded:
+
+| Prepared queue cap | Foreground provider calls (five runs) | Foreground median | Off-turn preparation median |
+| ---: | ---: | ---: | ---: |
+| 2 | 15 staged / 15 synchronous | 159.9 ms staged / 157.1 ms synchronous | 104.4 ms |
+| 4 | 5 staged / 15 synchronous | 56.2 ms staged / 156.4 ms synchronous | 208.4 ms |
+
+Both configurations retained all raw rows and matched baseline source
+coverage. The default cap of two offered no median latency improvement in this
+specific backlog; a cap of four moved more leaf work off-turn but still left
+one foreground provider call per run, principally for condensation. This is a
+queue-capacity/latency tradeoff, not a recommendation to raise the global
+default without measuring provider spend, real long-session quality, and
+production queue pressure. The multi-leaf stress fixture deliberately uses a
+low threshold to force compaction and does not forecast the live Hermes
+threshold or network latency.
+
 ## Executable acceptance coverage
 
 The original `test_async_background_compaction_design.py` spike called an
