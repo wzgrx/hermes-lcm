@@ -6531,6 +6531,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "last_compression_status": full_status.get("last_compression_status", "idle"),
         "last_compression_noop_reason": full_status.get("last_compression_noop_reason", ""),
         "threshold_full_sweep": full_status.get("threshold_full_sweep"),
+        "async_compaction": full_status.get("async_compaction"),
         "model": full_status.get("model", ""),
         "provider": full_status.get("provider", ""),
         "raw_context_length": full_status.get("raw_context_length", engine.context_length),
@@ -6974,6 +6975,29 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "check": "lifecycle_fragmentation",
             "status": "fail",
             "detail": str(e),
+        })
+
+    # Prepared leaves are intentionally invisible to canonical DAG checks.
+    # Report their separate queue health without treating default-off as debt.
+    try:
+        async_status = engine.get_async_compaction_status()
+        stale_preparation = bool(
+            async_status["preparing_batches"]
+            and (async_status["oldest_pending_age_seconds"] or 0) > 600
+        )
+        checks.append({
+            "check": "async_compaction",
+            "status": (
+                "warn" if async_status["worker_requested"] or stale_preparation
+                else "pass"
+            ),
+            "detail": async_status,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "async_compaction",
+            "status": "warn",
+            "detail": {"error_type": type(e).__name__},
         })
 
     # 7. Context pressure

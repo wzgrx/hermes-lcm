@@ -129,12 +129,18 @@ system anchor, excludes ignored-message-pattern sessions and unresolved
 externalized refs, and only prepares a complete tool-call group outside the
 stored fresh tail. It leaves the canonical DAG and active context unchanged.
 
-This is **not yet an automatically usable background compactor**: foreground
-promotion integration, current-turn fresh-tail validation, worker scheduling,
-status/doctor wiring, and the remaining design-spike acceptance tests remain.
-The low-level publisher takes a caller-supplied fresh-tail boundary, so it
-must not be exposed until the engine derives that boundary. The branch is not
-installed in the live Gateway.
+The normal foreground leaf loop now attempts publication only when a ready
+batch's ordered source IDs match an exact active raw prefix outside the live
+fresh tail. It skips provider summarization on success, then uses the existing
+condensation and active-context assembly path. A stale route or source falls
+back to the synchronous leaf path. Status and Doctor expose separate queue
+counts; default-off does not materialize optional tables.
+
+This is **not yet an automatically usable background compactor**: a scheduler
+or worker must invoke the manual preparation entry point off-turn, and the
+remaining design-spike acceptance cases (restart recovery, worker races,
+multi-leaf queues, reset fences, emergency paths) still need implementation.
+The branch is not installed in the live Gateway.
 
 ## Fingerprints and validation inputs
 

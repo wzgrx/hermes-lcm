@@ -9,11 +9,13 @@ publication transaction is implemented.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import json
 import hashlib
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new
@@ -33,6 +35,15 @@ _BATCH_STATES = (
     "failed",
     "superseded",
 )
+
+
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,7 @@ class AsyncCompactionStore:
     def __init__(self, db_path: str | Path, *, enabled: bool = False) -> None:
         self.enabled = bool(enabled)
         self.db_path = Path(db_path)
+        self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
         if not self.enabled:
             return
@@ -136,6 +148,7 @@ class AsyncCompactionStore:
             raise RuntimeError("async compaction storage is disabled or closed")
         return self._conn
 
+    @_synchronized
     def _ensure_schema(self) -> None:
         conn = self.connection
         conn.execute("BEGIN IMMEDIATE")
@@ -207,6 +220,7 @@ class AsyncCompactionStore:
                     f"incompatible async compaction table: {table}"
                 )
 
+    @_synchronized
     def create_batch(
         self,
         *,
@@ -356,6 +370,7 @@ class AsyncCompactionStore:
             json.dumps(pairs, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
+    @_synchronized
     def get_batch(self, batch_id: str) -> dict | None:
         row = self.connection.execute(
             "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?",
@@ -363,6 +378,7 @@ class AsyncCompactionStore:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    @_synchronized
     def active_batch_for_frontier(
         self,
         *,
@@ -380,6 +396,7 @@ class AsyncCompactionStore:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    @_synchronized
     def retry_blocked_until(
         self,
         *,
@@ -395,6 +412,50 @@ class AsyncCompactionStore:
         ).fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
+    @_synchronized
+    def source_snapshot_matches(self, batch_id: str) -> bool:
+        """Read-only probe used to retire stale jobs that no longer map live."""
+        conn = self.connection
+        conn.execute("BEGIN")
+        try:
+            batch = conn.execute(
+                "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                return False
+            ids, hashes = self._source_snapshot(
+                conn,
+                conversation_id=batch["conversation_id"],
+                session_id=batch["session_id"],
+                frontier_start_store_id=batch["frontier_start_store_id"],
+                frontier_end_store_id=batch["frontier_end_store_id"],
+            )
+            return (
+                ids == json.loads(batch["source_ids_json"])
+                and hashes == json.loads(batch["source_identity_hashes_json"])
+                and self._coverage_hash(ids, hashes) == batch["source_coverage_hash"]
+            )
+        finally:
+            conn.execute("ROLLBACK")
+
+    @_synchronized
+    def reject_batch(self, batch_id: str, *, reason: str) -> bool:
+        """Retire stale prepared work without touching canonical summaries."""
+        safe_reason = re.match(r"[A-Za-z_][A-Za-z0-9_]{0,79}", reason)
+        updated = self.connection.execute(
+            """UPDATE lcm_compaction_batches
+               SET state = 'rejected', rejected_reason = ?, updated_at = ?
+               WHERE batch_id = ? AND state IN ('pending', 'preparing', 'ready')""",
+            (
+                safe_reason.group(0) if safe_reason else "invalid_batch",
+                time.time(),
+                batch_id,
+            ),
+        )
+        return updated.rowcount == 1
+
+    @_synchronized
     def fail_batch(
         self, batch_id: str, *, error_type: str, backoff_seconds: float
     ) -> None:
@@ -412,6 +473,7 @@ class AsyncCompactionStore:
         if updated.rowcount != 1:
             raise ValueError("batch is not eligible for failure recording")
 
+    @_synchronized
     def stage_leaf(
         self,
         *,
@@ -518,6 +580,7 @@ class AsyncCompactionStore:
             conn.execute("ROLLBACK")
             raise
 
+    @_synchronized
     def mark_ready(self, batch_id: str) -> None:
         """Make a fully covered batch eligible for later *validated* promotion.
 
@@ -584,6 +647,7 @@ class AsyncCompactionStore:
             conn.execute("ROLLBACK")
             raise
 
+    @_synchronized
     def promote_batch(
         self,
         batch_id: str,
@@ -761,6 +825,7 @@ class AsyncCompactionStore:
                 conn.execute("ROLLBACK")
             raise
 
+    @_synchronized
     def counts(self, *, conversation_id: str | None = None) -> dict[str, int]:
         """Count staged generations; active DAG counters remain independent."""
         result = {state: 0 for state in _BATCH_STATES}
@@ -777,6 +842,51 @@ class AsyncCompactionStore:
         result.update({state: count for state, count in rows})
         return result
 
+    @_synchronized
+    def diagnostics(self, *, conversation_id: str | None = None) -> dict:
+        """Read bounded operator counters without exposing pending summary text."""
+        conn = self.connection
+        where = "WHERE conversation_id = ?" if conversation_id else ""
+        params = (conversation_id,) if conversation_id else ()
+        counts = self.counts(conversation_id=conversation_id)
+        pending_nodes = conn.execute(
+            """SELECT COUNT(*) FROM lcm_pending_summary_nodes AS n
+               JOIN lcm_compaction_batches AS b ON b.batch_id = n.batch_id """
+            + ("WHERE b.conversation_id = ?" if conversation_id else ""),
+            params,
+        ).fetchone()[0]
+        oldest = conn.execute(
+            "SELECT MIN(created_at) FROM lcm_compaction_batches "
+            + where
+            + (" AND " if where else " WHERE ")
+            + "state IN ('pending', 'preparing', 'ready')",
+            params,
+        ).fetchone()[0]
+        rejected = conn.execute(
+            "SELECT rejected_reason FROM lcm_compaction_batches "
+            + where
+            + (" AND " if where else " WHERE ")
+            + "state = 'rejected' ORDER BY updated_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+        failed = conn.execute(
+            "SELECT last_error FROM lcm_compaction_batches "
+            + where
+            + (" AND " if where else " WHERE ")
+            + "state = 'failed' ORDER BY updated_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return {
+            **{f"{state}_batches": count for state, count in counts.items()},
+            "pending_summaries": int(pending_nodes),
+            "oldest_pending_age_seconds": (
+                max(0.0, time.time() - float(oldest)) if oldest is not None else None
+            ),
+            "last_rejected_reason": rejected[0] if rejected else None,
+            "last_error": failed[0] if failed else None,
+        }
+
+    @_synchronized
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()

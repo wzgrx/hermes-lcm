@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
@@ -13,6 +15,7 @@ def _engine_with_stable_backlog(tmp_path):
         summary_model="explicit-summary-model",
         fresh_tail_count=2,
         leaf_chunk_tokens=20,
+        threshold_full_sweep_enabled=False,
     )
     engine = LCMEngine(config=config)
     engine.on_session_start(
@@ -67,6 +70,18 @@ def test_manual_preparation_calls_provider_outside_sqlite_transaction(
             ).fetchone()[0]
             == 1
         )
+        async_status = engine.get_async_compaction_status()
+        assert async_status["ready_batches"] == 1
+        assert async_status["pending_summaries"] == 1
+        assert async_status["worker_enabled"] is False
+        tool_status = json.loads(engine.handle_tool_call("lcm_status", {}))
+        assert tool_status["async_compaction"]["ready_batches"] == 1
+        doctor = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+        async_check = next(
+            check for check in doctor["checks"] if check["check"] == "async_compaction"
+        )
+        assert async_check["status"] == "pass"
+        assert async_check["detail"]["ready_batches"] == 1
         assert (
             engine.prepare_background_compaction_once(host_config={})["batch_id"]
             == batch["batch_id"]
@@ -111,6 +126,7 @@ def test_disabled_preparation_is_inert(tmp_path):
     try:
         assert engine.prepare_background_compaction_once(host_config={}) is None
         assert engine._async_compaction_store is None
+        assert engine.get_async_compaction_status()["enabled"] is False
     finally:
         engine.shutdown()
 
@@ -131,5 +147,142 @@ def test_summary_failure_records_type_only_and_enforces_backoff(tmp_path, monkey
         assert "TOKEN" not in str(batch)
         assert engine.prepare_background_compaction_once(host_config={}) is None
         assert len(calls) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_compress_consumes_ready_leaf_without_provider_call(
+    tmp_path, monkeypatch
+):
+    engine = _engine_with_stable_backlog(tmp_path)
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Prepared summary of old turns.", 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {},
+        )
+
+        def unexpected_provider(**_kwargs):
+            raise AssertionError("foreground provider call after ready leaf")
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            unexpected_provider,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        output = engine.compress(messages, current_tokens=900)
+
+        assert (
+            engine._async_compaction_store.get_batch(batch["batch_id"])["state"]
+            == "promoted"
+        )
+        assert engine._dag.get_session_node_count("session-1") == 1
+        assert (
+            engine._lifecycle.get_by_conversation(
+                "conversation-1"
+            ).current_frontier_store_id
+            == batch["frontier_end_store_id"]
+        )
+        assert any(
+            "Prepared summary of old turns." in str(msg.get("content"))
+            for msg in output
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_falls_back_when_summary_route_changes(tmp_path, monkeypatch):
+    engine = _engine_with_stable_backlog(tmp_path)
+    calls = []
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Prepared summary.", 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"auxiliary": {"compression": {"model": "new-route"}}},
+        )
+
+        def foreground_summary(**kwargs):
+            calls.append(kwargs)
+            return "Foreground summary after route change.", 1
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            foreground_summary,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        output = engine.compress(messages, current_tokens=900)
+
+        assert len(calls) == 1
+        assert (
+            engine._async_compaction_store.get_batch(batch["batch_id"])["state"]
+            == "rejected"
+        )
+        assert engine._dag.get_session_node_count("session-1") == 1
+        assert any(
+            "Foreground summary after route change." in str(msg.get("content"))
+            for msg in output
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_rejects_rewritten_source_then_summarizes_current_rows(
+    tmp_path, monkeypatch
+):
+    engine = _engine_with_stable_backlog(tmp_path)
+    calls = []
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("Prepared before rewrite.", 1),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "ready"
+        engine._store._conn.execute(
+            "UPDATE messages SET content = 'reconciled source' WHERE store_id = 2"
+        )
+        engine._store._conn.commit()
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+
+        def foreground_summary(**kwargs):
+            calls.append(kwargs)
+            return "Current-row foreground summary.", 1
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            foreground_summary,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        output = engine.compress(messages, current_tokens=900)
+
+        assert len(calls) == 1
+        assert (
+            engine._async_compaction_store.get_batch(batch["batch_id"])["state"]
+            == "rejected"
+        )
+        assert engine._dag.get_session_node_count("session-1") == 1
+        assert any(
+            "Current-row foreground summary." in str(msg.get("content"))
+            for msg in output
+        )
     finally:
         engine.shutdown()

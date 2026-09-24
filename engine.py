@@ -2497,6 +2497,70 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return store.get_batch(batch_id)
 
+    def _try_promote_prepared_prefix(
+        self,
+        candidate_raw: list[dict[str, Any]],
+        dependent_reply_message_ids: set[int],
+        hidden_direct_ids: dict[int, int],
+    ) -> tuple[int, SummaryNode] | None:
+        """Publish one exact old prefix, or leave the foreground path intact."""
+        store = self._async_compaction_store
+        if (
+            store is None or not self._config.async_background_compaction_enabled
+            or self._config.extraction_enabled
+            or self._config.assertion_extraction_enabled
+            or not self._conversation_id or not self._session_id
+        ):
+            return None
+        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        if state is None or state.current_session_id != self._session_id:
+            return None
+        batch = store.active_batch_for_frontier(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            frontier_store_id=int(state.current_frontier_store_id or 0),
+        )
+        if batch is None or batch["state"] != "ready" or batch["expected_leaf_count"] != 1:
+            return None
+        source_ids = json.loads(batch["source_ids_json"])
+        if not source_ids or len(candidate_raw) < len(source_ids):
+            return None
+        prefix = candidate_raw[:len(source_ids)]
+        if any(id(message) in dependent_reply_message_ids for message in prefix):
+            return None
+        source_map = dict(self._current_compress_store_ids_by_message_id)
+        source_map.update(hidden_direct_ids)
+        if [source_map.get(id(message)) for message in prefix] != source_ids:
+            if not store.source_snapshot_matches(batch["batch_id"]):
+                store.reject_batch(batch["batch_id"], reason="source_identity_mismatch")
+            return None
+
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            host_config = load_config_readonly()
+            if not isinstance(host_config, dict):
+                return None
+            policy_hash = policy_fingerprint(self._config)
+            route_hash = route_fingerprint(self._config, host_config)
+        except Exception:
+            logger.debug("LCM prepared leaf route fence unavailable", exc_info=True)
+            return None
+        result = store.promote_batch(
+            batch["batch_id"],
+            live_policy_fingerprint=policy_hash,
+            live_summary_route_fingerprint=route_hash,
+            max_publishable_store_id=source_ids[-1],
+        )
+        if not result.promoted:
+            return None
+        if len(result.node_ids) != 1:
+            raise RuntimeError("prepared leaf publisher returned an unexpected node count")
+        node = self._dag.get_node(result.node_ids[0])
+        if node is None:
+            raise RuntimeError("published prepared leaf is not readable")
+        return len(source_ids), node
+
     # -- ContextEngine optional methods ------------------------------------
 
     def _rollup_maintenance_key(self, scope: str) -> tuple[str, str]:
@@ -4700,6 +4764,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             identity["lifecycle_error"] = lifecycle_error
         return identity
 
+    def get_async_compaction_status(self) -> dict[str, Any]:
+        """Report staged generations without activating any optional storage."""
+        status: dict[str, Any] = {
+            "enabled": bool(self._config.async_background_compaction_enabled),
+            "worker_enabled": False,
+            "worker_requested": bool(self._config.async_background_compaction_worker_enabled),
+            "pending_batches": 0,
+            "preparing_batches": 0,
+            "ready_batches": 0,
+            "promoting_batches": 0,
+            "promoted_batches": 0,
+            "rejected_batches": 0,
+            "failed_batches": 0,
+            "superseded_batches": 0,
+            "pending_summaries": 0,
+            "oldest_pending_age_seconds": None,
+            "last_rejected_reason": None,
+            "last_error": None,
+        }
+        store = self._async_compaction_store
+        if store is not None:
+            status.update(store.diagnostics(
+                conversation_id=self.current_conversation_id or None,
+            ))
+        return status
+
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
         host_backoff_until, host_backoff_reason = self._host_rejection_snapshot()
@@ -4739,6 +4829,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "async_compaction": self.get_async_compaction_status(),
         })
         with self._assertion_extraction_metrics_lock:
             status["assertion_extraction"] = {

@@ -1560,7 +1560,18 @@ class CompactionMixin:
             hidden_candidate_raw = [
                 message for message in candidate_raw if id(message) in hidden_direct_ids
             ]
-            if hidden_candidate_raw:
+            prepared_promotion = (
+                self._try_promote_prepared_prefix(
+                    candidate_raw,
+                    dependent_reply_message_ids,
+                    hidden_direct_ids,
+                )
+                if not force and not force_overflow and not explicit_focus_topic
+                else None
+            )
+            if prepared_promotion is not None:
+                to_compact = candidate_raw[:prepared_promotion[0]]
+            elif hidden_candidate_raw:
                 # The loader already bounded and protected this prefix. Do not
                 # mix later active-window rows into its source lineage.
                 to_compact = hidden_candidate_raw
@@ -1601,7 +1612,13 @@ class CompactionMixin:
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
-            if not summary_input_chunk:
+            if prepared_promotion is not None:
+                compacted_chunk = selected_raw_chunk
+                source_tokens = count_messages_tokens(selected_raw_chunk)
+                summary_text = prepared_promotion[1].summary
+                _level = 0
+                _rescue_attempts = 0
+            elif not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
                 summary_text = (
@@ -1695,23 +1712,31 @@ class CompactionMixin:
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
-            node = SummaryNode(
-                session_id=self._session_id,
-                depth=0,
-                summary=summary_text,
-                token_count=summary_tokens,
-                source_token_count=source_tokens,
-                source_ids=source_store_ids,
-                source_type="messages",
-                created_at=time.time(),
-                earliest_at=earliest_at,
-                latest_at=latest_at,
-                expand_hint=self._extract_expand_hint(summary_text),
+            node = (
+                prepared_promotion[1]
+                if prepared_promotion is not None
+                else SummaryNode(
+                    session_id=self._session_id,
+                    depth=0,
+                    summary=summary_text,
+                    token_count=summary_tokens,
+                    source_token_count=source_tokens,
+                    source_ids=source_store_ids,
+                    source_type="messages",
+                    created_at=time.time(),
+                    earliest_at=earliest_at,
+                    latest_at=latest_at,
+                    expand_hint=self._extract_expand_hint(summary_text),
+                )
             )
+            if prepared_promotion is not None and source_store_ids != node.source_ids:
+                raise RuntimeError("prepared publication source lineage changed after validation")
             store_backed_leaf = any(
                 id(message) in hidden_direct_ids for message in source_lookup_chunk
             )
-            if store_backed_leaf:
+            if prepared_promotion is not None:
+                pass  # The node and frontier committed together before assembly.
+            elif store_backed_leaf:
                 if not source_store_ids or not consumed_store_ids:
                     raise RuntimeError("store-backed leaf lacks exact source lineage")
                 pending_calls: set[str] = set()
@@ -1736,7 +1761,9 @@ class CompactionMixin:
                 self._dag.add_node(node)
             self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            if store_backed_leaf:
+            if prepared_promotion is not None:
+                self._last_compacted_store_id = max(consumed_store_ids)
+            elif store_backed_leaf:
                 self._last_compacted_store_id = max(consumed_store_ids)
             elif not hidden_gap_bounds:
                 self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
