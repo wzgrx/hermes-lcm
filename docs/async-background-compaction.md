@@ -205,7 +205,10 @@ the same raw source IDs, every requested old source, **and the same ordered
 leaf source groups**. Matching only the union hid a real preparer error: it
 kept adding messages until it reached the target, while foreground selection
 stopped before the next message would exceed it. The preparer now follows the
-foreground boundary, except that an in-flight tool-call group stays intact.
+foreground boundary. If the boundary would split a tool call from its result,
+the preparer defers that leaf to the existing foreground path instead of
+staging a differently partitioned group. A complete group that fits the
+foreground target remains eligible.
 The report leaves `foreground_median_reduction_percent` unset when these
 partition/coverage gates fail. They still do not establish equal summary
 quality.
@@ -254,6 +257,7 @@ API; no design-only expected failures remain:
 | Default-off has no optional store/tables | `test_disabled_store_does_not_create_database_or_optional_tables`, `test_disabled_preparation_is_inert` |
 | Pending summary is absent from DAG/search | `test_staged_leaf_is_durable_but_invisible_to_canonical_dag`, `test_pending_summary_text_is_absent_from_active_search` |
 | Source rewrite rejects preparation/publication | `test_source_rewrite_during_summary_preparation_fails_closed`, `test_foreground_rejects_rewritten_source_then_summarizes_current_rows` |
+| Tool-call boundary matches foreground | `test_preparer_matches_foreground_tool_group_boundary` (split group defers without provider call; fitting group prepares) |
 | Live policy and threshold beat staged metadata | `test_promotion_rejects_stale_policy_route_or_fresh_tail`, `test_foreground_uses_live_threshold_policy_over_prepared_batch` |
 | Live summary route beats staged metadata | `test_foreground_falls_back_when_summary_route_changes` |
 | Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider` (ordinary and forced-overflow foreground winners), `test_two_publishers_serialize_and_publish_once`, `test_two_processes_publish_once_without_partial_canonical_state` (three independent databases with a simultaneous release gate) |

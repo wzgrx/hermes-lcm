@@ -14,6 +14,7 @@ import pytest
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.async_compaction_store import AsyncCompactionStore
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.tokens import count_message_tokens
 
 
 def _engine_with_stable_backlog(tmp_path, *, advance_anchor=True):
@@ -75,6 +76,72 @@ def _prepare_in_process(config, ready, release, provider_release, events, result
     finally:
         if engine is not None:
             engine.shutdown()
+
+
+@pytest.mark.parametrize("result_fits", [False, True])
+def test_preparer_matches_foreground_tool_group_boundary(
+    tmp_path, monkeypatch, result_fits,
+):
+    old_user = {"role": "user", "content": "Inspect the result " + "x " * 40}
+    call = {
+        "role": "assistant", "content": "Calling terminal",
+        "tool_calls": [{
+            "id": "call_boundary", "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+    }
+    result = {
+        "role": "tool", "tool_call_id": "call_boundary",
+        "content": "Large tool result " + "y " * 80,
+    }
+    target = count_message_tokens(old_user) + count_message_tokens(call)
+    if result_fits:
+        target += count_message_tokens(result)
+    config = LCMConfig(
+        database_path=str(tmp_path / "tool-boundary.db"),
+        async_background_compaction_enabled=True,
+        summary_model="test-model",
+        fresh_tail_count=2,
+        leaf_chunk_tokens=target,
+        dynamic_leaf_chunk_enabled=False,
+        threshold_full_sweep_enabled=False,
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start(
+            "session-tool", conversation_id="conversation-tool",
+            platform="test", context_length=1000,
+        )
+        anchor_id = engine._store.append(
+            "session-tool", {"role": "system", "content": "system anchor"},
+            conversation_id="conversation-tool",
+        )
+        engine._lifecycle.advance_frontier("conversation-tool", "session-tool", anchor_id)
+        for message in (old_user, call, result,
+                        {"role": "assistant", "content": "fresh reply"},
+                        {"role": "user", "content": "fresh request"}):
+            engine._store.append("session-tool", message, conversation_id="conversation-tool")
+        old_messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-tool")[1:4]
+        ]
+        assert len(engine._select_oldest_leaf_chunk(old_messages, target)) == (
+            3 if result_fits else 2
+        )
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            (lambda **_kwargs: ("Tool group summary.", 1)) if result_fits
+            else (lambda **_kwargs: pytest.fail("a mismatched prepared tool leaf called provider")),
+        )
+        batch = engine.prepare_background_compaction_once(host_config={})
+        if result_fits:
+            assert batch["state"] == "ready"
+            assert len(json.loads(batch["source_ids_json"])) == 3
+        else:
+            assert batch is None
+            assert engine._async_compaction_store.counts()["ready"] == 0
+    finally:
+        engine.shutdown()
 
 
 def test_manual_preparation_calls_provider_outside_sqlite_transaction(

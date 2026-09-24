@@ -2530,12 +2530,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # Match foreground _select_oldest_leaf_chunk: stop *before* a row
             # would exceed the working target. A prepared leaf that instead
             # waits until used_tokens >= target shifts the source partition and
-            # makes staged/foreground quality and latency incomparable. Keep
-            # an in-flight tool-call group intact even when it crosses target.
+            # makes staged/foreground quality and latency incomparable. If
+            # that boundary would divide a tool-call group, leave this leaf
+            # to foreground compaction rather than stage a different group.
             if (
                 selected_rows and used_tokens + message_tokens > target_tokens
-                and not pending_tool_calls
             ):
+                if pending_tool_calls:
+                    return None
                 hit_chunk_boundary = True
                 break
             content = str(message.get("content") or "")
