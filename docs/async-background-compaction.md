@@ -36,7 +36,7 @@ Add config fields, all disabled by default:
 | --- | --- | ---: | --- |
 | `async_background_compaction_enabled` | `LCM_BACKGROUND_COMPACTION_ENABLED` | `false` | Enables the feature surface; matches the upstream issue's master flag. |
 | `async_background_compaction_worker_enabled` | `LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED` | `false` | Allows automatic background preparation. Tests and hosts may still call one-shot prep manually when the feature is enabled. |
-| `async_background_compaction_max_batches` | `LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES` | `2` | Backpressure cap per conversation. |
+| `async_background_compaction_max_batches` | `LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES` | `4` | Backpressure cap per conversation; bounds off-turn provider spend. |
 | `async_background_compaction_retry_backoff_seconds` | `LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS` | `300` | Cooldown after summary failures. |
 
 The enable flag should guard all writes to the new tables and all promotion attempts. Reader filters must still be robust if old pending rows exist after the flag is later disabled.
@@ -232,6 +232,17 @@ token spend, or a recommendation to enable the worker globally. A run with
 `--missing-token-estimates` exercises the legacy case explicitly; the default
 models production ingest. The deliberately low threshold forces compaction and
 does not forecast the live Hermes threshold or network latency.
+
+A larger five-turn fixture with 16 old messages needs three leaf summaries.
+With the former cap of two, the staged path prepared two leaves off-turn but
+still made all three foreground provider calls: five-run medians were 171.1 ms
+staged versus 169.0 ms synchronous. With a cap of four, all three leaves were
+ready before the turn and the same fixture measured 13.3 ms staged versus
+168.7 ms synchronous, with zero staged foreground provider calls. Both cases
+retained all raw rows and covered all 16 old sources. The default cap is now
+four, matching the worker's existing per-pass limit; operators can lower it
+to bound speculative provider spend. These fixed-delay measurements do not
+establish real-provider latency or summary quality.
 
 ## Executable acceptance coverage
 
@@ -429,7 +440,9 @@ Doctor should warn, not fail, for normal disabled state. It should warn on:
 
 ## Test matrix
 
-These are mirrored in `tests/test_async_background_compaction_design.py` as xfailed RED spike tests until the implementation exists.
+This is the original design matrix. The obsolete xfailed RED spike file was
+removed after the executable tests listed above replaced it; treat this table
+as historical requirements, not a claim that tests remain expected failures.
 
 | Test | Proves |
 | --- | --- |

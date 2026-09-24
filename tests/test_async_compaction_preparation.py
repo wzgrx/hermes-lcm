@@ -124,8 +124,12 @@ def test_manual_preparation_calls_provider_outside_sqlite_transaction(
         assert next_batch["state"] == "ready"
         assert next_batch["batch_id"] != batch["batch_id"]
         assert next_batch["frontier_start_store_id"] == batch["frontier_end_store_id"]
-        assert engine.prepare_background_compaction_once(host_config={})["batch_id"] == next_batch["batch_id"]
-        assert len(calls) == 2
+        third_batch = engine.prepare_background_compaction_once(host_config={})
+        fourth_batch = engine.prepare_background_compaction_once(host_config={})
+        assert third_batch["frontier_start_store_id"] == next_batch["frontier_end_store_id"]
+        assert fourth_batch["frontier_start_store_id"] == third_batch["frontier_end_store_id"]
+        assert engine.prepare_background_compaction_once(host_config={})["batch_id"] == fourth_batch["batch_id"]
+        assert len(calls) == 4
         assert engine._dag.get_session_node_count("session-1") == 0
     finally:
         engine.shutdown()
@@ -239,7 +243,7 @@ def test_ingest_schedules_private_background_preparation(tmp_path, monkeypatch):
         assert provider_threads
         assert all(name != threading.main_thread().name for name in provider_threads)
         assert engine.get_async_compaction_status()["worker_enabled"] is True
-        assert engine._async_compaction_store.counts()["ready"] == 2
+        assert engine._async_compaction_store.counts()["ready"] == 4
         assert engine._dag.get_session_node_count("session-1") == 0
     finally:
         engine.shutdown(wait_for_background_work=True)
@@ -287,7 +291,7 @@ def test_background_preparation_honors_sqlite_integrity_gate(
         assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(
             engine._rollup_maintenance_owner, timeout=10,
         )
-        assert engine._async_compaction_store.counts()["ready"] == 2
+        assert engine._async_compaction_store.counts()["ready"] == 4
     finally:
         engine_module._ROLLUP_INTEGRITY_RETRY_UNTIL.pop(
             str(engine._storage_db_path.resolve()), None,
@@ -323,7 +327,7 @@ def test_background_provider_survives_foreground_engine_retirement(
         release.set()
         assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(owner, timeout=10)
         with AsyncCompactionStore(db_path, enabled=True) as reopened:
-            assert reopened.counts()["ready"] == 2
+            assert reopened.counts()["ready"] == 4
     finally:
         release.set()
         _ASYNC_COMPACTION_SCHEDULER.drain_owner(owner, timeout=10)

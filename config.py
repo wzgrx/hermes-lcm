@@ -667,7 +667,7 @@ class LCMConfig:
     # Opt-in background preparation; no store or worker is created by default.
     async_background_compaction_enabled: bool = False
     async_background_compaction_worker_enabled: bool = False
-    async_background_compaction_max_batches: int = 2
+    async_background_compaction_max_batches: int = 4
     async_background_compaction_retry_backoff_seconds: float = 300.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0

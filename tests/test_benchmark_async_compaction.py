@@ -41,6 +41,22 @@ def test_multi_turn_benchmark_batches_stamped_and_legacy_backlog(
     assert report["staged"]["prepared_batches_by_turn_per_run"] == [[2, 0]]
 
 
+def test_default_queue_cap_covers_three_leaf_backlog():
+    from hermes_lcm.config import LCMConfig
+
+    assert LCMConfig().async_background_compaction_max_batches == 4
+    report = run_benchmark(
+        repeats=1, source_tokens=3_000, provider_delay_ms=0,
+        old_messages=16, turns=5,
+    )
+    assert report["max_prepared_batches"] == 4
+    assert report["source_coverage_comparable"] is True
+    assert report["staged"]["prepared_batches_by_turn_per_run"] == [[3, 0, 0, 0, 0]]
+    assert report["staged"]["provider_calls_foreground"] == 0
+    assert report["staged"]["provider_calls_off_turn"] == 3
+    assert report["synchronous"]["provider_calls_foreground"] == 3
+
+
 def test_matching_but_partial_source_coverage_is_not_comparable():
     samples = {
         mode: [{"covered_source_ids": [1], "old_source_ids": [1, 2]}]

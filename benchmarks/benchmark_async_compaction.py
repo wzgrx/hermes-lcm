@@ -200,7 +200,7 @@ def _source_coverage(samples: dict[str, list[dict]]) -> tuple[bool, bool]:
 
 def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
                   provider_delay_ms: float = 100.0, old_messages: int = 1,
-                  max_batches: int = 2, turns: int = 1,
+                  max_batches: int = 4, turns: int = 1,
                   missing_token_estimates: bool = False) -> dict:
     if (repeats < 1 or source_tokens < 256 or provider_delay_ms < 0
             or old_messages < 1 or max_batches < 1 or turns < 1):
@@ -317,7 +317,7 @@ def main() -> None:
     parser.add_argument("--source-tokens", type=int, default=10_000)
     parser.add_argument("--provider-delay-ms", type=float, default=100.0)
     parser.add_argument("--old-messages", type=int, default=1)
-    parser.add_argument("--max-batches", type=int, default=2)
+    parser.add_argument("--max-batches", type=int, default=4)
     parser.add_argument("--turns", type=int, default=1)
     parser.add_argument("--missing-token-estimates", action="store_true")
     args = parser.parse_args()
