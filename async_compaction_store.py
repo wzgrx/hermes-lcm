@@ -8,19 +8,38 @@ publication transaction is implemented.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 import time
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new
-from .sqlite_util import _prepare_private_sqlite_file, _restrict_existing_sqlite_artifacts
+from .sqlite_util import (
+    _prepare_private_sqlite_file,
+    _restrict_existing_sqlite_artifacts,
+)
 
 
 _BATCH_STATES = (
-    "pending", "preparing", "ready", "promoting", "promoted", "rejected",
-    "failed", "superseded",
+    "pending",
+    "preparing",
+    "ready",
+    "promoting",
+    "promoted",
+    "rejected",
+    "failed",
+    "superseded",
 )
+
+
+@dataclass(frozen=True)
+class PromotionResult:
+    promoted: bool
+    reason: str
+    node_ids: tuple[int, ...] = ()
+
 
 _CREATE_BATCHES = """
 CREATE TABLE IF NOT EXISTS lcm_compaction_batches (
@@ -38,6 +57,8 @@ CREATE TABLE IF NOT EXISTS lcm_compaction_batches (
     policy_fingerprint TEXT NOT NULL,
     summary_route_fingerprint TEXT NOT NULL,
     source_coverage_hash TEXT NOT NULL,
+    source_ids_json TEXT NOT NULL,
+    source_identity_hashes_json TEXT NOT NULL,
     expected_leaf_count INTEGER NOT NULL CHECK (expected_leaf_count > 0),
     prepared_leaf_count INTEGER NOT NULL DEFAULT 0 CHECK (prepared_leaf_count >= 0),
     failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
@@ -90,7 +111,9 @@ class AsyncCompactionStore:
             raise FileNotFoundError(self.db_path)
         _prepare_private_sqlite_file(self.db_path)
         conn = sqlite3.connect(
-            str(self.db_path), timeout=5.0, check_same_thread=False,
+            str(self.db_path),
+            timeout=5.0,
+            check_same_thread=False,
             isolation_level=None,
         )
         try:
@@ -144,66 +167,217 @@ class AsyncCompactionStore:
     def _verify_schema(conn: sqlite3.Connection) -> None:
         required = {
             "lcm_compaction_batches": {
-                "batch_id", "conversation_id", "session_id", "state",
-                "frontier_start_store_id", "frontier_end_store_id",
-                "policy_fingerprint", "summary_route_fingerprint",
-                "source_coverage_hash", "expected_leaf_count", "prepared_leaf_count",
+                "batch_id",
+                "conversation_id",
+                "session_id",
+                "state",
+                "frontier_start_store_id",
+                "frontier_end_store_id",
+                "policy_fingerprint",
+                "summary_route_fingerprint",
+                "source_coverage_hash",
+                "source_ids_json",
+                "source_identity_hashes_json",
+                "expected_leaf_count",
+                "prepared_leaf_count",
             },
             "lcm_pending_summary_nodes": {
-                "pending_id", "batch_id", "conversation_id", "session_id",
-                "summary", "source_ids", "source_identity_hashes",
-                "source_range_start_store_id", "source_range_end_store_id",
+                "pending_id",
+                "batch_id",
+                "conversation_id",
+                "session_id",
+                "summary",
+                "source_ids",
+                "source_identity_hashes",
+                "source_range_start_store_id",
+                "source_range_end_store_id",
             },
         }
         for table, fields in required.items():
             columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             if not fields <= columns:
-                raise sqlite3.OperationalError(f"incompatible async compaction table: {table}")
+                raise sqlite3.OperationalError(
+                    f"incompatible async compaction table: {table}"
+                )
 
     def create_batch(
-        self, *, batch_id: str, conversation_id: str, session_id: str,
-        frontier_start_store_id: int, frontier_end_store_id: int,
-        fresh_tail_count: int, leaf_chunk_tokens: int,
-        policy_fingerprint: str, summary_route_fingerprint: str,
-        source_coverage_hash: str, expected_leaf_count: int,
-    ) -> None:
-        """Record a planning fence; this never changes canonical LCM state."""
-        now = time.time()
-        self.connection.execute(
-            """INSERT INTO lcm_compaction_batches (
-                batch_id, conversation_id, session_id, state,
-                frontier_start_store_id, frontier_end_store_id,
-                fresh_tail_count, leaf_chunk_tokens, policy_fingerprint,
-                summary_route_fingerprint, source_coverage_hash,
-                expected_leaf_count, created_at, updated_at
-            ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        self,
+        *,
+        batch_id: str,
+        conversation_id: str,
+        session_id: str,
+        frontier_start_store_id: int,
+        frontier_end_store_id: int,
+        fresh_tail_count: int,
+        leaf_chunk_tokens: int,
+        policy_fingerprint: str,
+        summary_route_fingerprint: str,
+        expected_leaf_count: int,
+    ) -> dict:
+        """Snapshot exact raw source rows and record a planning fence atomically.
+
+        The caller performs provider work only after this transaction commits.
+        A later publisher must re-read and compare these same identities.
+        """
+        if (
+            not batch_id
+            or not conversation_id
+            or not session_id
+            or not policy_fingerprint
+            or not summary_route_fingerprint
+            or expected_leaf_count <= 0
+        ):
+            raise ValueError("invalid compaction batch identity or policy")
+        conn = self.connection
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            source_ids, identity_hashes = self._source_snapshot(
+                conn,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                frontier_start_store_id=frontier_start_store_id,
+                frontier_end_store_id=frontier_end_store_id,
+            )
+            if (
+                not source_ids
+                or source_ids[-1] != frontier_end_store_id
+                or expected_leaf_count > len(source_ids)
+            ):
+                raise ValueError("batch has no complete source coverage")
+            coverage_hash = self._coverage_hash(source_ids, identity_hashes)
+            now = time.time()
+            conn.execute(
+                """INSERT INTO lcm_compaction_batches (
+                    batch_id, conversation_id, session_id, state,
+                    frontier_start_store_id, frontier_end_store_id,
+                    fresh_tail_count, leaf_chunk_tokens, policy_fingerprint,
+                    summary_route_fingerprint, source_coverage_hash,
+                    source_ids_json, source_identity_hashes_json,
+                    expected_leaf_count, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    batch_id,
+                    conversation_id,
+                    session_id,
+                    frontier_start_store_id,
+                    frontier_end_store_id,
+                    fresh_tail_count,
+                    leaf_chunk_tokens,
+                    policy_fingerprint,
+                    summary_route_fingerprint,
+                    coverage_hash,
+                    json.dumps(source_ids),
+                    json.dumps(identity_hashes),
+                    expected_leaf_count,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+            return {
+                "batch_id": batch_id,
+                "source_ids": source_ids,
+                "source_identity_hashes": identity_hashes,
+                "source_coverage_hash": coverage_hash,
+            }
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _source_snapshot(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        session_id: str,
+        frontier_start_store_id: int,
+        frontier_end_store_id: int,
+    ) -> tuple[list[int], list[str]]:
+        rows = conn.execute(
+            """SELECT store_id, conversation_id, session_id, role, content,
+                      tool_call_id, tool_calls, tool_name, timestamp
+               FROM messages
+               WHERE conversation_id = ? AND session_id = ?
+                 AND store_id > ? AND store_id <= ?
+               ORDER BY store_id""",
             (
-                batch_id, conversation_id, session_id,
-                frontier_start_store_id, frontier_end_store_id,
-                fresh_tail_count, leaf_chunk_tokens, policy_fingerprint,
-                summary_route_fingerprint, source_coverage_hash,
-                expected_leaf_count, now, now,
+                conversation_id,
+                session_id,
+                frontier_start_store_id,
+                frontier_end_store_id,
             ),
-        )
+        ).fetchall()
+        source_ids: list[int] = []
+        identity_hashes: list[str] = []
+        for row in rows:
+            (
+                source_id,
+                conversation,
+                session,
+                role,
+                content,
+                tool_call_id,
+                tool_calls,
+                tool_name,
+                timestamp,
+            ) = row
+            identity = (
+                int(source_id),
+                conversation,
+                session,
+                role,
+                hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
+                tool_call_id,
+                hashlib.sha256((tool_calls or "").encode("utf-8")).hexdigest(),
+                tool_name,
+                timestamp,
+            )
+            source_ids.append(int(source_id))
+            identity_hashes.append(
+                hashlib.sha256(
+                    json.dumps(
+                        identity, ensure_ascii=False, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+        return source_ids, identity_hashes
+
+    @staticmethod
+    def _coverage_hash(source_ids: list[int], identity_hashes: list[str]) -> str:
+        pairs = list(zip(source_ids, identity_hashes))
+        return hashlib.sha256(
+            json.dumps(pairs, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
     def get_batch(self, batch_id: str) -> dict | None:
         row = self.connection.execute(
-            "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?", (batch_id,),
+            "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?",
+            (batch_id,),
         ).fetchone()
         return dict(row) if row is not None else None
 
     def stage_leaf(
-        self, *, pending_id: str, batch_id: str, summary: str,
-        token_count: int, source_token_count: int,
-        source_ids: list[int], source_identity_hashes: list[str],
+        self,
+        *,
+        pending_id: str,
+        batch_id: str,
+        summary: str,
+        token_count: int,
+        source_token_count: int,
+        source_ids: list[int],
+        source_identity_hashes: list[str],
         previous_pending_ids: list[str] | None = None,
-        earliest_at: float | None = None, latest_at: float | None = None,
+        earliest_at: float | None = None,
+        latest_at: float | None = None,
         expand_hint: str = "",
     ) -> None:
         """Stage one complete leaf; never publish it to the canonical DAG."""
         if (
-            not summary.strip() or token_count <= 0 or source_token_count < 0
-            or not source_ids or len(source_ids) != len(source_identity_hashes)
+            not summary.strip()
+            or token_count <= 0
+            or source_token_count < 0
+            or not source_ids
+            or len(source_ids) != len(source_identity_hashes)
             or any(not isinstance(item, int) or item <= 0 for item in source_ids)
             or source_ids != sorted(set(source_ids))
             or any(not digest for digest in source_identity_hashes)
@@ -213,13 +387,34 @@ class AsyncCompactionStore:
         conn.execute("BEGIN IMMEDIATE")
         try:
             batch = conn.execute(
-                "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?", (batch_id,),
+                "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?",
+                (batch_id,),
             ).fetchone()
             if batch is None or batch["state"] not in {"pending", "preparing"}:
                 raise ValueError("batch is not accepting pending leaves")
-            if not (batch["frontier_start_store_id"] < source_ids[0]
-                    <= source_ids[-1] <= batch["frontier_end_store_id"]):
+            if not (
+                batch["frontier_start_store_id"]
+                < source_ids[0]
+                <= source_ids[-1]
+                <= batch["frontier_end_store_id"]
+            ):
                 raise ValueError("pending leaf exceeds batch frontier")
+            planned = dict(
+                zip(
+                    json.loads(batch["source_ids_json"]),
+                    json.loads(batch["source_identity_hashes_json"]),
+                )
+            )
+            if any(
+                planned.get(source_id) != digest
+                for source_id, digest in zip(
+                    source_ids,
+                    source_identity_hashes,
+                )
+            ):
+                raise ValueError(
+                    "pending leaf differs from the planned source snapshot"
+                )
             for row in conn.execute(
                 "SELECT source_ids FROM lcm_pending_summary_nodes WHERE batch_id = ?",
                 (batch_id,),
@@ -238,12 +433,22 @@ class AsyncCompactionStore:
                     earliest_at, latest_at, expand_hint
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    pending_id, batch_id, batch["conversation_id"], batch["session_id"],
-                    summary, token_count, source_token_count,
-                    json.dumps(source_ids), json.dumps(source_identity_hashes),
-                    source_ids[0], source_ids[-1],
-                    json.dumps(previous_pending_ids or []), now,
-                    earliest_at, latest_at, expand_hint,
+                    pending_id,
+                    batch_id,
+                    batch["conversation_id"],
+                    batch["session_id"],
+                    summary,
+                    token_count,
+                    source_token_count,
+                    json.dumps(source_ids),
+                    json.dumps(source_identity_hashes),
+                    source_ids[0],
+                    source_ids[-1],
+                    json.dumps(previous_pending_ids or []),
+                    now,
+                    earliest_at,
+                    latest_at,
+                    expand_hint,
                 ),
             )
             conn.execute(
@@ -257,6 +462,249 @@ class AsyncCompactionStore:
             conn.execute("ROLLBACK")
             raise
 
+    def mark_ready(self, batch_id: str) -> None:
+        """Make a fully covered batch eligible for later *validated* promotion.
+
+        Readiness does not publish canonical summaries or advance a frontier.
+        The publisher must repeat source and live-policy validation in its own
+        ``BEGIN IMMEDIATE`` transaction after provider work has finished.
+        """
+        conn = self.connection
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            batch = conn.execute(
+                "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None or batch["state"] != "preparing":
+                raise ValueError("batch is not preparing")
+            leaves = conn.execute(
+                "SELECT source_ids, source_identity_hashes "
+                "FROM lcm_pending_summary_nodes WHERE batch_id = ? "
+                "ORDER BY source_range_start_store_id",
+                (batch_id,),
+            ).fetchall()
+            if (
+                len(leaves) != batch["expected_leaf_count"]
+                or len(leaves) != batch["prepared_leaf_count"]
+            ):
+                raise ValueError("batch leaf count is incomplete")
+            staged = [
+                (source_id, digest)
+                for leaf in leaves
+                for source_id, digest in zip(json.loads(leaf[0]), json.loads(leaf[1]))
+            ]
+            planned = list(
+                zip(
+                    json.loads(batch["source_ids_json"]),
+                    json.loads(batch["source_identity_hashes_json"]),
+                )
+            )
+            if staged != planned:
+                raise ValueError("batch source coverage is incomplete or out of order")
+            current_ids, current_hashes = self._source_snapshot(
+                conn,
+                conversation_id=batch["conversation_id"],
+                session_id=batch["session_id"],
+                frontier_start_store_id=batch["frontier_start_store_id"],
+                frontier_end_store_id=batch["frontier_end_store_id"],
+            )
+            if list(zip(current_ids, current_hashes)) != planned:
+                raise ValueError(
+                    "source identity changed during background preparation"
+                )
+            if (
+                self._coverage_hash(current_ids, current_hashes)
+                != batch["source_coverage_hash"]
+            ):
+                raise ValueError("source coverage hash changed during preparation")
+            conn.execute(
+                "UPDATE lcm_compaction_batches SET state = 'ready', updated_at = ? "
+                "WHERE batch_id = ?",
+                (time.time(), batch_id),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    def promote_batch(
+        self,
+        batch_id: str,
+        *,
+        live_policy_fingerprint: str,
+        live_summary_route_fingerprint: str,
+        max_publishable_store_id: int,
+    ) -> PromotionResult:
+        """Publish all prepared leaves and the lifecycle frontier in one txn.
+
+        The caller must derive ``max_publishable_store_id`` from the *current*
+        fresh-tail boundary. No model/provider call or active-context assembly
+        happens here. Rejected batches leave canonical tables untouched.
+        """
+        conn = self.connection
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            batch = conn.execute(
+                "SELECT * FROM lcm_compaction_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise ValueError("unknown compaction batch")
+
+            def reject(reason: str) -> PromotionResult:
+                conn.execute(
+                    "UPDATE lcm_compaction_batches "
+                    "SET state = 'rejected', rejected_reason = ?, updated_at = ? "
+                    "WHERE batch_id = ?",
+                    (reason, time.time(), batch_id),
+                )
+                conn.execute("COMMIT")
+                return PromotionResult(False, reason)
+
+            if batch["state"] != "ready":
+                # A second promoter must never demote an already-published batch.
+                if batch["state"] == "promoted":
+                    conn.execute("COMMIT")
+                    return PromotionResult(False, "already_promoted")
+                return reject("batch_not_ready")
+            if live_policy_fingerprint != batch["policy_fingerprint"]:
+                return reject("policy_fingerprint_mismatch")
+            if live_summary_route_fingerprint != batch["summary_route_fingerprint"]:
+                return reject("summary_route_fingerprint_mismatch")
+            if max_publishable_store_id < batch["frontier_end_store_id"]:
+                return reject("fresh_tail_boundary_changed")
+
+            lifecycle = conn.execute(
+                "SELECT current_session_id, current_frontier_store_id "
+                "FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (batch["conversation_id"],),
+            ).fetchone()
+            if (
+                lifecycle is None
+                or lifecycle["current_session_id"] != batch["session_id"]
+            ):
+                return reject("session_binding_changed")
+            if (
+                lifecycle["current_frontier_store_id"]
+                != batch["frontier_start_store_id"]
+            ):
+                return reject("frontier_changed")
+
+            planned = list(
+                zip(
+                    json.loads(batch["source_ids_json"]),
+                    json.loads(batch["source_identity_hashes_json"]),
+                )
+            )
+            current_ids, current_hashes = self._source_snapshot(
+                conn,
+                conversation_id=batch["conversation_id"],
+                session_id=batch["session_id"],
+                frontier_start_store_id=batch["frontier_start_store_id"],
+                frontier_end_store_id=batch["frontier_end_store_id"],
+            )
+            if (
+                list(zip(current_ids, current_hashes)) != planned
+                or self._coverage_hash(current_ids, current_hashes)
+                != batch["source_coverage_hash"]
+            ):
+                return reject("source_identity_mismatch")
+
+            leaves = conn.execute(
+                "SELECT * FROM lcm_pending_summary_nodes WHERE batch_id = ? "
+                "ORDER BY source_range_start_store_id",
+                (batch_id,),
+            ).fetchall()
+            if (
+                len(leaves) != batch["expected_leaf_count"]
+                or len(leaves) != batch["prepared_leaf_count"]
+                or [
+                    (source_id, digest)
+                    for leaf in leaves
+                    for source_id, digest in zip(
+                        json.loads(leaf["source_ids"]),
+                        json.loads(leaf["source_identity_hashes"]),
+                    )
+                ]
+                != planned
+            ):
+                return reject("pending_coverage_mismatch")
+
+            planned_ids = set(current_ids)
+            canonical = conn.execute(
+                "SELECT source_ids FROM summary_nodes "
+                "WHERE session_id = ? AND depth = 0 AND source_type = 'messages'",
+                (batch["session_id"],),
+            )
+            if any(planned_ids.intersection(json.loads(row[0])) for row in canonical):
+                return reject("canonical_source_overlap")
+
+            now = time.time()
+            node_ids: list[int] = []
+            for leaf in leaves:
+                cur = conn.execute(
+                    """INSERT INTO summary_nodes
+                       (session_id, depth, summary, token_count, source_token_count,
+                        source_ids, source_type, created_at, earliest_at, latest_at,
+                        expand_hint)
+                       VALUES (?, 0, ?, ?, ?, ?, 'messages', ?, ?, ?, ?)""",
+                    (
+                        batch["session_id"],
+                        leaf["summary"],
+                        leaf["token_count"],
+                        leaf["source_token_count"],
+                        leaf["source_ids"],
+                        now,
+                        leaf["earliest_at"],
+                        leaf["latest_at"],
+                        leaf["expand_hint"],
+                    ),
+                )
+                node_ids.append(int(cur.lastrowid))
+            updated = conn.execute(
+                """UPDATE lcm_lifecycle_state
+                   SET current_frontier_store_id = ?, updated_at = ?
+                   WHERE conversation_id = ? AND current_session_id = ?
+                     AND current_frontier_store_id = ?""",
+                (
+                    batch["frontier_end_store_id"],
+                    now,
+                    batch["conversation_id"],
+                    batch["session_id"],
+                    batch["frontier_start_store_id"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    "frontier compare-and-swap failed during publication"
+                )
+            conn.execute(
+                "UPDATE lcm_compaction_batches SET state = 'promoted', "
+                "promoted_at = ?, updated_at = ? WHERE batch_id = ?",
+                (now, now, batch_id),
+            )
+            conn.execute(
+                """UPDATE lcm_compaction_batches
+                   SET state = 'superseded', updated_at = ?
+                   WHERE batch_id != ? AND conversation_id = ? AND session_id = ?
+                     AND state IN ('pending', 'preparing', 'ready')
+                     AND frontier_start_store_id < ?""",
+                (
+                    now,
+                    batch_id,
+                    batch["conversation_id"],
+                    batch["session_id"],
+                    batch["frontier_end_store_id"],
+                ),
+            )
+            conn.execute("COMMIT")
+            return PromotionResult(True, "promoted", tuple(node_ids))
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
     def counts(self, *, conversation_id: str | None = None) -> dict[str, int]:
         """Count staged generations; active DAG counters remain independent."""
         result = {state: 0 for state in _BATCH_STATES}
@@ -267,7 +715,8 @@ class AsyncCompactionStore:
         else:
             rows = self.connection.execute(
                 "SELECT state, COUNT(*) FROM lcm_compaction_batches "
-                "WHERE conversation_id = ? GROUP BY state", (conversation_id,),
+                "WHERE conversation_id = ? GROUP BY state",
+                (conversation_id,),
             )
         result.update({state: count for state, count in rows})
         return result

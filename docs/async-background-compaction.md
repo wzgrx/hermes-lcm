@@ -34,7 +34,7 @@ Add config fields, all disabled by default:
 
 | Field | Env | Default | Meaning |
 | --- | --- | ---: | --- |
-| `async_background_compaction_enabled` | `LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED` | `false` | Enables the feature surface. |
+| `async_background_compaction_enabled` | `LCM_BACKGROUND_COMPACTION_ENABLED` | `false` | Enables the feature surface; matches the upstream issue's master flag. |
 | `async_background_compaction_worker_enabled` | `LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED` | `false` | Allows automatic background preparation. Tests and hosts may still call one-shot prep manually when the feature is enabled. |
 | `async_background_compaction_max_batches` | `LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES` | `2` | Backpressure cap per conversation. |
 | `async_background_compaction_retry_backoff_seconds` | `LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS` | `300` | Cooldown after summary failures. |
@@ -62,6 +62,8 @@ Suggested columns:
 - `policy_fingerprint TEXT NOT NULL`
 - `summary_route_fingerprint TEXT NOT NULL`
 - `source_coverage_hash TEXT NOT NULL`
+- `source_ids_json TEXT NOT NULL` — exact ordered source IDs planned in the batch
+- `source_identity_hashes_json TEXT NOT NULL` — one identity digest per planned ID
 - `expected_leaf_count INTEGER NOT NULL`
 - `prepared_leaf_count INTEGER NOT NULL DEFAULT 0`
 - `failure_count INTEGER NOT NULL DEFAULT 0`
@@ -111,16 +113,20 @@ Do **not** add pending rows to `summary_nodes`. Reusing the canonical table with
 
 ### Implementation status on `feature/async-background-compaction`
 
-The first, isolated slice now has default-off config flags, an optional store
-bound only when enabled, transactional creation of these two tables, staging
-of leaf rows with overlap/shape checks, and read-only batch counts. Seven
-focused tests cover default-off inertia, binding, durability, canonical
-invisibility, rollback, incompatible schema, and environment parsing.
+The isolated branch now has default-off config flags, an optional store bound
+only when enabled, transactional schema creation, source-identity snapshots,
+staging with overlap checks, exact ready-state coverage validation, and a
+single-transaction canonical publisher with frontier compare-and-swap. The
+publisher rejects stale source/policy/route/fresh-tail inputs and canonical
+overlap; publication failure rolls back nodes, frontier, and batch state.
+Seventeen focused tests include concurrent publishers and injected failure.
 
-This is **not yet a usable background compactor**: preparation, source/policy
-fingerprinting, ready-state validation, atomic canonical publication, worker
-scheduling, status/doctor wiring, and all design-spike acceptance tests remain
-to be implemented. The branch is not installed in the live Gateway.
+This is **not yet a usable background compactor**: engine-owned preparation,
+live policy/route fingerprint generation, foreground promotion integration,
+worker scheduling, status/doctor wiring, and the design-spike acceptance tests
+remain. The low-level publisher takes a caller-supplied fresh-tail boundary,
+so it must not be exposed until the engine computes that boundary from the
+current turn. The branch is not installed in the live Gateway.
 
 ## Fingerprints and validation inputs
 

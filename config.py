@@ -337,7 +337,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("automatic_foreground_max_passes", "LCM_AUTOMATIC_FOREGROUND_MAX_PASSES", int),
     _EnvFieldSpec("automatic_foreground_max_seconds", "LCM_AUTOMATIC_FOREGROUND_MAX_SECONDS", float),
-    _EnvFieldSpec("async_background_compaction_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_enabled", "LCM_BACKGROUND_COMPACTION_ENABLED", bool),
     _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
     _EnvFieldSpec("async_background_compaction_max_batches", "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", int),
     _EnvFieldSpec("async_background_compaction_retry_backoff_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", float),
