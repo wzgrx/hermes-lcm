@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -142,6 +143,51 @@ def test_staged_leaf_is_durable_but_invisible_to_canonical_dag(tmp_path):
             assert reopened.get_batch("batch-1")["prepared_leaf_count"] == 1
             assert reopened.counts()["preparing"] == 1
         assert os.stat(db_path).st_mode & 0o777 == 0o600
+    finally:
+        core.close()
+
+
+def test_restart_recovery_releases_only_abandoned_incomplete_claims(tmp_path):
+    db_path = tmp_path / "recovery.db"
+    core = MessageStore(db_path)
+    try:
+        _seed_sources(core)
+        with AsyncCompactionStore(db_path, enabled=True) as store:
+            _create_batch(store)
+            assert store.mark_preparing("batch-1") is True
+            assert store.mark_preparing("batch-1") is False
+            assert store.recover_abandoned_batches(
+                conversation_id="conversation-1", session_id="session-1",
+                stale_after_seconds=300,
+            ) == 0
+            store.connection.execute(
+                "UPDATE lcm_compaction_batches SET updated_at = ? WHERE batch_id = ?",
+                (time.time() - 601, "batch-1"),
+            )
+        with AsyncCompactionStore(db_path, enabled=True) as reopened:
+            assert reopened.recover_abandoned_batches(
+                conversation_id="conversation-1", session_id="session-1",
+                stale_after_seconds=300,
+            ) == 1
+            abandoned = reopened.get_batch("batch-1")
+            assert abandoned["state"] == "failed"
+            assert abandoned["last_error"] == "PreparationAbandoned"
+            assert abandoned["next_retry_at"] <= time.time()
+            assert reopened.recover_abandoned_batches(
+                conversation_id="conversation-1", session_id="session-1",
+                stale_after_seconds=300,
+            ) == 0
+            _create_batch(reopened, batch_id="batch-2")
+            reopened.connection.execute(
+                "UPDATE lcm_compaction_batches SET state = 'ready', updated_at = ? "
+                "WHERE batch_id = 'batch-2'",
+                (time.time() - 601,),
+            )
+            assert reopened.recover_abandoned_batches(
+                conversation_id="conversation-1", session_id="session-1",
+                stale_after_seconds=300,
+            ) == 0
+            assert reopened.get_batch("batch-2")["state"] == "ready"
     finally:
         core.close()
 

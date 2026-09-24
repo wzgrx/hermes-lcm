@@ -136,11 +136,20 @@ condensation and active-context assembly path. A stale route or source falls
 back to the synchronous leaf path. Status and Doctor expose separate queue
 counts; default-off does not materialize optional tables.
 
-This is **not yet an automatically usable background compactor**: a scheduler
-or worker must invoke the manual preparation entry point off-turn, and the
-remaining design-spike acceptance cases (restart recovery, worker races,
-multi-leaf queues, reset fences, emergency paths) still need implementation.
-The branch is not installed in the live Gateway.
+With both master and worker flags enabled, successful post-turn ingest now
+queues a bounded, deduplicated worker keyed by database and conversation/session.
+The worker opens private SQLite helpers and uses an immutable binding snapshot;
+it does not run the provider on the foreground engine. Plugin unload drains
+accepted work, while retirement of an individual foreground engine leaves its
+already accepted preparation intact. Incomplete claims older than twice the
+provider timeout (minimum five minutes) are released for retry after process
+restart. Ready batches remain durable and are revalidated at promotion.
+
+This remains an **experimental isolated branch**, not installed in the live
+Gateway. It still needs multi-leaf queue advancement, reset fences, first-leaf
+system-anchor handling, emergency/partial-emergency paths, and broader race and
+long-session performance coverage before deployment. The worker flag is off by
+default even when the master feature flag is enabled.
 
 ## Fingerprints and validation inputs
 

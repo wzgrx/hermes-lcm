@@ -410,6 +410,7 @@ class _RollupMaintenanceScheduler:
 
 
 _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
+_ASYNC_COMPACTION_SCHEDULER = _RollupMaintenanceScheduler(max_pending_jobs=16)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _HOST_REJECTION_BACKOFF_SECONDS = 300.0
@@ -577,11 +578,14 @@ class _EngineShutdownGroup:
                 if generation is None:
                     return
             _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(rollup_owner)
+            _ASYNC_COMPACTION_SCHEDULER.drain_owner(rollup_owner)
             assertion_idle.wait()
             with self._condition:
                 if self._background_work.get(record) != generation:
                     continue
                 if not _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(
+                    rollup_owner, timeout=0
+                ) or not _ASYNC_COMPACTION_SCHEDULER.drain_owner(
                     rollup_owner, timeout=0
                 ) or not assertion_idle.is_set():
                     continue
@@ -2179,6 +2183,60 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 except Exception as e:
                     self._record_ingest_failure("per-turn ingest()", e)
+                else:
+                    self._schedule_background_compaction()
+
+    def _schedule_background_compaction(self) -> bool:
+        """Queue a private, off-turn preparer after a successful durable ingest."""
+        if not (
+            self._config.async_background_compaction_enabled
+            and self._config.async_background_compaction_worker_enabled
+            and self._session_id
+            and self._conversation_id
+            and not self._session_ignored
+            and not self._session_stateless
+        ):
+            return False
+        if not self._begin_background_schedule():
+            return False
+        try:
+            session_id = self._session_id
+            conversation_id = self._conversation_id
+            config = copy.deepcopy(self._config)
+            hermes_home = self._hermes_home
+            database_path = Path(self._storage_db_path).resolve()
+            key = (str(database_path), f"async-compaction:{conversation_id}:{session_id}")
+
+            def prepare() -> None:
+                # Never use the foreground engine's mutable session binding or
+                # SQLite connections from this worker. The durable lifecycle and
+                # source snapshot are rechecked by the private preparer.
+                worker = None
+                try:
+                    worker = type(self)(config=config, hermes_home=hermes_home,
+                                        _lazy_storage=True)
+                    worker._storage_db_path = database_path
+                    worker._session_id = session_id
+                    worker._conversation_id = conversation_id
+                    worker.prepare_background_compaction_once()
+                except Exception:
+                    logger.warning("LCM background compaction preparation failed",
+                                   exc_info=True)
+                finally:
+                    if worker is not None:
+                        worker.shutdown()
+
+            accepted = _ASYNC_COMPACTION_SCHEDULER.schedule(
+                key, prepare, owner=self._rollup_maintenance_owner,
+            )
+            if accepted:
+                self._shutdown_group.track_background(
+                    self._rollup_maintenance_owner,
+                    self._assertion_extraction_idle,
+                )
+            return accepted
+        finally:
+            self._end_background_schedule()
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -2334,6 +2392,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except (TypeError, ValueError):
             return None
 
+        # A process restart can strand an incomplete claim at this frontier.
+        # Do not reclaim a live provider call: wait at least two timeout windows
+        # before releasing its claim, and preserve ready batches for validation.
+        store.recover_abandoned_batches(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            stale_after_seconds=max(
+                300.0, 2.0 * self._config.summary_timeout_ms / 1000,
+            ),
+        )
+
         existing = store.active_batch_for_frontier(
             conversation_id=self._conversation_id,
             session_id=self._session_id,
@@ -2450,6 +2519,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return None
 
+        if not store.mark_preparing(batch_id):
+            return store.get_batch(batch_id)
+
         # The model call is deliberately outside every SQLite transaction.
         try:
             summary_text, level = summarize_with_escalation(
@@ -2490,11 +2562,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             store.mark_ready(batch_id)
         except Exception as exc:
-            store.fail_batch(
-                batch_id,
-                error_type=type(exc).__name__,
-                backoff_seconds=self._config.async_background_compaction_retry_backoff_seconds,
-            )
+            try:
+                store.fail_batch(
+                    batch_id,
+                    error_type=type(exc).__name__,
+                    backoff_seconds=self._config.async_background_compaction_retry_backoff_seconds,
+                )
+            except ValueError:
+                # A concurrent recovery/reset may have already retired it.
+                pass
         return store.get_batch(batch_id)
 
     def _try_promote_prepared_prefix(
@@ -4768,7 +4844,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Report staged generations without activating any optional storage."""
         status: dict[str, Any] = {
             "enabled": bool(self._config.async_background_compaction_enabled),
-            "worker_enabled": False,
+            "worker_enabled": bool(
+                self._config.async_background_compaction_enabled
+                and self._config.async_background_compaction_worker_enabled
+            ),
             "worker_requested": bool(self._config.async_background_compaction_worker_enabled),
             "pending_batches": 0,
             "preparing_batches": 0,
@@ -7965,6 +8044,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._background_work_condition.wait()
         if wait:
             self.drain_rollup_maintenance()
+            _ASYNC_COMPACTION_SCHEDULER.drain_owner(self._rollup_maintenance_owner)
             self._assertion_extraction_idle.wait()
 
     def shutdown(self, *, wait_for_background_work: bool = False):
@@ -7981,10 +8061,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 shutdown_group.discard(self)
                 return
             rollup_pending = not self.drain_rollup_maintenance(timeout=0)
+            async_pending = not _ASYNC_COMPACTION_SCHEDULER.drain_owner(
+                self._rollup_maintenance_owner, timeout=0,
+            )
             assertion_pending = not self._assertion_extraction_idle.is_set()
             shutdown_group.retire(
                 self,
                 self._rollup_maintenance_owner,
                 self._assertion_extraction_idle,
-                background_pending=rollup_pending or assertion_pending,
+                background_pending=rollup_pending or async_pending or assertion_pending,
             )

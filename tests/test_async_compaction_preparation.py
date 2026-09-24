@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.async_compaction_store import AsyncCompactionStore
 from hermes_lcm.engine import LCMEngine
 
 
@@ -89,6 +91,70 @@ def test_manual_preparation_calls_provider_outside_sqlite_transaction(
         assert len(calls) == 1
     finally:
         engine.shutdown()
+
+
+def test_ingest_schedules_private_background_preparation(tmp_path, monkeypatch):
+    engine = _engine_with_stable_backlog(tmp_path)
+    engine._config.async_background_compaction_worker_enabled = True
+    provider_threads = []
+    try:
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", lambda: {},
+        )
+
+        def summarize(**_kwargs):
+            provider_threads.append(threading.current_thread().name)
+            return "Prepared on the dedicated background worker.", 1
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+        engine.ingest([{"role": "user", "content": "a new turn after the stable backlog"}])
+        from hermes_lcm.engine import _ASYNC_COMPACTION_SCHEDULER
+
+        assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(
+            engine._rollup_maintenance_owner, timeout=10,
+        )
+        assert provider_threads
+        assert all(name != threading.main_thread().name for name in provider_threads)
+        assert engine.get_async_compaction_status()["worker_enabled"] is True
+        assert engine._async_compaction_store.counts()["ready"] == 1
+        assert engine._dag.get_session_node_count("session-1") == 0
+    finally:
+        engine.shutdown(wait_for_background_work=True)
+
+
+def test_background_provider_survives_foreground_engine_retirement(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path)
+    engine._config.async_background_compaction_worker_enabled = True
+    entered = threading.Event()
+    release = threading.Event()
+    from hermes_lcm.engine import _ASYNC_COMPACTION_SCHEDULER
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+
+    def summarize(**_kwargs):
+        entered.set()
+        assert release.wait(10)
+        return "Prepared after foreground engine retirement.", 1
+
+    monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+    owner = engine._rollup_maintenance_owner
+    db_path = engine._storage_db_path
+    try:
+        assert engine._schedule_background_compaction() is True
+        assert entered.wait(10)
+        assert engine._async_compaction_store.counts()["preparing"] == 1
+        assert engine._dag.get_session_node_count("session-1") == 0
+        engine.shutdown(wait_for_background_work=False)
+        release.set()
+        assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(owner, timeout=10)
+        with AsyncCompactionStore(db_path, enabled=True) as reopened:
+            assert reopened.counts()["ready"] == 1
+    finally:
+        release.set()
+        _ASYNC_COMPACTION_SCHEDULER.drain_owner(owner, timeout=10)
+        engine.shutdown(wait_for_background_work=True)
 
 
 def test_source_rewrite_during_summary_preparation_fails_closed(tmp_path, monkeypatch):

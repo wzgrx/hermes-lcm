@@ -413,6 +413,47 @@ class AsyncCompactionStore:
         return float(row[0]) if row and row[0] is not None else None
 
     @_synchronized
+    def recover_abandoned_batches(
+        self, *, conversation_id: str, session_id: str,
+        stale_after_seconds: float,
+    ) -> int:
+        """Release old, incomplete claims after a crashed or stalled preparer.
+
+        A generous lease avoids taking work from a live provider call. Ready
+        batches survive restarts and are always revalidated at publication.
+        """
+        now = time.time()
+        cutoff = now - max(1.0, float(stale_after_seconds))
+        conn = self.connection
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            updated = conn.execute(
+                """UPDATE lcm_compaction_batches
+                   SET state = 'failed', failure_count = failure_count + 1,
+                       next_retry_at = ?, last_error = 'PreparationAbandoned',
+                       updated_at = ?
+                   WHERE conversation_id = ? AND session_id = ?
+                     AND state IN ('pending', 'preparing') AND updated_at <= ?""",
+                (now, now, conversation_id, session_id, cutoff),
+            )
+            conn.execute("COMMIT")
+            return updated.rowcount
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    @_synchronized
+    def mark_preparing(self, batch_id: str) -> bool:
+        """Mark the provider phase without holding a transaction during it."""
+        updated = self.connection.execute(
+            """UPDATE lcm_compaction_batches
+               SET state = 'preparing', updated_at = ?
+               WHERE batch_id = ? AND state = 'pending'""",
+            (time.time(), batch_id),
+        )
+        return updated.rowcount == 1
+
+    @_synchronized
     def source_snapshot_matches(self, batch_id: str) -> bool:
         """Read-only probe used to retire stale jobs that no longer map live."""
         conn = self.connection
