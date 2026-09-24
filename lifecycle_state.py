@@ -489,6 +489,16 @@ class LifecycleStateStore:
             "read_only": True,
             "lifecycle_rows": _count("SELECT COUNT(*) FROM lcm_lifecycle_state"),
             "empty_lifecycle_rows": empty_lifecycle_rows,
+            # A graceful shutdown clears the current slot but retains the
+            # compacted-through checkpoint in last_finalized_frontier_store_id.
+            # This shape is not a zero-frontier backlog for the next session.
+            "finalized_checkpoint_rows": _count(
+                """SELECT COUNT(*) FROM lcm_lifecycle_state
+                   WHERE current_session_id IS NULL
+                     AND current_frontier_store_id = 0
+                     AND last_finalized_session_id IS NOT NULL
+                     AND last_finalized_frontier_store_id > 0"""
+            ),
             "messages_total": _count("SELECT COUNT(*) FROM messages"),
             "summary_nodes_total": _count("SELECT COUNT(*) FROM summary_nodes"),
             "distinct_message_sessions": len(message_sessions),

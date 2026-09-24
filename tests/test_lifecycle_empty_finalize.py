@@ -166,6 +166,55 @@ def test_engine_resumes_finalized_frontier_after_gateway_restart(tmp_path):
         resumed.shutdown()
 
 
+def test_new_session_does_not_count_finalized_historical_rows_as_backlog(tmp_path):
+    """#555: a finalized checkpoint is not an active zero-frontier backlog."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20,
+        deferred_maintenance_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    engine.on_session_start("historical", platform="test", conversation_id="conversation")
+    try:
+        historical = [
+            {"role": "user", "content": f"old {index} " + "detail " * 20}
+            for index in range(30)
+        ]
+        old_ids = engine._store.append_batch(
+            "historical", historical, [40] * len(historical),
+            source="test", conversation_id="conversation",
+        )
+        engine._lifecycle.advance_frontier("conversation", "historical", old_ids[-1])
+        finalized = engine._lifecycle.finalize_session(
+            "conversation", "historical", old_ids[-1],
+        )
+        assert finalized.current_session_id is None
+        assert finalized.current_frontier_store_id == 0
+        assert finalized.last_finalized_frontier_store_id == old_ids[-1]
+        assert engine._lifecycle.get_fragmentation_stats()["finalized_checkpoint_rows"] == 1
+
+        engine.on_session_start("new-session", platform="test", conversation_id="conversation")
+        active = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "new request"},
+        ]
+        engine._ingest_messages(active)
+
+        assert engine._hidden_store_prefix_upper_bound(active) is None
+        assert engine._load_hidden_store_leaf_chunk(active) is None
+        engine._refresh_raw_backlog_debt(active, observed_tokens=10)
+        current = engine._lifecycle.get_by_conversation("conversation")
+        assert current.current_session_id == "new-session"
+        assert current.current_frontier_store_id == 0
+        assert current.debt_kind is None
+        assert engine._lifecycle.get_fragmentation_stats()["finalized_checkpoint_rows"] == 0
+        assert engine._store.get_session_count("new-session") == 2
+        assert engine._store.get_session_count("historical") == len(historical)
+    finally:
+        engine.shutdown()
+
+
 def test_empty_lifecycle_gc_probes_referenced_sessions_only(tmp_path):
     db_path = tmp_path / "lcm.db"
     messages = MessageStore(db_path)

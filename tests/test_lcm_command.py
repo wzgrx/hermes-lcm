@@ -1118,6 +1118,23 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert engine._lifecycle.row_count() == 2
 
 
+def test_lcm_doctor_distinguishes_finalized_checkpoint_from_live_zero_frontier(engine):
+    engine.on_session_start("checkpoint-session", platform="cli", conversation_id="checkpoint-conversation")
+    frontier = engine._store.append(
+        "checkpoint-session", {"role": "user", "content": "already summarized"},
+        conversation_id="checkpoint-conversation",
+    )
+    engine._lifecycle.advance_frontier("checkpoint-conversation", "checkpoint-session", frontier)
+    engine._lifecycle.finalize_session("checkpoint-conversation", "checkpoint-session", frontier)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "finalized_checkpoint_rows=1" in result
+    state = engine._lifecycle.get_by_conversation("checkpoint-conversation")
+    assert state.current_frontier_store_id == 0
+    assert state.last_finalized_frontier_store_id == frontier
+
+
 def test_lcm_doctor_reports_lcm_sessions_without_lifecycle_references_as_observations(engine):
     engine.on_session_start("current-session", platform="cli", context_length=200000)
     engine._store.append("current-session", {"role": "user", "content": "covered"}, source="cli")
