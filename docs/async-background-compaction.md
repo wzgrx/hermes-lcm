@@ -191,7 +191,10 @@ default even when the master feature flag is enabled.
 
 The same offline harness also accepts `--old-messages` and `--max-batches` to
 stress a multi-leaf backlog. It compares timings only when both modes cover
-the same raw source IDs; that check does not establish equal summary quality.
+the same raw source IDs **and every requested old source**; matching partial
+coverage is not a valid speedup comparison. Neither check establishes equal
+summary quality. The report distinguishes coverage parity from completeness
+and leaves `foreground_median_reduction_percent` unset when either fails.
 On 2026-09-24, five runs with four 3,000-token synthetic old messages, a
 fixed 50 ms summarizer stub, and dynamic four-pass leaf compaction yielded:
 
@@ -209,6 +212,13 @@ default without measuring provider spend, real long-session quality, and
 production queue pressure. The multi-leaf stress fixture deliberately uses a
 low threshold to force compaction and does not forecast the live Hermes
 threshold or network latency.
+
+An eight-message stress probe with a queue cap of eight prepared all eight
+batches, but its single staged foreground pass covered only four old messages
+while the synchronous pass covered eight. The harness therefore withholds a
+speedup percentage for that probe. Prepared batch count is not equivalent to
+same-turn publication or equal work done; a multi-turn replay is needed before
+drawing a larger-backlog latency conclusion.
 
 ## Executable acceptance coverage
 

@@ -133,6 +133,21 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
 
 
+def _source_coverage(samples: dict[str, list[dict]]) -> tuple[bool, bool]:
+    """Report both parity and completeness; parity alone can hide lost work."""
+    synchronous = samples["synchronous"]
+    staged = samples["staged"]
+    matches = all(
+        left["covered_source_ids"] == right["covered_source_ids"]
+        for left, right in zip(synchronous, staged, strict=True)
+    )
+    complete = all(
+        set(item["covered_source_ids"]) == set(item["old_source_ids"])
+        for mode in samples.values() for item in mode
+    )
+    return matches, complete
+
+
 def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
                   provider_delay_ms: float = 100.0, old_messages: int = 1,
                   max_batches: int = 2) -> dict:
@@ -157,11 +172,8 @@ def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
     staged = [item["foreground_ms"] for item in samples["staged"]]
     baseline_median = statistics.median(baseline)
     staged_median = statistics.median(staged)
-    coverage_matches = all(
-        samples["synchronous"][index]["covered_source_ids"]
-        == samples["staged"][index]["covered_source_ids"]
-        for index in range(repeats)
-    )
+    coverage_matches, coverage_complete = _source_coverage(samples)
+    comparable = coverage_matches and coverage_complete
     return {
         "workload": "synthetic_single_old_leaf" if old_messages == 1 else "synthetic_multi_old_messages",
         "provider": "fixed_sleep_stub_no_network",
@@ -200,13 +212,14 @@ def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
         },
         "foreground_median_reduction_percent": round(
             100 * (1 - staged_median / baseline_median), 2
-        ) if baseline_median > 0 and coverage_matches else None,
-        "source_coverage_comparable": coverage_matches,
+        ) if baseline_median > 0 and comparable else None,
+        "source_coverage_comparable": comparable,
         "invariants": {
             "one_canonical_leaf_each_run": all(
                 item["canonical_nodes"] == 1 for mode in samples.values() for item in mode
             ) if old_messages == 1 else None,
             "source_coverage_matches_baseline": coverage_matches,
+            "all_old_sources_covered": coverage_complete,
             "all_raw_rows_retained": all(
                 item["raw_rows"] == old_messages + 3
                 for mode in samples.values() for item in mode
