@@ -125,10 +125,6 @@ def reset_explicit_new_carry(
                 if session_id
             }
         )
-        updated = lifecycle.clear_carry_for_explicit_new(old_session_id)
-        if updated is None:
-            return {"found": False, "reason": "stale_session"}
-
         dag = SummaryDAG(path)
         try:
 
@@ -152,6 +148,12 @@ def reset_explicit_new_carry(
             )
         finally:
             dag.close()
+        # Node deletion is idempotent, but clearing the carry pointer is not
+        # reversible: the outgoing session would no longer be discoverable on
+        # a retry. Keep ownership intact until every summary batch is removed.
+        updated = lifecycle.clear_carry_for_explicit_new(old_session_id)
+        if updated is None:
+            return {"found": False, "reason": "stale_session"}
         logger.info(
             "LCM explicit /new forgot summary carry for conversation=%s sessions=%d nodes=%d",
             updated.conversation_id,

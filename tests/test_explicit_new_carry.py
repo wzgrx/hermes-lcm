@@ -121,6 +121,39 @@ def test_explicit_new_forgets_current_and_finalized_summaries_not_raw_rows(tmp_p
         lifecycle.close()
 
 
+@pytest.mark.parametrize("fail_after_delete", [False, True])
+def test_explicit_new_keeps_carry_retryable_when_node_cleanup_fails(
+    tmp_path, monkeypatch, fail_after_delete,
+):
+    db_path = tmp_path / "lcm.db"
+    lifecycle = LifecycleStateStore(db_path)
+    dag = SummaryDAG(db_path)
+    try:
+        lifecycle.bind_session("old", conversation_id="chat-a")
+        lifecycle.finalize_session("chat-a", "old", frontier_store_id=42)
+        dag.add_node(SummaryNode(session_id="old", depth=2, summary="old carry"))
+
+        original_delete = SummaryDAG.delete_session_nodes
+
+        def fail_once(self, session_id, *, on_deleted_batch=None):
+            if fail_after_delete:
+                original_delete(self, session_id, on_deleted_batch=on_deleted_batch)
+            raise OSError("injected node cleanup failure")
+
+        monkeypatch.setattr(SummaryDAG, "delete_session_nodes", fail_once)
+        with pytest.raises(OSError, match="injected node cleanup failure"):
+            reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")
+        assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id == "old"
+
+        monkeypatch.setattr(SummaryDAG, "delete_session_nodes", original_delete)
+        assert reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")["found"] is True
+        assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id is None
+        assert dag.get_session_nodes("old") == []
+    finally:
+        dag.close()
+        lifecycle.close()
+
+
 def test_late_old_finalize_does_not_rearm_explicit_new_carry(tmp_path):
     db_path = tmp_path / "lcm.db"
     lifecycle = LifecycleStateStore(db_path)
