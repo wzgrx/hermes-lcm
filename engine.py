@@ -2203,6 +2203,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_id = self._session_id
             conversation_id = self._conversation_id
             config = copy.deepcopy(self._config)
+            engine_type = type(self)
             hermes_home = self._hermes_home
             database_path = Path(self._storage_db_path).resolve()
             key = (str(database_path), f"async-compaction:{conversation_id}:{session_id}")
@@ -2213,12 +2214,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # source snapshot are rechecked by the private preparer.
                 worker = None
                 try:
-                    worker = type(self)(config=config, hermes_home=hermes_home,
-                                        _lazy_storage=True)
+                    worker = engine_type(config=config, hermes_home=hermes_home,
+                                         _lazy_storage=True)
                     worker._storage_db_path = database_path
                     worker._session_id = session_id
                     worker._conversation_id = conversation_id
-                    worker.prepare_background_compaction_once()
+                    seen: set[str] = set()
+                    for _ in range(min(4, max(1, int(config.async_background_compaction_max_batches)))):
+                        batch = worker.prepare_background_compaction_once()
+                        if (
+                            not batch or batch["state"] != "ready"
+                            or batch["batch_id"] in seen
+                        ):
+                            break
+                        seen.add(batch["batch_id"])
                 except Exception:
                     logger.warning("LCM background compaction preparation failed",
                                    exc_info=True)
@@ -2371,6 +2380,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if state is None or state.current_session_id != self._session_id:
             return None
         frontier = int(state.current_frontier_store_id or 0)
+        store.retire_unbound_batches(
+            conversation_id=self._conversation_id,
+            current_session_id=self._session_id,
+        )
 
         if host_config is None:
             try:
@@ -2397,19 +2410,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 300.0, 2.0 * self._config.summary_timeout_ms / 1000,
             ),
         )
-
-        existing = store.active_batch_for_frontier(
+        store.retire_unreachable_batches(
             conversation_id=self._conversation_id,
             session_id=self._session_id,
-            frontier_store_id=frontier,
         )
-        if existing is not None:
-            return (
-                existing
-                if existing["policy_fingerprint"] == policy_hash
-                and existing["summary_route_fingerprint"] == route_hash
-                else None
+
+        max_batches = max(1, int(self._config.async_background_compaction_max_batches))
+        last_ready: dict[str, Any] | None = None
+        # Walk the exact ready chain, not merely the live lifecycle frontier.
+        # Each future batch is still non-canonical and can publish only after
+        # its predecessor advances the real frontier in the foreground.
+        for _ in range(max_batches):
+            existing = store.active_batch_for_frontier(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                frontier_store_id=frontier,
             )
+            if existing is None:
+                break
+            if (
+                existing["policy_fingerprint"] != policy_hash
+                or existing["summary_route_fingerprint"] != route_hash
+            ):
+                if existing["state"] == "ready":
+                    store.reject_batch(existing["batch_id"], reason="planning_route_changed")
+                return None
+            if existing["state"] != "ready":
+                return existing
+            if not store.source_snapshot_matches(existing["batch_id"]):
+                store.reject_batch(existing["batch_id"], reason="planning_source_changed")
+                return None
+            last_ready = existing
+            frontier = int(existing["frontier_end_store_id"])
+        if last_ready is not None and (
+            store.active_batch_for_frontier(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                frontier_store_id=frontier,
+            ) is not None
+            or store.counts(conversation_id=self._conversation_id)["ready"] >= max_batches
+        ):
+            return last_ready
         blocked_until = store.retry_blocked_until(
             conversation_id=self._conversation_id,
             session_id=self._session_id,
@@ -2418,10 +2459,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if blocked_until is not None and blocked_until > time.time():
             return None
         counts = store.counts(conversation_id=self._conversation_id)
-        if sum(counts[key] for key in ("pending", "preparing", "ready")) >= max(
-            1, int(self._config.async_background_compaction_max_batches)
-        ):
-            return None
+        if sum(counts[key] for key in ("pending", "preparing", "ready")) >= max_batches:
+            return last_ready
 
         fresh_tail, _boundary = self._get_session_fresh_tail(
             self._session_id, minimum_count=1,
@@ -2499,6 +2538,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 policy_fingerprint=policy_hash,
                 summary_route_fingerprint=route_hash,
                 expected_leaf_count=1,
+                require_frontier_chain=True,
             )
         except sqlite3.IntegrityError:
             # Another preparer won the durable frontier claim. Reuse its work
@@ -2514,6 +2554,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and existing["summary_route_fingerprint"] == route_hash
                 else None
             )
+        except ValueError:
+            # The binding or predecessor chain changed between planning and
+            # the atomic batch claim. Foreground behavior remains unchanged.
+            return None
         if plan["source_ids"] != source_ids:
             store.fail_batch(
                 batch_id, error_type="SourceSnapshotChanged", backoff_seconds=0,

@@ -13,6 +13,7 @@ import pytest
 from hermes_lcm.async_compaction_store import AsyncCompactionStore, _CREATE_BATCHES
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.store import MessageStore
 
 
@@ -23,6 +24,11 @@ def _seed_sources(core: MessageStore) -> None:
             {"role": "user", "content": f"source {idx}"},
             conversation_id="conversation-1",
         )
+    lifecycle = LifecycleStateStore(core.db_path)
+    try:
+        lifecycle.bind_session("session-1", conversation_id="conversation-1")
+    finally:
+        lifecycle.close()
 
 
 def _create_batch(store: AsyncCompactionStore, *, batch_id: str = "batch-1") -> dict:
@@ -188,6 +194,27 @@ def test_restart_recovery_releases_only_abandoned_incomplete_claims(tmp_path):
                 stale_after_seconds=300,
             ) == 0
             assert reopened.get_batch("batch-2")["state"] == "ready"
+    finally:
+        core.close()
+
+
+def test_session_reset_retires_old_queue_claims(tmp_path):
+    db_path = tmp_path / "session-reset.db"
+    core = MessageStore(db_path)
+    try:
+        _seed_sources(core)
+        with AsyncCompactionStore(db_path, enabled=True) as store:
+            _create_batch(store)
+            lifecycle = LifecycleStateStore(db_path)
+            try:
+                lifecycle.bind_session("session-2", conversation_id="conversation-1")
+            finally:
+                lifecycle.close()
+            assert store.retire_unbound_batches(
+                conversation_id="conversation-1", current_session_id="session-2",
+            ) == 1
+            assert store.get_batch("batch-1")["state"] == "superseded"
+            assert store.counts(conversation_id="conversation-1")["pending"] == 0
     finally:
         core.close()
 

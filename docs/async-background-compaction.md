@@ -148,6 +148,15 @@ already accepted preparation intact. Incomplete claims older than twice the
 provider timeout (minimum five minutes) are released for retry after process
 restart. Ready batches remain durable and are revalidated at promotion.
 
+The worker can now prepare a consecutive ready chain ahead of the live frontier
+(default at most two batches; at most four preparations in one scheduled pass).
+Each future claim validates a ready predecessor and source identities inside
+its write transaction. Foreground promotion still consumes one batch at a time
+in frontier order; a future batch remains inactive until its predecessor has
+committed. The next preparation pass retires queue claims left unreachable by
+a session reset, failed preparation, or rejected ancestor. A provider result
+arriving after a reset or predecessor rejection cannot become ready.
+
 The first leaf can now prepare behind a stored system anchor without advancing
 the lifecycle frontier early: the batch records a separate source-selection
 frontier, and both readiness and publication revalidate that every skipped row
@@ -155,10 +164,10 @@ is still a system anchor. The one publication transaction still moves the
 canonical frontier from its original value to the leaf end.
 
 This remains an **experimental isolated branch**, not installed in the live
-Gateway. It still needs multi-leaf queue advancement, reset fences,
-emergency/partial-emergency paths, and broader race and long-session
-performance coverage before deployment. The worker flag is off by default
-even when the master feature flag is enabled.
+Gateway. It still needs deeper queue-race stress tests,
+emergency/partial-emergency paths, and long-session performance coverage
+before deployment. The worker flag is off by default even when the master
+feature flag is enabled.
 
 ## Fingerprints and validation inputs
 

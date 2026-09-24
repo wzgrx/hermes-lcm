@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import threading
 
+import pytest
+
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.async_compaction_store import AsyncCompactionStore
 from hermes_lcm.engine import LCMEngine
@@ -85,11 +87,13 @@ def test_manual_preparation_calls_provider_outside_sqlite_transaction(
         )
         assert async_check["status"] == "pass"
         assert async_check["detail"]["ready_batches"] == 1
-        assert (
-            engine.prepare_background_compaction_once(host_config={})["batch_id"]
-            == batch["batch_id"]
-        )
-        assert len(calls) == 1
+        next_batch = engine.prepare_background_compaction_once(host_config={})
+        assert next_batch["state"] == "ready"
+        assert next_batch["batch_id"] != batch["batch_id"]
+        assert next_batch["frontier_start_store_id"] == batch["frontier_end_store_id"]
+        assert engine.prepare_background_compaction_once(host_config={})["batch_id"] == next_batch["batch_id"]
+        assert len(calls) == 2
+        assert engine._dag.get_session_node_count("session-1") == 0
     finally:
         engine.shutdown()
 
@@ -183,7 +187,7 @@ def test_ingest_schedules_private_background_preparation(tmp_path, monkeypatch):
         assert provider_threads
         assert all(name != threading.main_thread().name for name in provider_threads)
         assert engine.get_async_compaction_status()["worker_enabled"] is True
-        assert engine._async_compaction_store.counts()["ready"] == 1
+        assert engine._async_compaction_store.counts()["ready"] == 2
         assert engine._dag.get_session_node_count("session-1") == 0
     finally:
         engine.shutdown(wait_for_background_work=True)
@@ -217,7 +221,7 @@ def test_background_provider_survives_foreground_engine_retirement(
         release.set()
         assert _ASYNC_COMPACTION_SCHEDULER.drain_owner(owner, timeout=10)
         with AsyncCompactionStore(db_path, enabled=True) as reopened:
-            assert reopened.counts()["ready"] == 1
+            assert reopened.counts()["ready"] == 2
     finally:
         release.set()
         _ASYNC_COMPACTION_SCHEDULER.drain_owner(owner, timeout=10)
@@ -250,6 +254,25 @@ def test_source_rewrite_during_summary_preparation_fails_closed(tmp_path, monkey
         )
         assert engine.prepare_background_compaction_once(host_config={}) is None
         assert engine._async_compaction_store.counts()["failed"] == 1
+    finally:
+        engine.shutdown()
+
+
+def test_session_reset_during_provider_cannot_ready_old_batch(tmp_path, monkeypatch):
+    engine = _engine_with_stable_backlog(tmp_path)
+    try:
+        def summarize(**_kwargs):
+            engine._lifecycle.bind_session(
+                "session-2", conversation_id="conversation-1",
+            )
+            return "Summary produced after a session reset.", 1
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+        batch = engine.prepare_background_compaction_once(host_config={})
+        assert batch["state"] == "failed"
+        assert batch["last_error"] == "ValueError"
+        assert engine._dag.get_session_node_count("session-1") == 0
+        assert engine._async_compaction_store.counts()["ready"] == 0
     finally:
         engine.shutdown()
 
@@ -328,6 +351,119 @@ def test_foreground_compress_consumes_ready_leaf_without_provider_call(
             "Prepared summary of old turns." in str(msg.get("content"))
             for msg in output
         )
+    finally:
+        engine.shutdown()
+
+
+def test_two_prepared_leaves_publish_in_frontier_order(tmp_path, monkeypatch):
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    calls = []
+    try:
+        def summarize(**_kwargs):
+            calls.append(True)
+            return f"Prepared leaf {len(calls)}.", 1
+
+        monkeypatch.setattr("hermes_lcm.engine.summarize_with_escalation", summarize)
+        first = engine.prepare_background_compaction_once(host_config={})
+        second = engine.prepare_background_compaction_once(host_config={})
+        assert first["state"] == second["state"] == "ready"
+        assert second["frontier_start_store_id"] == first["frontier_end_store_id"]
+        assert len(calls) == 2
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+
+        def unexpected_provider(**_kwargs):
+            raise AssertionError("both foreground leaves must reuse staged summaries")
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation", unexpected_provider,
+        )
+        messages = [
+            engine._store.to_openai_msg(row)
+            for row in engine._store.get_session_messages("session-1")
+        ]
+        after_first = engine.compress(messages, current_tokens=900)
+        store = engine._async_compaction_store
+        assert store.get_batch(first["batch_id"])["state"] == "promoted"
+        assert store.get_batch(second["batch_id"])["state"] == "ready"
+        assert engine._lifecycle.get_by_conversation("conversation-1").current_frontier_store_id == first["frontier_end_store_id"]
+        after_second = engine.compress(after_first, current_tokens=900)
+        assert store.get_batch(second["batch_id"])["state"] == "promoted"
+        assert engine._lifecycle.get_by_conversation("conversation-1").current_frontier_store_id == second["frontier_end_store_id"]
+        assert any("Prepared leaf 2." in str(msg.get("content")) for msg in after_second)
+    finally:
+        engine.shutdown()
+
+
+def test_rejected_predecessor_retires_unreachable_ready_descendant(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("A prepared leaf.", 1),
+        )
+        first = engine.prepare_background_compaction_once(host_config={})
+        second = engine.prepare_background_compaction_once(host_config={})
+        store = engine._async_compaction_store
+        assert store.reject_batch(first["batch_id"], reason="test_source_changed")
+        replacement = engine.prepare_background_compaction_once(host_config={})
+        assert replacement["state"] == "ready"
+        assert replacement["batch_id"] != first["batch_id"]
+        assert store.get_batch(second["batch_id"])["state"] == "superseded"
+        assert store.counts()["ready"] == 1
+    finally:
+        engine.shutdown()
+
+
+def test_future_batch_claim_requires_a_ready_frontier_chain(tmp_path):
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    try:
+        with pytest.raises(ValueError, match="no ready predecessor"):
+            engine._async_compaction_store.create_batch(
+                batch_id="unreachable",
+                conversation_id="conversation-1",
+                session_id="session-1",
+                frontier_start_store_id=3,
+                frontier_end_store_id=4,
+                fresh_tail_count=2,
+                leaf_chunk_tokens=20,
+                policy_fingerprint="policy",
+                summary_route_fingerprint="route",
+                expected_leaf_count=1,
+                require_frontier_chain=True,
+            )
+        assert engine._async_compaction_store.get_batch("unreachable") is None
+    finally:
+        engine.shutdown()
+
+
+def test_predecessor_rejected_during_second_provider_blocks_readiness(
+    tmp_path, monkeypatch,
+):
+    engine = _engine_with_stable_backlog(tmp_path, advance_anchor=False)
+    try:
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            lambda **_kwargs: ("First prepared leaf.", 1),
+        )
+        first = engine.prepare_background_compaction_once(host_config={})
+        assert first["state"] == "ready"
+
+        def summarize_after_rejection(**_kwargs):
+            engine._async_compaction_store.reject_batch(
+                first["batch_id"], reason="test_parent_rejected",
+            )
+            return "Second leaf after parent rejection.", 1
+
+        monkeypatch.setattr(
+            "hermes_lcm.engine.summarize_with_escalation",
+            summarize_after_rejection,
+        )
+        second = engine.prepare_background_compaction_once(host_config={})
+        assert second["state"] == "failed"
+        assert second["last_error"] == "ValueError"
+        assert engine._dag.get_session_node_count("session-1") == 0
     finally:
         engine.shutdown()
 

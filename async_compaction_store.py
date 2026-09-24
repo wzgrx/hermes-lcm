@@ -255,6 +255,7 @@ class AsyncCompactionStore:
         policy_fingerprint: str,
         summary_route_fingerprint: str,
         expected_leaf_count: int,
+        require_frontier_chain: bool = False,
     ) -> dict:
         """Snapshot exact raw source rows and record a planning fence atomically.
 
@@ -279,6 +280,63 @@ class AsyncCompactionStore:
         conn = self.connection
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if require_frontier_chain:
+                lifecycle = conn.execute(
+                    "SELECT current_session_id, current_frontier_store_id "
+                    "FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if lifecycle is None or lifecycle["current_session_id"] != session_id:
+                    raise ValueError("session binding changed before batch claim")
+                cursor = frontier_start_store_id
+                chain_depth = 0
+                while cursor != lifecycle["current_frontier_store_id"]:
+                    chain_depth += 1
+                    if (
+                        chain_depth > 256
+                        or cursor < lifecycle["current_frontier_store_id"]
+                    ):
+                        raise ValueError("virtual frontier chain is invalid")
+                    predecessor = conn.execute(
+                        """SELECT * FROM lcm_compaction_batches
+                           WHERE conversation_id = ? AND session_id = ?
+                             AND frontier_end_store_id = ? AND state = 'ready'
+                             AND policy_fingerprint = ?
+                             AND summary_route_fingerprint = ?
+                           ORDER BY created_at DESC LIMIT 1""",
+                        (conversation_id, session_id, cursor,
+                         policy_fingerprint, summary_route_fingerprint),
+                    ).fetchone()
+                    if predecessor is None:
+                        raise ValueError("virtual frontier has no ready predecessor")
+                    predecessor_ids, predecessor_hashes = self._source_snapshot(
+                        conn,
+                        conversation_id=conversation_id,
+                        session_id=session_id,
+                        frontier_start_store_id=predecessor[
+                            "source_frontier_start_store_id"
+                        ],
+                        frontier_end_store_id=predecessor["frontier_end_store_id"],
+                    )
+                    if (
+                        not self._skipped_system_prefix_matches(
+                            conn,
+                            conversation_id=conversation_id,
+                            session_id=session_id,
+                            frontier_start_store_id=predecessor[
+                                "frontier_start_store_id"
+                            ],
+                            source_frontier_start_store_id=predecessor[
+                                "source_frontier_start_store_id"
+                            ],
+                        )
+                        or predecessor_ids != json.loads(predecessor["source_ids_json"])
+                        or predecessor_hashes != json.loads(
+                            predecessor["source_identity_hashes_json"]
+                        )
+                    ):
+                        raise ValueError("ready predecessor source changed")
+                    cursor = int(predecessor["frontier_start_store_id"])
             if not self._skipped_system_prefix_matches(
                 conn, conversation_id=conversation_id, session_id=session_id,
                 frontier_start_store_id=frontier_start_store_id,
@@ -498,6 +556,70 @@ class AsyncCompactionStore:
             raise
 
     @_synchronized
+    def retire_unbound_batches(
+        self, *, conversation_id: str, current_session_id: str,
+    ) -> int:
+        """Drop obsolete queue claims after a conversation changes session."""
+        updated = self.connection.execute(
+            """UPDATE lcm_compaction_batches
+               SET state = 'superseded', updated_at = ?
+               WHERE conversation_id = ? AND session_id != ?
+                 AND state IN ('pending', 'preparing', 'ready')""",
+            (time.time(), conversation_id, current_session_id),
+        )
+        return updated.rowcount
+
+    @_synchronized
+    def retire_unreachable_batches(
+        self, *, conversation_id: str, session_id: str,
+    ) -> int:
+        """Remove queue descendants with no live, consecutive ready ancestor."""
+        conn = self.connection
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            lifecycle = conn.execute(
+                "SELECT current_session_id, current_frontier_store_id "
+                "FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            rows = conn.execute(
+                """SELECT batch_id, state, frontier_start_store_id,
+                          frontier_end_store_id
+                   FROM lcm_compaction_batches
+                   WHERE conversation_id = ? AND session_id = ?
+                     AND state IN ('pending', 'preparing', 'ready')""",
+                (conversation_id, session_id),
+            ).fetchall()
+            by_start = {int(row["frontier_start_store_id"]): row for row in rows}
+            keep: set[str] = set()
+            if lifecycle is not None and lifecycle["current_session_id"] == session_id:
+                cursor = int(lifecycle["current_frontier_store_id"] or 0)
+                while cursor in by_start and len(keep) < len(rows):
+                    row = by_start[cursor]
+                    keep.add(str(row["batch_id"]))
+                    if row["state"] != "ready":
+                        break
+                    next_cursor = int(row["frontier_end_store_id"])
+                    if next_cursor <= cursor:
+                        break
+                    cursor = next_cursor
+            retired = 0
+            for row in rows:
+                if str(row["batch_id"]) in keep:
+                    continue
+                retired += conn.execute(
+                    """UPDATE lcm_compaction_batches
+                       SET state = 'superseded', updated_at = ?
+                       WHERE batch_id = ? AND state IN ('pending', 'preparing', 'ready')""",
+                    (time.time(), row["batch_id"]),
+                ).rowcount
+            conn.execute("COMMIT")
+            return retired
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    @_synchronized
     def mark_preparing(self, batch_id: str) -> bool:
         """Mark the provider phase without holding a transaction during it."""
         updated = self.connection.execute(
@@ -701,6 +823,32 @@ class AsyncCompactionStore:
             ).fetchone()
             if batch is None or batch["state"] != "preparing":
                 raise ValueError("batch is not preparing")
+            lifecycle = conn.execute(
+                "SELECT current_session_id, current_frontier_store_id "
+                "FROM lcm_lifecycle_state "
+                "WHERE conversation_id = ?",
+                (batch["conversation_id"],),
+            ).fetchone()
+            if (
+                lifecycle is None
+                or lifecycle["current_session_id"] != batch["session_id"]
+            ):
+                raise ValueError("session binding changed during preparation")
+            if lifecycle["current_frontier_store_id"] != batch["frontier_start_store_id"]:
+                predecessor = conn.execute(
+                    """SELECT batch_id FROM lcm_compaction_batches
+                       WHERE conversation_id = ? AND session_id = ?
+                         AND frontier_end_store_id = ? AND state = 'ready'
+                         AND policy_fingerprint = ?
+                         AND summary_route_fingerprint = ?
+                       LIMIT 1""",
+                    (batch["conversation_id"], batch["session_id"],
+                     batch["frontier_start_store_id"],
+                     batch["policy_fingerprint"],
+                     batch["summary_route_fingerprint"]),
+                ).fetchone()
+                if predecessor is None:
+                    raise ValueError("predecessor changed during preparation")
             leaves = conn.execute(
                 "SELECT source_ids, source_identity_hashes "
                 "FROM lcm_pending_summary_nodes WHERE batch_id = ? "
