@@ -201,10 +201,14 @@ default even when the master feature flag is enabled.
 The same offline harness accepts `--old-messages`, `--max-batches`, and
 `--turns` to stress a multi-leaf backlog across successive turn boundaries.
 It compares cumulative foreground time only when both modes cover
-the same raw source IDs **and every requested old source**; matching partial
-coverage is not a valid speedup comparison. Neither check establishes equal
-summary quality. The report distinguishes coverage parity from completeness
-and leaves `foreground_median_reduction_percent` unset when either fails.
+the same raw source IDs, every requested old source, **and the same ordered
+leaf source groups**. Matching only the union hid a real preparer error: it
+kept adding messages until it reached the target, while foreground selection
+stopped before the next message would exceed it. The preparer now follows the
+foreground boundary, except that an in-flight tool-call group stays intact.
+The report leaves `foreground_median_reduction_percent` unset when these
+partition/coverage gates fail. They still do not establish equal summary
+quality.
 The initial multi-leaf fixture inserted rows with `token_estimate=0` (the
 `MessageStore.append()` default), unlike the production ingest path, which
 persists per-message estimates. Dynamic preparation therefore saw a zero-token
@@ -217,32 +221,26 @@ its dynamic target. It does not rewrite historical rows or scan the full
 transcript. The preparation policy fingerprint changed to v2, so old planned
 batches are revalidated rather than silently reused after this selection change.
 
-On 2026-09-24, five runs of **two turns** with eight approximately 3,000-token
-old messages, a queue cap of two, and a fixed 50 ms summarizer stub yielded:
+After fixing the partition mismatch, five runs of **five turns** with a fixed
+50 ms summarizer stub gave the following paired results. Both modes covered
+all old source IDs, retained all raw rows, and formed identical leaf source
+groups; each synchronous run made three foreground provider calls.
 
-| Initial old-row estimates | Cumulative foreground median, staged / sync | Off-turn preparation median | Provider calls over five runs, staged / sync |
-| --- | ---: | ---: | ---: |
-| Present (normal ingest) | 6.0 / 159.8 ms | 105.8 ms | 10 (all off-turn) / 15 |
-| Missing (legacy/direct insert) | 6.1 / 160.6 ms | 105.9 ms | 10 (all off-turn) / 15 |
+| Old messages | Queue cap | Foreground median, staged / sync | Staged provider calls over five runs, foreground / off-turn |
+| ---: | ---: | ---: | ---: |
+| 8 | 2 | 60.5 / 163.2 ms | 5 / 10 |
+| 8 | 4 | 9.4 / 162.0 ms | 0 / 15 |
+| 16 | 2 | 61.1 / 163.9 ms | 5 / 10 |
+| 16 | 4 | 11.7 / 163.4 ms | 0 / 15 |
 
-Both modes covered all eight old source IDs by the first turn and retained all
-raw rows; the second turn adds a fresh synthetic reply/request. These are
-fixed-delay scheduling numbers, not real-provider latency, summary quality,
-token spend, or a recommendation to enable the worker globally. A run with
-`--missing-token-estimates` exercises the legacy case explicitly; the default
-models production ingest. The deliberately low threshold forces compaction and
-does not forecast the live Hermes threshold or network latency.
-
-A larger five-turn fixture with 16 old messages needs three leaf summaries.
-With the former cap of two, the staged path prepared two leaves off-turn but
-still made all three foreground provider calls: five-run medians were 171.1 ms
-staged versus 169.0 ms synchronous. With a cap of four, all three leaves were
-ready before the turn and the same fixture measured 13.3 ms staged versus
-168.7 ms synchronous, with zero staged foreground provider calls. Both cases
-retained all raw rows and covered all 16 old sources. The default cap is now
-four, matching the worker's existing per-pass limit; operators can lower it
-to bound speculative provider spend. These fixed-delay measurements do not
-establish real-provider latency or summary quality.
+The cap of two leaves the third leaf for foreground work; the new default of
+four prepares all three off-turn in these fixtures. Earlier results in this
+document compared different leaf partitions and must not be used as a latency
+claim. A run with `--missing-token-estimates` exercises legacy/direct inserts;
+the default models production ingest. These fixed-delay numbers are not
+real-provider latency, summary quality, token spend, or a recommendation to
+enable the experimental worker globally. The deliberately low threshold
+forces compaction and does not forecast the live Hermes threshold.
 
 ## Executable acceptance coverage
 

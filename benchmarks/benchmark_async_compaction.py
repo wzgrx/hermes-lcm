@@ -171,6 +171,10 @@ def _run_once(root: Path, *, staged: bool, source_tokens: int,
             "covered_old_messages_by_turn": covered_old_messages_by_turn,
             "raw_rows": len(engine._store.get_session_messages("benchmark-session")),
             "canonical_nodes": len(nodes),
+            "leaf_source_groups": sorted(
+                (list(node.source_ids) for node in nodes if node.depth == 0),
+                key=lambda ids: ids[0] if ids else -1,
+            ),
             "covered_source_ids": covered_ids,
             "old_source_ids": source_ids,
         }
@@ -196,6 +200,14 @@ def _source_coverage(samples: dict[str, list[dict]]) -> tuple[bool, bool]:
         for mode in samples.values() for item in mode
     )
     return matches, complete
+
+
+def _source_partition_matches(samples: dict[str, list[dict]]) -> bool:
+    """A latency comparison should summarize the same leaves, not just their union."""
+    return all(
+        left["leaf_source_groups"] == right["leaf_source_groups"]
+        for left, right in zip(samples["synchronous"], samples["staged"], strict=True)
+    )
 
 
 def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
@@ -226,7 +238,8 @@ def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
     baseline_median = statistics.median(baseline)
     staged_median = statistics.median(staged)
     coverage_matches, coverage_complete = _source_coverage(samples)
-    comparable = coverage_matches and coverage_complete
+    partition_matches = _source_partition_matches(samples)
+    comparable = coverage_matches and coverage_complete and partition_matches
     return {
         "workload": (
             "synthetic_multi_turns" if turns > 1 else
@@ -258,6 +271,9 @@ def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
             "covered_old_messages_per_run": [
                 len(set(item["covered_source_ids"]) & set(item["old_source_ids"]))
                 for item in samples["synchronous"]
+            ],
+            "leaf_source_groups_per_run": [
+                item["leaf_source_groups"] for item in samples["synchronous"]
             ],
         },
         "staged": {
@@ -292,6 +308,9 @@ def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
                 len(set(item["covered_source_ids"]) & set(item["old_source_ids"]))
                 for item in samples["staged"]
             ],
+            "leaf_source_groups_per_run": [
+                item["leaf_source_groups"] for item in samples["staged"]
+            ],
         },
         "foreground_median_reduction_percent": round(
             100 * (1 - staged_median / baseline_median), 2
@@ -302,6 +321,7 @@ def run_benchmark(*, repeats: int = 5, source_tokens: int = 10_000,
                 item["canonical_nodes"] == 1 for mode in samples.values() for item in mode
             ) if old_messages == 1 else None,
             "source_coverage_matches_baseline": coverage_matches,
+            "source_partition_matches_baseline": partition_matches,
             "all_old_sources_covered": coverage_complete,
             "all_raw_rows_retained": all(
                 item["raw_rows"] == old_messages + 3 + 2 * (turns - 1)

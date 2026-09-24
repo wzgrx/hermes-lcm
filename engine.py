@@ -2521,10 +2521,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         pending_tool_calls: set[str] = set()
         used_tokens = 0
         used_chars = 0
+        hit_chunk_boundary = False
         for row in rows:
             if row["role"] == "system" or row.get("pinned"):
                 return None
             message = self._store.to_openai_msg(row)
+            message_tokens = count_message_tokens(message)
+            # Match foreground _select_oldest_leaf_chunk: stop *before* a row
+            # would exceed the working target. A prepared leaf that instead
+            # waits until used_tokens >= target shifts the source partition and
+            # makes staged/foreground quality and latency incomparable. Keep
+            # an in-flight tool-call group intact even when it crosses target.
+            if (
+                selected_rows and used_tokens + message_tokens > target_tokens
+                and not pending_tool_calls
+            ):
+                hit_chunk_boundary = True
+                break
             content = str(message.get("content") or "")
             if self._content_has_externalized_placeholder_ref(content):
                 return None
@@ -2533,7 +2546,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return None
             selected_rows.append(row)
             selected_messages.append(message)
-            used_tokens += count_message_tokens(message)
+            used_tokens += message_tokens
             if message.get("role") == "assistant":
                 for call in message.get("tool_calls") or []:
                     if isinstance(call, dict) and call.get("id"):
@@ -2543,9 +2556,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if not tool_call_id or tool_call_id not in pending_tool_calls:
                     return None
                 pending_tool_calls.discard(tool_call_id)
-            if used_tokens >= target_tokens and not pending_tool_calls:
-                break
-        if used_tokens < target_tokens or pending_tool_calls:
+        if (used_tokens < target_tokens and not hit_chunk_boundary) or pending_tool_calls:
             return None
         source_ids = [int(row["store_id"]) for row in selected_rows]
         if self._dag.get_covered_message_ids(

@@ -32,10 +32,11 @@ aggregate JSON; individual runs and temporary paths are not retained.
 
 For a bounded multi-leaf queue check, use `--old-messages 16 --turns 5
 --source-tokens 3000 --provider-delay-ms 50` and compare `--max-batches 2`
-against `--max-batches 4`. The two-batch cap leaves a third leaf for foreground
-summarization; four permits the worker to prepare all three in this fixture.
-Compare both source coverage and foreground provider-call counts, not latency
-percentage alone. Four is the experimental default, not a real-provider tuning
+against `--max-batches 4`. The two-batch cap leaves one of three leaves for
+foreground summarization; four permits the worker to prepare all three in this
+fixture. The comparability gate requires identical leaf source groups, not
+merely the same source union; an earlier version of this benchmark missed that
+distinction. Four is the experimental default, not a real-provider tuning
 recommendation.
 
 ## Active tool-result stubbing benchmark
