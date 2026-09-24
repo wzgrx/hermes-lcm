@@ -420,6 +420,7 @@ class SummaryDAG:
         *,
         min_depth: int | None,
         on_deleted_batch: Callable[[list[int]], None] | None,
+        on_deleted_batch_in_transaction: Callable[[sqlite3.Connection, list[int]], None] | None = None,
     ) -> int:
         deleted = 0
         while True:
@@ -431,6 +432,8 @@ class SummaryDAG:
                         (session_id,),
                         min_depth=min_depth,
                     )
+                    if node_ids and on_deleted_batch_in_transaction is not None:
+                        on_deleted_batch_in_transaction(self._conn, node_ids)
                     self._conn.commit()
                 except Exception:
                     self._conn.rollback()
@@ -464,12 +467,19 @@ class SummaryDAG:
         session_id: str,
         *,
         on_deleted_batch: Callable[[list[int]], None] | None = None,
+        on_deleted_batch_in_transaction: Callable[[sqlite3.Connection, list[int]], None] | None = None,
     ) -> int:
-        """Delete all nodes for a session. Returns count deleted."""
+        """Delete all nodes for a session. Returns count deleted.
+
+        The optional in-transaction callback runs once per bounded batch on
+        this connection, before commit. A callback failure rolls that batch
+        back with its node deletion; prior batches remain committed.
+        """
         return self._delete_nodes_batched(
             session_id,
             min_depth=None,
             on_deleted_batch=on_deleted_batch,
+            on_deleted_batch_in_transaction=on_deleted_batch_in_transaction,
         )
 
     def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:

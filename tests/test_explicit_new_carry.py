@@ -135,9 +135,13 @@ def test_explicit_new_keeps_carry_retryable_when_node_cleanup_fails(
 
         original_delete = SummaryDAG.delete_session_nodes
 
-        def fail_once(self, session_id, *, on_deleted_batch=None):
+        def fail_once(self, session_id, *, on_deleted_batch=None, on_deleted_batch_in_transaction=None):
             if fail_after_delete:
-                original_delete(self, session_id, on_deleted_batch=on_deleted_batch)
+                original_delete(
+                    self, session_id,
+                    on_deleted_batch=on_deleted_batch,
+                    on_deleted_batch_in_transaction=on_deleted_batch_in_transaction,
+                )
             raise OSError("injected node cleanup failure")
 
         monkeypatch.setattr(SummaryDAG, "delete_session_nodes", fail_once)
@@ -150,6 +154,114 @@ def test_explicit_new_keeps_carry_retryable_when_node_cleanup_fails(
         assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id is None
         assert dag.get_session_nodes("old") == []
     finally:
+        dag.close()
+        lifecycle.close()
+
+
+def test_explicit_new_rolls_back_node_when_embedding_cleanup_fails(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "lcm.db"
+    lifecycle = LifecycleStateStore(db_path)
+    dag = SummaryDAG(db_path)
+    vectors = VectorStore(db_path)
+    try:
+        lifecycle.bind_session("old", conversation_id="chat-a")
+        lifecycle.finalize_session("chat-a", "old", frontier_store_id=42)
+        node_id = dag.add_node(SummaryNode(session_id="old", depth=2, summary="old carry"))
+        identity = vectors.register_profile("cleanup-test", "local", 2)
+        vectors.connection.execute(
+            "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) VALUES (?, ?, ?)",
+            (str(node_id), identity, bytes(8)),
+        )
+        vectors.connection.execute(
+            "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, identity_hash, embedded_at, source_token_count, archived) "
+            "VALUES (?, 'summary', ?, '2026-01-01', 1, 0)",
+            (str(node_id), identity),
+        )
+        vectors.connection.commit()
+
+        original_purge = VectorStore.purge_embedding_batch_on_connection
+
+        def fail_purge(_conn, _node_ids):
+            raise sqlite3.OperationalError("injected embedding cleanup failure")
+
+        monkeypatch.setattr(VectorStore, "purge_embedding_batch_on_connection", staticmethod(fail_purge))
+        with pytest.raises(sqlite3.OperationalError, match="injected embedding cleanup failure"):
+            reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")
+        assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id == "old"
+        assert dag.get_node(node_id) is not None
+        assert vectors.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_vectors WHERE embedded_id = ?", (str(node_id),)
+        ).fetchone()[0] == 1
+
+        monkeypatch.setattr(VectorStore, "purge_embedding_batch_on_connection", staticmethod(original_purge))
+        assert reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")["found"] is True
+        assert dag.get_node(node_id) is None
+        assert vectors.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_vectors WHERE embedded_id = ?", (str(node_id),)
+        ).fetchone()[0] == 0
+    finally:
+        vectors.close()
+        dag.close()
+        lifecycle.close()
+
+
+def test_explicit_new_retries_remaining_batches_after_late_embedding_failure(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "lcm.db"
+    lifecycle = LifecycleStateStore(db_path)
+    dag = SummaryDAG(db_path)
+    vectors = VectorStore(db_path)
+    try:
+        lifecycle.bind_session("old", conversation_id="chat-a")
+        lifecycle.finalize_session("chat-a", "old", frontier_store_id=42)
+        ids = list(range(1, 301))
+        dag.connection.executemany(
+            "INSERT INTO summary_nodes(node_id, session_id, depth, summary, source_token_count, "
+            "source_ids, source_type, created_at) VALUES (?, 'old', 0, 'summary', 1, '[]', 'messages', ?)",
+            ((node_id, float(node_id)) for node_id in ids),
+        )
+        dag.connection.commit()
+        identity = vectors.register_profile("cleanup-test", "local", 2)
+        vectors.connection.executemany(
+            "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) VALUES (?, ?, ?)",
+            ((str(node_id), identity, bytes(8)) for node_id in ids),
+        )
+        vectors.connection.executemany(
+            "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, identity_hash, embedded_at, "
+            "source_token_count, archived) VALUES (?, 'summary', ?, '2026-01-01', 1, 0)",
+            ((str(node_id), identity) for node_id in ids),
+        )
+        vectors.connection.commit()
+
+        original_purge = VectorStore.purge_embedding_batch_on_connection
+        calls = 0
+
+        def fail_second(conn, node_ids):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise sqlite3.OperationalError("second embedding batch failed")
+            return original_purge(conn, node_ids)
+
+        monkeypatch.setattr(VectorStore, "purge_embedding_batch_on_connection", staticmethod(fail_second))
+        with pytest.raises(sqlite3.OperationalError, match="second embedding batch failed"):
+            reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")
+        assert calls == 2
+        assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id == "old"
+        assert dag.get_session_node_count("old") == 44
+        assert vectors.connection.execute("SELECT COUNT(*) FROM lcm_embedding_vectors").fetchone()[0] == 44
+
+        monkeypatch.setattr(VectorStore, "purge_embedding_batch_on_connection", staticmethod(original_purge))
+        result = reset_explicit_new_carry(db_path, "old", conversation_id="chat-a")
+        assert result["deleted_nodes"] == 44
+        assert lifecycle.get_by_conversation("chat-a").last_finalized_session_id is None
+        assert dag.get_session_node_count("old") == 0
+        assert vectors.connection.execute("SELECT COUNT(*) FROM lcm_embedding_vectors").fetchone()[0] == 0
+    finally:
+        vectors.close()
         dag.close()
         lifecycle.close()
 

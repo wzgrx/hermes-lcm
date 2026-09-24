@@ -128,22 +128,15 @@ def reset_explicit_new_carry(
         dag = SummaryDAG(path)
         try:
 
-            def purge_embeddings(node_ids: list[int]) -> None:
+            def purge_embeddings(conn: sqlite3.Connection, node_ids: list[int]) -> None:
                 # Summary nodes and vector rows share this SQLite database.
-                # The delete callback is bounded to 256 ids by SummaryDAG.
-                try:
-                    VectorStore.purge_embedding_batch_on_connection(
-                        dag.connection, node_ids
-                    )
-                    dag.connection.commit()
-                except Exception:
-                    dag.connection.rollback()
-                    logger.warning(
-                        "LCM explicit /new embedding cleanup failed", exc_info=True
-                    )
+                # Each bounded batch must commit both deletions or neither.
+                VectorStore.purge_embedding_batch_on_connection(conn, node_ids)
 
             deleted = sum(
-                dag.delete_session_nodes(session_id, on_deleted_batch=purge_embeddings)
+                dag.delete_session_nodes(
+                    session_id, on_deleted_batch_in_transaction=purge_embeddings,
+                )
                 for session_id in owned_sessions
             )
         finally:
