@@ -67,6 +67,7 @@ Suggested columns:
 - `source_coverage_hash TEXT NOT NULL`
 - `source_ids_json TEXT NOT NULL` — exact ordered source IDs planned in the batch
 - `source_identity_hashes_json TEXT NOT NULL` — one identity digest per planned ID
+- `preparer_identity TEXT NOT NULL DEFAULT ''` — Linux boot/PID-namespace/process-start identity of the current owner; refreshed when another process claims preparation, with the boot ID stored only as a digest
 - `expected_leaf_count INTEGER NOT NULL`
 - `prepared_leaf_count INTEGER NOT NULL DEFAULT 0`
 - `failure_count INTEGER NOT NULL DEFAULT 0`
@@ -144,9 +145,14 @@ queues a bounded, deduplicated worker keyed by database and conversation/session
 The worker opens private SQLite helpers and uses an immutable binding snapshot;
 it does not run the provider on the foreground engine. Plugin unload drains
 accepted work, while retirement of an individual foreground engine leaves its
-already accepted preparation intact. Incomplete claims older than twice the
-provider timeout (minimum five minutes) are released for retry after process
-restart. Ready batches remain durable and are revalidated at promotion.
+already accepted preparation intact. On Linux, an incomplete claim owned by
+a provably exited process is released at store reopen (or the next recovery
+pass). If the process identity cannot be verified, the lease fallback releases
+claims older than twice the provider timeout (minimum five minutes). A live
+other process is not reclaimed by the immediate dead-owner check; the
+time-based lease still applies if a provider stalls beyond its bound. Ready
+batches remain durable and are
+revalidated at promotion.
 
 The worker can now prepare a consecutive ready chain ahead of the live frontier
 (default at most two batches; at most four preparations in one scheduled pass).
@@ -196,13 +202,12 @@ API; no design-only expected failures remain:
 | Live summary route beats staged metadata | `test_foreground_falls_back_when_summary_route_changes` |
 | Foreground and background publication race | `test_foreground_winner_fences_inflight_background_provider`, `test_two_publishers_serialize_and_publish_once` |
 | Provider failure/backoff leaves foreground usable | `test_summary_failure_records_type_only_and_enforces_backoff`, `test_background_failure_backoff_does_not_block_foreground_compaction` |
-| Restart recovery | `test_restart_recovery_releases_only_abandoned_incomplete_claims` (lease-bounded; incomplete claims are reclaimed after at least two provider timeout windows, minimum five minutes) |
+| Restart recovery | `test_live_other_process_is_preserved_then_dead_owner_recovers_on_open` (Linux dead-owner immediate recovery; live owner preserved), `test_restart_recovery_releases_only_abandoned_incomplete_claims` (lease fallback for unknown ownership) |
 | Atomic success and rollback | `test_promotion_publishes_nodes_frontier_and_batch_in_one_transaction`, `test_mid_publication_failure_rolls_back_all_canonical_changes` |
 | Status/Doctor counters | `test_manual_preparation_calls_provider_outside_sqlite_transaction` |
 
-The remaining work is not represented as a passing claim: immediate recovery
-of an incomplete claim from a provably dead process, broader multi-process
-stress, and long-session latency/quality measurements still require evidence.
+The remaining work is not represented as a passing claim: broader multi-process
+stress and long-session latency/quality measurements still require evidence.
 
 ## Fingerprints and validation inputs
 
@@ -317,14 +322,13 @@ Summary failure increments `failure_count`, stores a compact `last_error`, and s
 
 ### Restart
 
-On startup/session bind:
-
-- `promoting` from a crashed transaction should not be visible as canonical unless the transaction committed. If the batch row says `promoting` but no canonical nodes/frontier were advanced, mark it `rejected` or return it to `ready` after validation.
-- `preparing` older than a timeout becomes `pending` for retry, or `failed` if backoff policy says so.
-- `ready` batches are left ready, but promotion still revalidates live config and source coverage.
-- Pending rows are never used by active context during recovery.
-
-SQLite transaction atomicity should mean there is no half-published active state. Recovery still needs explicit cleanup of stale lifecycle labels so status/doctor is trustworthy.
+At optional-store open, `pending`/`preparing` rows owned by a provably exited
+Linux process become `failed` with an immediately eligible retry. On the next
+recovery pass, older unverifiable or stalled claims are also marked `failed`
+after the configured lease. A live owner is preserved by the immediate check.
+`ready` rows remain durable but require fresh validation before promotion.
+Pending rows never enter active context. Canonical publication uses one SQLite
+transaction; a crash cannot expose half-published nodes or frontier state.
 
 ## Reader and diagnostics rules
 

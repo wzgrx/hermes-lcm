@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import multiprocessing
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +11,11 @@ from threading import Barrier
 
 import pytest
 
-from hermes_lcm.async_compaction_store import AsyncCompactionStore, _CREATE_BATCHES
+from hermes_lcm.async_compaction_store import (
+    AsyncCompactionStore,
+    _CREATE_BATCHES,
+    _current_preparer_identity,
+)
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.lifecycle_state import LifecycleStateStore
@@ -44,6 +49,13 @@ def _create_batch(store: AsyncCompactionStore, *, batch_id: str = "batch-1") -> 
         summary_route_fingerprint="route-hash",
         expected_leaf_count=2,
     )
+
+
+def _hold_preparing_claim(db_path: str, ready, release) -> None:
+    with AsyncCompactionStore(db_path, enabled=True) as store:
+        assert store.mark_preparing("batch-1")
+        ready.set()
+        assert release.wait(15)
 
 
 def test_disabled_store_does_not_create_database_or_optional_tables(tmp_path):
@@ -196,6 +208,52 @@ def test_restart_recovery_releases_only_abandoned_incomplete_claims(tmp_path):
             assert reopened.get_batch("batch-2")["state"] == "ready"
     finally:
         core.close()
+
+
+@pytest.mark.skipif(
+    not _current_preparer_identity(), reason="Linux /proc process identity unavailable",
+)
+def test_live_other_process_is_preserved_then_dead_owner_recovers_on_open(tmp_path):
+    db_path = tmp_path / "owner-recovery.db"
+    core = MessageStore(db_path)
+    try:
+        _seed_sources(core)
+    finally:
+        core.close()
+    with AsyncCompactionStore(db_path, enabled=True) as creator:
+        _create_batch(creator)
+        creator_identity = creator.get_batch("batch-1")["preparer_identity"]
+    # The plugin is imported under its synthetic package alias by conftest;
+    # fork preserves that test-only alias in the child on the Linux host.
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    release = context.Event()
+    child = context.Process(
+        target=_hold_preparing_claim, args=(str(db_path), ready, release),
+    )
+    child.start()
+    try:
+        assert ready.wait(15), f"claim process exited early: {child.exitcode}"
+        with AsyncCompactionStore(db_path, enabled=True) as observer:
+            assert observer.get_batch("batch-1")["state"] == "preparing"
+            assert observer.get_batch("batch-1")["preparer_identity"] != creator_identity
+            assert observer.recover_abandoned_batches(
+                conversation_id="conversation-1", session_id="session-1",
+                stale_after_seconds=300,
+            ) == 0
+        release.set()
+        child.join(15)
+        assert child.exitcode == 0
+        with AsyncCompactionStore(db_path, enabled=True) as restarted:
+            batch = restarted.get_batch("batch-1")
+            assert batch["state"] == "failed"
+            assert batch["last_error"] == "PreparationOwnerExited"
+            assert batch["next_retry_at"] <= time.time()
+    finally:
+        release.set()
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
 
 
 def test_session_reset_retires_old_queue_claims(tmp_path):
@@ -606,7 +664,7 @@ def test_existing_optional_batch_schema_gains_source_frontier(tmp_path):
             "        source_frontier_start_store_id >= frontier_start_store_id\n"
             "    ),\n",
             "",
-        )
+        ).replace("    preparer_identity TEXT NOT NULL DEFAULT '',\n", "")
         core._conn.execute(legacy_schema)
         core._conn.execute(
             """INSERT INTO lcm_compaction_batches (
@@ -623,6 +681,7 @@ def test_existing_optional_batch_schema_gains_source_frontier(tmp_path):
         core._conn.commit()
         with AsyncCompactionStore(db_path, enabled=True) as upgraded:
             assert upgraded.get_batch("old")["source_frontier_start_store_id"] == 1
+            assert upgraded.get_batch("old")["preparer_identity"] == ""
             assert upgraded.counts()["pending"] == 1
     finally:
         core.close()

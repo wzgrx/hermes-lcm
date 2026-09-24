@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import functools
 import json
 import hashlib
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -35,6 +36,64 @@ _BATCH_STATES = (
     "failed",
     "superseded",
 )
+
+
+def _linux_scope() -> tuple[str, str] | None:
+    """Return boot and PID-namespace identities when /proc is available."""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        namespace = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+    if not boot_id or not re.fullmatch(r"pid:\[\d+\]", namespace):
+        return None
+    return hashlib.sha256(boot_id.encode()).hexdigest(), namespace
+
+
+def _proc_start_ticks(pid: int) -> str | None:
+    """Read Linux stat field 22 without misparsing a spaced command name."""
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    closing = raw.rfind(")")
+    if closing < 0:
+        return None
+    fields = raw[closing + 1:].split()
+    return fields[19] if len(fields) > 19 and fields[19].isdigit() else None
+
+
+def _current_preparer_identity() -> str:
+    scope = _linux_scope()
+    if scope is None:
+        return ""
+    try:
+        start_ticks = _proc_start_ticks(os.getpid())
+    except OSError:
+        return ""
+    return (
+        f"linux:{os.getpid()}:{scope[0]}:{scope[1]}:{start_ticks}"
+        if start_ticks else ""
+    )
+
+
+def _preparer_provably_dead(identity: str) -> bool:
+    match = re.fullmatch(
+        r"linux:(\d+):([0-9a-f]{64}):(pid:\[\d+\]):(\d+)", identity or "",
+    )
+    if match is None:
+        return False
+    scope = _linux_scope()
+    if scope is None:
+        return False
+    if match.group(2) != scope[0]:
+        return True  # An old kernel boot cannot still own a live worker.
+    if match.group(3) != scope[1]:
+        return False  # A different PID namespace is not observable here.
+    try:
+        current_start = _proc_start_ticks(int(match.group(1)))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return current_start is not None and current_start != match.group(4)
 
 
 def _synchronized(method):
@@ -74,6 +133,7 @@ CREATE TABLE IF NOT EXISTS lcm_compaction_batches (
     source_coverage_hash TEXT NOT NULL,
     source_ids_json TEXT NOT NULL,
     source_identity_hashes_json TEXT NOT NULL,
+    preparer_identity TEXT NOT NULL DEFAULT '',
     expected_leaf_count INTEGER NOT NULL CHECK (expected_leaf_count > 0),
     prepared_leaf_count INTEGER NOT NULL DEFAULT 0 CHECK (prepared_leaf_count >= 0),
     failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
@@ -139,6 +199,7 @@ class AsyncCompactionStore:
             conn.row_factory = sqlite3.Row
             self._conn = conn
             self._ensure_schema()
+            self._recover_provably_dead_batches()
             _restrict_existing_sqlite_artifacts(self.db_path)
         except BaseException:
             conn.close()
@@ -173,6 +234,11 @@ class AsyncCompactionStore:
                 conn.execute(
                     "UPDATE lcm_compaction_batches SET "
                     "source_frontier_start_store_id = frontier_start_store_id"
+                )
+            if "preparer_identity" not in columns:
+                conn.execute(
+                    "ALTER TABLE lcm_compaction_batches ADD COLUMN "
+                    "preparer_identity TEXT NOT NULL DEFAULT ''"
                 )
             self._verify_schema(conn)
             conn.execute(
@@ -218,6 +284,7 @@ class AsyncCompactionStore:
                 "source_coverage_hash",
                 "source_ids_json",
                 "source_identity_hashes_json",
+                "preparer_identity",
                 "expected_leaf_count",
                 "prepared_leaf_count",
             },
@@ -366,8 +433,8 @@ class AsyncCompactionStore:
                     fresh_tail_count, leaf_chunk_tokens, policy_fingerprint,
                     summary_route_fingerprint, source_coverage_hash,
                     source_ids_json, source_identity_hashes_json,
-                    expected_leaf_count, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    preparer_identity, expected_leaf_count, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     batch_id,
                     conversation_id,
@@ -382,6 +449,7 @@ class AsyncCompactionStore:
                     coverage_hash,
                     json.dumps(source_ids),
                     json.dumps(identity_hashes),
+                    _current_preparer_identity(),
                     expected_leaf_count,
                     now,
                     now,
@@ -526,6 +594,46 @@ class AsyncCompactionStore:
         return float(row[0]) if row and row[0] is not None else None
 
     @_synchronized
+    def _recover_provably_dead_batches(
+        self, *, conversation_id: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """Reclaim only claims whose recorded Linux process has ended."""
+        conn = self.connection
+        where = "state IN ('pending', 'preparing')"
+        params: list[str] = []
+        if conversation_id is not None:
+            where += " AND conversation_id = ?"
+            params.append(conversation_id)
+        if session_id is not None:
+            where += " AND session_id = ?"
+            params.append(session_id)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT batch_id, preparer_identity FROM lcm_compaction_batches "
+                f"WHERE {where}", params,
+            ).fetchall()
+            now = time.time()
+            reclaimed = 0
+            for row in rows:
+                if not _preparer_provably_dead(str(row["preparer_identity"])):
+                    continue
+                reclaimed += conn.execute(
+                    """UPDATE lcm_compaction_batches
+                       SET state = 'failed', failure_count = failure_count + 1,
+                           next_retry_at = ?, last_error = 'PreparationOwnerExited',
+                           updated_at = ?
+                       WHERE batch_id = ? AND state IN ('pending', 'preparing')""",
+                    (now, now, row["batch_id"]),
+                ).rowcount
+            conn.execute("COMMIT")
+            return reclaimed
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    @_synchronized
     def recover_abandoned_batches(
         self, *, conversation_id: str, session_id: str,
         stale_after_seconds: float,
@@ -535,6 +643,9 @@ class AsyncCompactionStore:
         A generous lease avoids taking work from a live provider call. Ready
         batches survive restarts and are always revalidated at publication.
         """
+        dead_reclaimed = self._recover_provably_dead_batches(
+            conversation_id=conversation_id, session_id=session_id,
+        )
         now = time.time()
         cutoff = now - max(1.0, float(stale_after_seconds))
         conn = self.connection
@@ -550,7 +661,7 @@ class AsyncCompactionStore:
                 (now, now, conversation_id, session_id, cutoff),
             )
             conn.execute("COMMIT")
-            return updated.rowcount
+            return dead_reclaimed + updated.rowcount
         except BaseException:
             conn.execute("ROLLBACK")
             raise
@@ -624,9 +735,9 @@ class AsyncCompactionStore:
         """Mark the provider phase without holding a transaction during it."""
         updated = self.connection.execute(
             """UPDATE lcm_compaction_batches
-               SET state = 'preparing', updated_at = ?
+               SET state = 'preparing', preparer_identity = ?, updated_at = ?
                WHERE batch_id = ? AND state = 'pending'""",
-            (time.time(), batch_id),
+            (_current_preparer_identity(), time.time(), batch_id),
         )
         return updated.rowcount == 1
 
