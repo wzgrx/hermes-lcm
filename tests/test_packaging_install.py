@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 import types
 
 
@@ -28,6 +29,25 @@ EXPECTED_LCM_TOOLS = {
     "lcm_inspect",
     "lcm_doctor",
 }
+
+
+def test_pyproject_declares_virtual_workspace_runtime_dependencies():
+    """Hermes PM must resolve LCM imports in every managed venv generation."""
+    repo_root = Path(__file__).resolve().parent.parent
+    document = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = document["project"]
+    assert project["name"] == "hermes-lcm"
+    assert project["version"]
+    assert "build-system" not in document
+    declared = {spec.split(">=", 1)[0].lower() for spec in project["dependencies"]}
+    assert declared == {
+        "numpy",
+        "tiktoken",
+        "pyyaml",
+        "fastembed",
+        "huggingface-hub",
+        "regex",
+    }
 
 
 def _load_plugin_entrypoint_module(module_name: str):
