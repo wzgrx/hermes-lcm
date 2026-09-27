@@ -6,6 +6,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Mark LCM-generated summary and proactive-recall rows `display_kind=hidden` while leaving genuine fresh-tail turns unchanged, so Hermes transcript views can distinguish model-facing recovery context without matching text (upstream #635).
 - Distinguish a finalized-session checkpoint from a live zero-frontier backlog in read-only lifecycle diagnostics; a new session in the same conversation remains scoped to its own stored rows (upstream #555 regression).
 - Classify a broken host config loader and malformed `database` structure as unreadable/invalid rather than healthy default WAL; emit one value-free warning when an invalid mode config is encountered (follow-up to upstream PR #627).
 - Count ingest/sanitation preparation inside a lowered automatic foreground time ceiling; large transcripts no longer receive the entire configured summary budget *after* slow preparation. Preserve the existing manual/default sweep clock and raw backlog on budget exhaustion.
