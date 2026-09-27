@@ -10921,7 +10921,11 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
-        assert result == messages
+        # The backed marker is reassembled as LCM-owned context. Its visible
+        # text stays identical, while the provenance flag keeps it out of the
+        # host transcript; the genuine fresh tail remains untouched.
+        assert result[0] == {**messages[0], "display_kind": "hidden"}
+        assert result[1:] == messages[1:]
         assert len(nodes) == 1
         assert nodes[0].node_id == node_id
         assert instance._ingest_cursor == len(result)
@@ -11042,6 +11046,30 @@ class TestEngineCompress:
             if isinstance(m.get("content"), str) and "prior work summary" in m["content"]
         )
         assert summary_block["role"] == "user"
+
+    def test_assemble_context_marks_only_generated_recovery_rows_hidden(self, engine):
+        """A real turn with a summary-like heading remains a real visible turn."""
+        engine._dag.add_node(SummaryNode(
+            session_id=engine._session_id,
+            depth=0,
+            summary="prior work summary",
+            token_count=50,
+            source_token_count=5000,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
+        genuine = {"role": "user", "content": "[Recent Summary (d0, node user)]\nMy actual request"}
+
+        result = engine._assemble_context(
+            {"role": "system", "content": "You are an agent."}, [genuine]
+        )
+
+        generated = next(m for m in result if "prior work summary" in str(m.get("content")))
+        assert generated["role"] == "user"
+        assert generated["display_kind"] == "hidden"
+        assert any(m is genuine for m in result)
+        assert "display_kind" not in genuine
 
     def test_compress_preserves_latest_user_request_outside_fresh_tail(self, tmp_path, monkeypatch):
         """The latest real user request anchors the task even after tool-heavy turns.

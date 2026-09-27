@@ -297,8 +297,10 @@ def test_assemble_context_places_block_between_summary_and_tail(tmp_path, provid
     # The block is not the leading anchor and not the last (fresh-tail) message.
     assert mem_idx > 0
     assert mem_idx < len(result) - 1
+    assert result[mem_idx]["display_kind"] == "hidden"
     # Never inside the fresh tail: the original tail messages carry no block.
     assert not any("<relevant-memories>" in str(m.get("content", "")) for m in tail)
+    assert all("display_kind" not in m for m in tail)
 
 
 def test_assemble_context_default_off_has_no_block(tmp_path, provider):
