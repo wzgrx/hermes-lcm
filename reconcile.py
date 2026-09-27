@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1538,6 +1539,28 @@ class ReconcileMixin:
             session_count=len(stored_tail),
             raw_session_count=session_count,
         )
+        if cursor is None or cursor <= 0 or not self._effective_replay_identities(messages[:cursor]):
+            # A compacted re-bind can replay a fresh tail with store-only rows
+            # interleaved. Exact suffix matching then proves no durable row.
+            window_cursor = self._rebind_replay_stored_window_cursor(messages, stored_tail)
+            if window_cursor > (cursor or 0):
+                self._record_ingest_reconciliation(
+                    action="advanced cursor",
+                    reason="replayed stored window since anchor",
+                    cursor=window_cursor,
+                    incoming=len(messages),
+                    session_count=session_count,
+                    stored_tail_count=len(stored_tail),
+                    effective_incoming=len(self._effective_replay_identities(messages)),
+                )
+                logger.debug(
+                    "LCM reconciled re-bind replay against stored window: session=%s cursor=%d incoming=%d stored_tail=%d",
+                    self._session_id,
+                    window_cursor,
+                    len(messages),
+                    len(stored_tail),
+                )
+                return window_cursor
         if cursor is not None and cursor > 0:
             reason = (
                 "skipped scaffold-only prefix"
@@ -1788,6 +1811,70 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return None
+
+    def _rebind_replay_stored_window_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_tail: list[tuple[str, str, str, str]],
+    ) -> int:
+        """Find the leading compacted replay rows already stored since their anchor.
+
+        A store-only row can break exact-suffix reconciliation even though the
+        host is replaying an old compacted context. Only batches headed by a
+        compaction note or summary qualify: an objective-only banner and an
+        anchorless delta retain the deliberate-append behavior.
+        Using the anchor's last store occurrence minimizes the matching window.
+        Counting occurrences preserves a newly repeated turn after the original
+        replayed copy consumes its matching stored row.
+        """
+        if not messages or not stored_tail:
+            return 0
+        first = None
+        saw_replay_proof = False
+        for idx, msg in enumerate(messages):
+            if self._is_replayed_context_scaffold_message(msg):
+                # The preserved-objective banner alone does not prove that a
+                # matching user turn is a replay. It may introduce a genuinely
+                # new repeated request; keep the lossless-first path for it.
+                content = (normalize_content_value(msg.get("content")) or "").lstrip()
+                if not content.startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+                    saw_replay_proof = True
+                continue
+            if str(msg.get("role") or "") == "system":
+                continue
+            first = idx
+            break
+        if first is None or not saw_replay_proof:
+            return 0
+
+        candidates: list[tuple[int, tuple[str, str, str, str]]] = []
+        for idx in range(first, len(messages)):
+            msg = messages[idx]
+            if self._is_replayed_context_scaffold_message(msg):
+                continue
+            if self._matches_ignore_message_patterns(msg):
+                continue
+            candidates.append((idx, self._message_replay_identity(msg)))
+        if not candidates:
+            return 0
+
+        anchor_identity = candidates[0][1]
+        anchor = None
+        for pos in range(len(stored_tail) - 1, -1, -1):
+            if stored_tail[pos] == anchor_identity:
+                anchor = pos
+                break
+        if anchor is None:
+            return 0
+
+        remaining = Counter(stored_tail[anchor:])
+        last_idx = None
+        for idx, identity in candidates:
+            if remaining[identity] <= 0:
+                break
+            remaining[identity] -= 1
+            last_idx = idx
+        return 0 if last_idx is None else last_idx + 1
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (

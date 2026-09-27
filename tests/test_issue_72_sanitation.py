@@ -1272,7 +1272,9 @@ def test_no_leaf_scaffold_reassembly_has_distinct_status(tmp_path, monkeypatch):
     ]
 
     claim = object()
-    assert engine.compress(messages, operation_claim=claim) == messages
+    expected = [dict(msg) for msg in messages]
+    expected[0]["display_kind"] = "hidden"  # backed summary, not a raw turn
+    assert engine.compress(messages, operation_claim=claim) == expected
     assert engine.last_compression_status == "reassembled"
 
 
