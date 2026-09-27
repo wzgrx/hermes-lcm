@@ -11,6 +11,7 @@ This is the smallest viable substrate for cross-turn/session lifecycle state:
 from __future__ import annotations
 
 import functools
+import logging
 import sqlite3
 import threading
 import time
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+
+logger = logging.getLogger(__name__)
 
 
 def _synchronized(method):
@@ -294,7 +297,8 @@ class LifecycleStateStore:
         # conversation's carry source, especially after an explicit /new.
         if session_id not in (state.current_session_id, state.last_finalized_session_id):
             return state
-        if int(frontier_store_id or 0) == 0 and not self._session_has_lcm_data(session_id):
+        normalized_frontier = int(frontier_store_id or 0)
+        if normalized_frontier == 0 and not self._session_has_lcm_data(session_id):
             # A short-lived clone with no durable context is not a carry source.
             # Still release its current slot; simply returning the old state
             # would leave an ended session advertised as active indefinitely.
@@ -319,7 +323,7 @@ class LifecycleStateStore:
             current_session_id = None
             current_frontier = 0
         finalized_frontier = max(
-            int(frontier_store_id or 0),
+            normalized_frontier,
             state.last_finalized_frontier_store_id,
         )
         self._conn.execute(

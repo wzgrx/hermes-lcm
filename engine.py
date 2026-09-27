@@ -14,12 +14,13 @@ import re
 import sqlite3
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import closing
 import uuid
-import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
 from agent.context_engine import ContextEngine
 
@@ -143,7 +144,13 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
-from .store import MessageStore, _normalize_observed_at
+from .store import (
+    MessageStore,
+    _normalize_observed_at,
+    add_contour_failure_listener,
+    load_sidecar_health_failure,
+    remove_contour_failure_listener,
+)
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -207,6 +214,27 @@ def _rollup_integrity_preflight(database_path: Path) -> bool:
     return True
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+_STORAGE_QUICKCHECK_CACHE_LOCK = threading.RLock()
+_STORAGE_QUICKCHECK_CACHE: dict[str, tuple[bool, str]] = {}
+_SIDECAR_GUARD_INTERVAL_SECONDS = 30.0
+
+
+def _make_contour_failure_listener(engine: "LCMEngine") -> Callable[[str], None]:
+    """Weak listener: confirmed store contour failure -> engine fuse flags.
+
+    Cheap and non-blocking by contract (runs on write/check paths): it only
+    sets fuse state. Actual teardown happens on the next lazy-attribute access
+    (__getattribute__ fuse branch) or the next guard tick, whichever first.
+    """
+    engine_ref = weakref.ref(engine)
+
+    def listener(db_key: str) -> None:
+        instance = engine_ref()
+        if instance is None:
+            return
+        instance._on_contour_failure_notification(db_key)
+
+    return listener
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -645,6 +673,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def __getattribute__(self, name: str) -> Any:
         if name in object.__getattribute__(self, "_LAZY_STORAGE_ATTRS"):
             state = object.__getattribute__(self, "__dict__")
+            unavailable_reason = state.get("_storage_unavailable_reason", "")
+            if unavailable_reason:
+                # A confirmed contour failure must close all helper writers
+                # before any further lazy-storage access is allowed.
+                state["_storage_shutdown"] = True
+                self._close_storage()
+                raise RuntimeError(unavailable_reason)
             if (
                 "_storage_lock" in state
                 and not state.get("_storage_bound", False)
@@ -682,6 +717,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_binding = False
         self._storage_binding_thread_id = None
         self._storage_shutdown = False
+        self._storage_unavailable_reason = ""
+        self._sidecar_guard_timer: threading.Timer | None = None
+        self._sidecar_guard_stopped = threading.Event()
+        self._sidecar_guard_lock = threading.RLock()
+        self._contour_failure_listener_token: int | None = None
         self._store = None
         self._dag = None
         self._lifecycle = None
@@ -1023,6 +1063,55 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return Path(hermes_home) / "lcm.db"
         return Path.home() / ".hermes" / "lcm.db"
 
+    @staticmethod
+    def _sqlite_readonly_uri(db_path: Path) -> str:
+        return f"file:{quote(str(db_path.resolve(strict=False)))}?mode=ro"
+
+    @classmethod
+    def _quick_check_storage(cls, db_path: Path) -> tuple[bool, str]:
+        """Return cached startup quick_check status for an existing SQLite DB.
+
+        Set ``LCM_SKIP_QUICKCHECK=1`` only for explicit repair tooling that must
+        inspect or rewrite a damaged ``lcm.db``. Normal plugin startup must keep
+        this guard enabled so LCM stays offline instead of opening write
+        connections against a corrupt database.
+        """
+        if os.environ.get("LCM_SKIP_QUICKCHECK") == "1":
+            return True, "skipped by LCM_SKIP_QUICKCHECK=1"
+        if str(db_path) == ":memory:" or not db_path.exists():
+            return True, "ok"
+
+        cache_key = str(db_path.resolve(strict=False))
+        with _STORAGE_QUICKCHECK_CACHE_LOCK:
+            cached = _STORAGE_QUICKCHECK_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ok = False
+        detail = ""
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(cls._sqlite_readonly_uri(db_path), uri=True)
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            lines = [str(row[0]) for row in rows if row and row[0] is not None]
+            detail = "\n".join(lines[:3])
+            ok = bool(lines) and lines == ["ok"]
+            if not detail:
+                detail = "empty quick_check result"
+        except Exception as exc:
+            detail = str(exc) or exc.__class__.__name__
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        result = (ok, detail)
+        with _STORAGE_QUICKCHECK_CACHE_LOCK:
+            _STORAGE_QUICKCHECK_CACHE[cache_key] = result
+        return result
+
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
         db_path = Path(db_path)
@@ -1030,6 +1119,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._storage_hermes_home = hermes_home
         if self._storage_bound:
             return
+        sidecar_failure = load_sidecar_health_failure(db_path)
+        if sidecar_failure:
+            self._storage_unavailable_reason = sidecar_failure
+            logger.critical(sidecar_failure)
+            raise RuntimeError(sidecar_failure)
+        ok, detail = self._quick_check_storage(db_path)
+        if not ok:
+            first_lines = "; ".join(str(detail).splitlines()[:3]) or "unknown failure"
+            message = (
+                f"lcm.db failed quick_check: {first_lines} — plugin stays offline, "
+                "repair required (lcm-repair skill)"
+            )
+            self._storage_unavailable_reason = message
+            logger.critical(message)
+            raise RuntimeError(message)
+        self._storage_unavailable_reason = ""
         self._storage_shutdown = False
         self._storage_binding = True
         self._storage_binding_thread_id = threading.get_ident()
@@ -1077,6 +1182,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
             self._storage_bound = True
+            self._contour_failure_listener_token = add_contour_failure_listener(
+                _make_contour_failure_listener(self)
+            )
+            self._schedule_sidecar_guard()
         except Exception:
             self._close_storage()
             raise
@@ -1084,18 +1193,96 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._storage_binding = False
             self._storage_binding_thread_id = None
 
+    def _schedule_sidecar_guard(self) -> None:
+        state = object.__getattribute__(self, "__dict__")
+        with self._sidecar_guard_lock:
+            old_timer = state.get("_sidecar_guard_timer")
+            if old_timer is not None:
+                old_timer.cancel()
+            if state.get("_storage_shutdown", False):
+                return
+            self._sidecar_guard_stopped.clear()
+            timer = threading.Timer(
+                _SIDECAR_GUARD_INTERVAL_SECONDS,
+                LCMEngine._sidecar_guard_tick_for_ref,
+                args=(weakref.ref(self),),
+            )
+            timer.daemon = True
+            state["_sidecar_guard_timer"] = timer
+            timer.start()
+
+    @staticmethod
+    def _sidecar_guard_tick_for_ref(engine_ref: weakref.ReferenceType["LCMEngine"]) -> None:
+        engine = engine_ref()
+        if engine is not None:
+            engine._sidecar_guard_tick()
+
+    def _sidecar_guard_tick(self) -> None:
+        state = object.__getattribute__(self, "__dict__")
+        with self._sidecar_guard_lock:
+            if state.get("_storage_shutdown", False) or self._sidecar_guard_stopped.is_set():
+                return
+            store = state.get("_store")
+            if store is not None and state.get("_storage_bound", False):
+                try:
+                    store.check_sidecars_intact()
+                except RuntimeError as exc:
+                    state["_storage_unavailable_reason"] = str(exc)
+                    state["_storage_shutdown"] = True
+                    self._close_storage()
+                    return
+                except Exception:
+                    logger.exception("LCM sidecar guard failed unexpectedly")
+            if not state.get("_storage_shutdown", False) and not self._sidecar_guard_stopped.is_set():
+                self._schedule_sidecar_guard()
+
     def _ensure_storage(self) -> None:
         """Bind SQLite helpers on first use of a lazy clone."""
+        reason = self._storage_unavailable_reason
+        if reason:
+            raise RuntimeError(reason)
+        sidecar_failure = load_sidecar_health_failure(self._storage_db_path)
+        if sidecar_failure:
+            self._storage_unavailable_reason = sidecar_failure
+            raise RuntimeError(sidecar_failure)
         if self._storage_bound:
             return
         with self._storage_lock:
+            reason = self._storage_unavailable_reason
+            if reason:
+                raise RuntimeError(reason)
+            sidecar_failure = load_sidecar_health_failure(self._storage_db_path)
+            if sidecar_failure:
+                self._storage_unavailable_reason = sidecar_failure
+                raise RuntimeError(sidecar_failure)
             if self._storage_bound:
                 return
             self._bind_storage(self._storage_db_path, self._storage_hermes_home)
 
+    def _on_contour_failure_notification(self, db_key: str) -> None:
+        """Set a non-blocking fuse flag from a confirmed store failure."""
+        state = object.__getattribute__(self, "__dict__")
+        if state.get("_storage_shutdown", False):
+            return
+        db_path = state.get("_storage_db_path")
+        if db_path is None or str(Path(db_path).resolve(strict=False)) != db_key:
+            return
+        reason = load_sidecar_health_failure(db_path) or "LCM storage contour failure"
+        state["_storage_unavailable_reason"] = reason
+        state["_storage_shutdown"] = True
+        state["_storage_bound"] = False
+
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
         state = object.__getattribute__(self, "__dict__")
+        remove_contour_failure_listener(state.get("_contour_failure_listener_token"))
+        state["_contour_failure_listener_token"] = None
+        with self._sidecar_guard_lock:
+            timer = state.get("_sidecar_guard_timer")
+            if timer is not None:
+                timer.cancel()
+                state["_sidecar_guard_timer"] = None
+            self._sidecar_guard_stopped.set()
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -1105,7 +1292,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_query_views",
         ):
             helper = state.get(attr)
-            close = getattr(helper, "close", None)
+            close = (
+                getattr(helper, "shutdown", None)
+                if attr == "_store"
+                else getattr(helper, "close", None)
+            )
             if callable(close):
                 try:
                     close()

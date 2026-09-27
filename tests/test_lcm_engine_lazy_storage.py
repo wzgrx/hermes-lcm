@@ -6,6 +6,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
+import hermes_lcm.engine as lcm_engine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
@@ -143,4 +146,46 @@ def test_unbound_clone_rebinds_profile_before_first_storage_access(tmp_path):
         assert clone._storage_bound is True
     finally:
         clone.shutdown()
+        engine.shutdown()
+
+
+def test_storage_quick_check_refuses_corrupt_database_before_write_connect(
+    tmp_path, monkeypatch, caplog
+):
+    db_path = tmp_path / "corrupt.db"
+    db_path.write_bytes(b"SQLite format 3\x00" + b"not a valid sqlite database" * 64)
+    lcm_engine._STORAGE_QUICKCHECK_CACHE.clear()
+
+    real_connect = sqlite3.connect
+    write_connects = 0
+
+    def counting_connect(*args, **kwargs):
+        nonlocal write_connects
+        if not kwargs.get("uri"):
+            write_connects += 1
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    caplog.set_level("CRITICAL", logger="hermes_lcm.engine")
+
+    with pytest.raises(RuntimeError, match="failed quick_check"):
+        LCMEngine(
+            config=LCMConfig(database_path=str(db_path)),
+            hermes_home=str(tmp_path / "hermes"),
+        )
+
+    assert write_connects == 0
+    assert "plugin stays offline, repair required" in caplog.text
+
+
+def test_storage_quick_check_allows_healthy_database(tmp_path):
+    db_path = tmp_path / "healthy.db"
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(db_path)),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    try:
+        engine._store.append("session-a", {"role": "user", "content": "hello"})
+        assert engine._store.get_session_count("session-a") == 1
+    finally:
         engine.shutdown()
