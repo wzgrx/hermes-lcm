@@ -4,6 +4,8 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+## v1.0.0-rc.2 - 2026-09-28
+
 ### Fixed
 
 - Keep the SQLite WAL contour open for each live MessageStore, detect database/sidecar inode replacement, and fuse all engine storage helpers after confirmed contour failure; preserve lazy clone binding and reject corrupt databases at first bind (adapted from upstream PR #630 / issue #628).
@@ -23,7 +25,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 - Honor the Hermes host SQLite journal-mode policy for LCM connections, with legacy WAL setup only when the host helper is absent.
 - Use the linear private-key block scanner during ingest, avoiding timeout-clamped quadratic regex stalls while preserving redaction.
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
-- Declare all four registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
+- Declare the registered lifecycle hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 - Mutated active tails no longer trigger per-turn whole-transcript re-ingest; replay identity, sanitation claims, and cursor refresh now converge (reviewed integration of upstream PR #613).
 - lcm_compile_evidence avoids top-level JSON-Schema combinators rejected by native Anthropic providers while preserving typed runtime proposal validation (upstream PR #618 schema commit).
 - Local provider-independent sanitation tests use larger synthetic payloads so critical-pressure assertions remain stable across supported tokenizer backends.

@@ -79,6 +79,15 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
+## Upgrade from v1.0.0-rc.1 to v1.0.0-rc.2
+
+1. While the current runtime is running, use `/lcm backup` to create a consistent online backup. If taking a filesystem copy instead, stop Hermes and every other SQLite writer first, then copy `lcm.db` with any `lcm.db-wal` and `lcm.db-shm` companions as one quiescent snapshot.
+2. Update the plugin checkout to the `v1.0.0-rc.2` tag and restart Hermes. Send one normal message, then confirm `lcm_status` reports `plugin_version: 1.0.0-rc.2` and the expected database path.
+3. Run `/lcm doctor` and check SQLite `quick_check`, WAL mode, and the core schema version (`5`). The RC does not require a manual core migration or embedding backfill; optional assertion, query-view, pre-answer evidence, embedding, and adaptive-retrieval features remain opt-in.
+4. For rollback to RC1 after RC2 has written the database, restore the pre-upgrade backup before loading the older plugin.
+
+The RC2 changes focus on bounded automatic compaction, replay/idempotency, SQLite runtime containment, and transcript display classification. The earlier [v0.20.0 / v0.21.0-rc2 upgrade procedure](#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1) remains relevant when upgrading directly from those older versions.
+
 ## Upgrade from v0.20.0 or v0.21.0-rc2 to v1.0.0-rc.1
 
 1. While the old runtime is running, run `/lcm backup`. If Hermes or any other
@@ -142,7 +151,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v1.0.0-rc.1 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.2 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm
