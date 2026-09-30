@@ -16,8 +16,10 @@ def test_managed_update_delegates_to_durable_launcher(tmp_path, option):
     source = Path(__file__).resolve().parents[1] / "scripts" / "update.sh"
     script = root / "scripts" / "update.sh"
     shutil.copy2(source, script)
-    marker = root / "user-owned.txt"; marker.write_text("preserve")
-    bin_dir = tmp_path / "bin"; bin_dir.mkdir()
+    marker = root / "user-owned.txt"
+    marker.write_text("preserve")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
     record = tmp_path / "argv.txt"
     launcher = bin_dir / "hermes"
     launcher.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$RECORD"\n')
