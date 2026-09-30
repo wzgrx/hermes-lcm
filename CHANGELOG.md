@@ -4,6 +4,8 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+- Route managed `scripts/update.sh` through Hermes plugin transactions instead of pulling the active checkout directly; preserve PM dependency admission and user files. Document exact reviewed-SHA updates and retained-pin removal.
+
 - Verify same-session compression and repeated no-op boundaries ingest carried fresh-tail rows exactly once (upstream #645); the maintained fork already reconciles this replay correctly. New genuine turns still append.
 - Correct test module specs for Python 3.14 so relative imports retain their proper package parent without repeated DeprecationWarning noise.
 

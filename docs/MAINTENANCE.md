@@ -26,6 +26,10 @@ maintainer. Do not open a pull request for routine fork maintenance.
 8. Update the installed checkout and restart Hermes through its drain-aware
    gateway command after checking active work.
 
+## Managed runtime workflow
+
+See `INSTALL.md` for PM installation/update, dependency consent and retained-pin semantics. `scripts/update.sh` delegates when run inside the installed directory; it no longer raw-pulls the live tree. The maintained Hermes host adds scoped CAUTION consent on update; global scanning stays enabled.
+
 ## Deploy the maintained main branch
 
 Keep the live checkout and updater comparison ref aligned to `main` and
