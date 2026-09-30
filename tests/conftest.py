@@ -37,7 +37,6 @@ if pkg_name not in sys.modules:
         if sub_name not in sys.modules:
             sub_spec = importlib.util.spec_from_file_location(
                 sub_name, str(py_file),
-                submodule_search_locations=[],
             )
             sub_mod = importlib.util.module_from_spec(sub_spec)
             sub_mod.__package__ = pkg_name
