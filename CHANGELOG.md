@@ -4,6 +4,17 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Reviewed Hermes compatibility fixes — 2026-10-03
+
+- Deduplicate superseded ingest closures on the legacy hook fallback only; retain public hook ownership on current Hermes (adapted from [upstream #646](https://github.com/stephenschoettler/hermes-lcm/pull/646)).
+- Create private Linux SQLite files without opening/closing a data descriptor, preserving locks held by a concurrent SQLite connection; retain inode, sidecar and permission checks ([upstream #647](https://github.com/stephenschoettler/hermes-lcm/pull/647)).
+- Preserve the ingest cursor and exact durable owner across same-session in-place compression, including older hosts that finalize before starting the same ID. Reject stale ownership callbacks ([upstream #653](https://github.com/stephenschoettler/hermes-lcm/pull/653)).
+- Treat generated DAG summaries as objective-boundary scaffolding, not fresh user instructions ([upstream #650](https://github.com/stephenschoettler/hermes-lcm/pull/650)).
+- Clear post-compression usage gates on the next foreground response/reset, but not on auxiliary responses ([upstream #651](https://github.com/stephenschoettler/hermes-lcm/pull/651)).
+- Keep test imports inside their selected interpreter instead of bootstrapping into a live PM runtime. The focused regression set passed 38 tests; the full local suite against Hermes `91b17917e605` plus maintained overlays passed 3464 tests, with 6 skips and 12 expected failures. This is not a live-provider or Feishu end-to-end test.
+
+No schema migration, provider change, model download or history deletion is required. Restart the host after a managed plugin update to load these changes. Preserve a pre-update database backup as described below.
+
 - Route managed `scripts/update.sh` through Hermes plugin transactions instead of pulling the active checkout directly; preserve PM dependency admission and user files. Document exact reviewed-SHA updates and retained-pin removal.
 
 - Verify same-session compression and repeated no-op boundaries ingest carried fresh-tail rows exactly once (upstream #645); the maintained fork already reconciles this replay correctly. New genuine turns still append.

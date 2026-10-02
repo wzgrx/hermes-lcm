@@ -392,6 +392,15 @@ def _on_explicit_session_reset(engine, cli_pairing=None, **payload):
         return None
 
 
+def _is_lcm_ingest_hook(candidate) -> bool:
+    """Recognize superseded legacy ingest hooks across in-place module reloads."""
+    return bool(getattr(candidate, "_lcm_post_llm_ingest", False)) or (
+        getattr(candidate, "__module__", "") == __name__
+        and getattr(candidate, "__qualname__", "")
+        == "register.<locals>._on_post_llm_call"
+    )
+
+
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
@@ -686,9 +695,12 @@ def register(ctx):
             # Compatibility for Hermes hosts predating the public hook API.
             from hermes_cli.plugins import get_plugin_manager as _get_pm
 
-            _get_pm()._hooks.setdefault("post_llm_call", []).append(
-                _on_post_llm_call
-            )
+            # Legacy collectors register on every engine build. Remove only
+            # their stale ingest closures so retired SQLite owners can collect.
+            _on_post_llm_call._lcm_post_llm_ingest = True
+            hooks = _get_pm()._hooks.setdefault("post_llm_call", [])
+            hooks[:] = [hook for hook in hooks if not _is_lcm_ingest_hook(hook)]
+            hooks.append(_on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)

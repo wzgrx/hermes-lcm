@@ -4,8 +4,12 @@ Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
 import sys
+import os
 import importlib
 from pathlib import Path
+
+# Test imports must never exec into the host PM runtime.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
 # Make the repo root importable (for agent.context_engine etc.)
 repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)

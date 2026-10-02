@@ -121,6 +121,20 @@ def _chmod_sqlite_artifact_at(
                 "stop all connections and chmod the artifact to 0600 offline",
             )
 
+    if expected is None and _CHMOD_THROUGH_PATH_DESCRIPTOR:
+        # A data descriptor closed after creation could release locks acquired
+        # by a concurrent SQLite opener. mknod creates the regular file without
+        # such a descriptor; the path check validates the winning inode.
+        try:
+            os.mknod(path.name, stat.S_IFREG | _PRIVATE_SQLITE_MODE, dir_fd=directory_fd)
+        except FileExistsError:
+            pass
+        if not _chmod_sqlite_artifact_at(
+            path, directory_fd=directory_fd, create=False,
+        ):
+            raise _sqlite_artifact_error(path, "directory entry disappeared while creating")
+        return True
+
     use_path_descriptor = expected is not None and _CHMOD_THROUGH_PATH_DESCRIPTOR
     if use_path_descriptor:
         flags = _O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
