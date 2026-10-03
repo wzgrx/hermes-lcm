@@ -4,6 +4,11 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Partial compaction visibility — 2026-10-03
+
+- Preserve committed leaf progress when later condensation or active-context assembly raises: record one compression event, `partial`, and the failed stage while re-raising the original error. Adapted from [upstream #656](https://github.com/stephenschoettler/hermes-lcm/pull/656), retaining this fork's sanitation-claim lock and automatic deadline behavior. A prior invocation's partial status never masks a new pre-publication failure.
+- This is accurate failure accounting, not a successful compression claim, automatic retry, or change to the 0.85 threshold. Original messages and committed DAG/frontier data remain intact; no schema or dependency change.
+
 ### Routing, replay memory and test isolation — 2026-10-03
 
 - Carry a named provider's declared API mode through explicit LCM model overrides; route the supported `minimax-cn` prefix to Anthropic Messages (adapted from [upstream #649](https://github.com/stephenschoettler/hermes-lcm/pull/649)). Existing provider/model configuration is not rewritten.

@@ -51,6 +51,14 @@ def _update_cleanup_handoff_digest(digest: Any, value: str) -> None:
 
 
 class CompactionMixin:
+    def _record_committed_leaf_failure(self, stage: str, started: float) -> None:
+        """Expose durable leaf progress without swallowing a later stage error."""
+        self.compression_count += 1
+        self._last_compaction_duration_ms = (time.perf_counter() - started) * 1000.0
+        self._last_compression_status = "partial"
+        self._last_compression_noop_reason = f"{stage}_failed_after_leaf_commit"
+        logger.warning("LCM leaf committed before %s failed; partial progress retained", stage)
+
     def _visible_store_ids_from_tail(
         self, messages: List[Dict[str, Any]],
     ) -> list[int]:
@@ -1072,6 +1080,7 @@ class CompactionMixin:
                     return result
         # Generic compaction runs OUTSIDE the claim lock: on the fallback path
         # above the with-block has exited and the lock is released.
+        count_before = self.compression_count
         try:
             return self._compress_impl(
                 messages,
@@ -1082,8 +1091,12 @@ class CompactionMixin:
                 claimed_sanitation_handoff=None,
             )
         except BaseException:
-            self._last_compression_status = "error"
-            self._last_compression_noop_reason = ""
+            if not (
+                self._last_compression_status == "partial"
+                and self.compression_count > count_before
+            ):
+                self._last_compression_status = "error"
+                self._last_compression_noop_reason = ""
             raise
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
@@ -1913,17 +1926,21 @@ class CompactionMixin:
                     )
                 )
         else:
-            self._maybe_condense(
-                focus_topic=focus_topic,
-                leaf_compacted_this_turn=True,
-                force_overflow=force_overflow,
-                critical_budget_pressure=critical_budget_pressure,
-                deadline=(
-                    sweep_deadline
-                    if (threshold_full_sweep_active or automatic_budget_enforced)
-                    else None
-                ),
-            )
+            try:
+                self._maybe_condense(
+                    focus_topic=focus_topic,
+                    leaf_compacted_this_turn=True,
+                    force_overflow=force_overflow,
+                    critical_budget_pressure=critical_budget_pressure,
+                    deadline=(
+                        sweep_deadline
+                        if (threshold_full_sweep_active or automatic_budget_enforced)
+                        else None
+                    ),
+                )
+            except Exception:
+                self._record_committed_leaf_failure("condensation", _compress_started)
+                raise
 
         # Step 7: Assemble new active context
         self._refresh_raw_backlog_debt(
@@ -1939,6 +1956,9 @@ class CompactionMixin:
                 working_messages[leading_anchor_count:],
                 assembly_cap_override=recovery_assembly_cap,
             )
+        except Exception:
+            self._record_committed_leaf_failure("assembly", _compress_started)
+            raise
         finally:
             self._pending_context_anchor_messages = None
         self.compression_count += 1
