@@ -19,6 +19,7 @@ avoid an import cycle (staticmethod resolution is identical).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import re
 from collections import Counter
@@ -247,7 +248,36 @@ def _stored_row_content_post_ingest_mutated(content: str, *, role: str = "") -> 
     return False
 
 
+_COMPACT_TOOL_REPLAY_IDENTITY_CHARS = 64 * 1024
+_COMPACT_TOOL_REPLAY_IDENTITY_PREFIX = "[LCM compact tool replay identity: "
+
+
 class ReconcileMixin:
+    @staticmethod
+    def _compact_tool_replay_identity_content(role: str, content: str) -> str:
+        """Bound identity memory with SHA-256; preserve surrogate-bearing JSON text.
+
+        This changes only ephemeral equality keys, never stored message text.
+        SHA-256 equality has the usual theoretical content-hash collision risk.
+        """
+
+        if role != "tool" or (
+            len(content) <= _COMPACT_TOOL_REPLAY_IDENTITY_CHARS
+            and not content.startswith(_COMPACT_TOOL_REPLAY_IDENTITY_PREFIX)
+        ):
+            return content
+        digest_builder = hashlib.sha256()
+        byte_count = 0
+        chunk_chars = 1024 * 1024
+        for start in range(0, len(content), chunk_chars):
+            encoded_chunk = content[start : start + chunk_chars].encode("utf-8", errors="surrogatepass")
+            digest_builder.update(encoded_chunk)
+            byte_count += len(encoded_chunk)
+        digest = digest_builder.hexdigest()
+        return _COMPACT_TOOL_REPLAY_IDENTITY_PREFIX + (
+            f"sha256={digest}; chars={len(content)}; bytes={byte_count}]"
+        )
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -507,6 +537,7 @@ class ReconcileMixin:
                 _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX
             ):
                 content = _escape_replay_identity_content(content)
+        content = self._compact_tool_replay_identity_content(role, content)
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         # Shape tag (round-8 finding 4029411030): only the LIVE side tags the
         # RAW value shape — that is where structured-vs-string distinction is

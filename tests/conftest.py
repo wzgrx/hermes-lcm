@@ -6,10 +6,35 @@ Patches the plugin modules so they can be imported both as a package
 import sys
 import os
 import importlib
+import tempfile
+
+import pytest
 from pathlib import Path
 
 # Test imports must never exec into the host PM runtime.
 os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+
+# Some tests deliberately clear HERMES_HOME. Isolate the process HOME before
+# importing plugin modules so their default SQLite path never reaches user data.
+# The TemporaryDirectory is retained until interpreter shutdown, including
+# child-process tests; this does not change the invoking shell environment.
+_TEST_HOME = tempfile.TemporaryDirectory(prefix="hermes-lcm-tests-")
+os.environ["HOME"] = _TEST_HOME.name
+if os.name == "nt":
+    os.environ["USERPROFILE"] = _TEST_HOME.name
+os.environ["HERMES_HOME"] = str(Path(_TEST_HOME.name) / ".hermes")
+
+@pytest.fixture(autouse=True)
+def isolate_home_per_test(tmp_path_factory, monkeypatch):
+    """Keep auxiliary profile files from leaking between unrelated tests."""
+    # Do not populate a test's own tmp_path: benchmark output contracts can
+    # require that directory to be empty before their first write.
+    home = tmp_path_factory.mktemp("lcm-isolated-user")
+    monkeypatch.setenv("HOME", str(home))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+
 
 # Make the repo root importable (for agent.context_engine etc.)
 repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)

@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Routing, replay memory and test isolation — 2026-10-03
+
+- Carry a named provider's declared API mode through explicit LCM model overrides; route the supported `minimax-cn` prefix to Anthropic Messages (adapted from [upstream #649](https://github.com/stephenschoettler/hermes-lcm/pull/649)). Existing provider/model configuration is not rewritten.
+- Bound ephemeral replay identity strings for tool output above 64 Ki characters using streamed SHA-256 plus character/byte counts (adapted from [upstream #654](https://github.com/stephenschoettler/hermes-lcm/pull/654)). Preserve maintained shape tags, reserved-prefix escaping and surrogate-bearing JSON text. Stored messages are unchanged; content-hash equality retains the standard theoretical collision limitation.
+- Isolate HOME before test collection and per test, in addition to HERMES_HOME, so clearing a profile override does not reach an operator database or share auxiliary state. This strengthens the test-isolation note in [upstream #629](https://github.com/stephenschoettler/hermes-lcm/pull/629); its linear cursor-scan optimization was already present in this fork.
+
 ### Reviewed Hermes compatibility fixes — 2026-10-03
 
 - Deduplicate superseded ingest closures on the legacy hook fallback only; retain public hook ownership on current Hermes (adapted from [upstream #646](https://github.com/stephenschoettler/hermes-lcm/pull/646)).
