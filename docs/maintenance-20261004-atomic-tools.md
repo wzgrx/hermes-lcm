@@ -52,3 +52,29 @@ release stress. Both full invocations report **3510 passed, 6 skipped, 12 expect
 failures**. Fourteen focused cases pass; four of the original nine upstream
 checks failed against the unchanged maintained fork. Ruff and whitespace checks
 pass. Hosted CI and exact-code deployment are distinct following gates.
+
+## Verified publication and deployment
+
+Maintained/runtime commit: `f31fcb3e3931b76508d005b48198497548624ddc`.
+Its [GitHub CI](https://github.com/wzgrx/hermes-lcm/actions/runs/37176787396)
+passed, including Python 3.11–3.14 minimal-host jobs. This does not replace the
+full/low-FD tests against the actual deployed Hermes host described above.
+
+The exact commit was deployed together with Card 0.20.12 using Hermes's
+managed plugin update and PM workflow after two idle checks. SQLite online
+backups captured committed WAL state; no schema migration, history cleanup
+or provider configuration change occurred. LCM/Card doctors, PM doctor,
+Gateway restart/Feishu connection and read-only database health checks passed.
+
+Synthetic checks inside the selected managed dependency generation reproduced
+whole-group omission at a short budget and a complete group/cleared flag at a
+larger budget. They used a temporary SQLite database, not production history;
+no model request or live database write was made. This is runtime integration
+evidence, not a new long production conversation or guarantee that every
+irreducible overflow can be recovered.
+
+The 2026-10-04 12:32 Asia/Shanghai audit reconfirmed clean source, active Gateway,
+Feishu connectivity, preserved configuration/credentials and all three database
+quick checks. Full-suite and release-evidence hashes still matched. This receipt
+is documentation-only; the installed executable code remains the exact tested
+commit above without another restart. There is no new release tag.
