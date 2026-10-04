@@ -78,3 +78,32 @@ dependency contract, compile/shell checks, focused pytest, benchmark smoke,
 stress smoke, full pytest, low-FD pytest and release stress. Both full invocations
 report 3496 passed, 6 skipped and 12 expected failures. README/maintenance prose
 was synchronized afterwards; source and regression tests are unchanged.
+
+
+## Verified publication and deployment
+
+Reviewed Card code: `1c199d68ba3aa6cd903aed3bea48b94068b7033a` (**0.20.11**).
+Reviewed LCM code: `5d0c7768227218200f18fd9c75195d2f4fef9739` (maintenance after **1.0.0-rc.2**, no new tag).
+Exact-commit hosted gates passed: [wzgrx/hermes-lark-streaming CodeQL](https://github.com/wzgrx/hermes-lark-streaming/actions/runs/37175026423); [wzgrx/hermes-lark-streaming Tests](https://github.com/wzgrx/hermes-lark-streaming/actions/runs/37175026352); [wzgrx/hermes-lcm CI](https://github.com/wzgrx/hermes-lcm/actions/runs/37175273052).
+
+After two idle checks, one graceful Gateway stop/start loaded both exact plugin
+commits through Hermes managed update and PM. Official Hermes remains the
+already-current reviewed `24b9f0f8c5df` plus local overlays (`0764e9165721`).
+Card/LCM plugin doctors, PM doctor, hook verification/reinstallation, frontend
+freshness, Card smoke and runtime import checks passed. Gateway is running and
+Feishu connected; source checkouts are clean and the updater timer is restored.
+
+Private pre-update snapshots were made through SQLite's online backup API,
+including committed WAL state, and verified for each database. Configuration
+and credential-file hashes match protected backups; conversations, model
+settings and historical usage were preserved. Read-only quick checks of all
+three live databases pass. Current-process journal has no traceback. Existing
+`metrics_stale` on idle and historical `delivery_unknown` remain visible;
+no old message was automatically resent or old ledger row erased.
+
+Synthetic checks in the selected PM runtime confirmed the new partial-resource
+renderer and the installed LCM damaged-entry, fresh-content and session-scoped
+lookup contracts. Zero provider calls, zero messages and zero live database
+writes were made by that check. This is not a new model turn or native-client
+visual acceptance. Private rollback refs, plugin copies and PM inputs remain
+local. This receipt is a documentation-only follow-up to the tested code.
