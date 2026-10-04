@@ -22,6 +22,7 @@ OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
 
 > **Maintained fork:** `wzgrx/hermes-lcm` main. Use the [managed installation guide](INSTALL.md).
+> Additional 2026-10-05 hardening rejects boolean token/window inputs; [scope and tests](docs/maintenance-20261005-boolean-limits.md).
 > Latest 2026-10-05 maintenance adopts inherited live compression ratios and
 > provider-scoped model overrides, while preserving explicit LCM policy, clone/profile
 > isolation and stricter budgets. Context-pin removal/re-inference remains separate;

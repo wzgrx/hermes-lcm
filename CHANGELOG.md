@@ -4,6 +4,11 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Reject boolean token limits — 2026-10-05
+
+- Reject YAML/Python booleans as token caps and model-window updates instead of treating `true` as 1 or `false` as 0. Existing numeric/string limits and explicit zero-window behavior remain unchanged.
+- Add eight isolated regression cases. This deliberately hardens the official int-coercion boundary; see [scope](docs/maintenance-20261005-boolean-limits.md).
+
 ### Live inherited ratios and model overrides — 2026-10-05
 
 - Consume the host's final live-config invalidation boundary rather than leaving ratio edits as passive attributes. Recompute LCM's own trigger and status; invalid/non-finite ratios preserve the last valid policy.

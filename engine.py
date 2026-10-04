@@ -1630,9 +1630,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         controller is an LCMEngine, so this method must exist here to avoid the
         per-turn AttributeError that breaks live compression-config sync.
 
-        Accepts None / str / int (as delivered from config). Non-numeric or
-        non-positive/non-finite values yield None (no cap).
+        Accepts None / str / int (as delivered from config). Non-numeric,
+        boolean or non-positive/non-finite values yield None (no cap). Unlike
+        the host's permissive int conversion, YAML true is not a one-token cap.
         """
+        if isinstance(value, bool):
+            return None
         try:
             ivalue = int(value) if value is not None else 0
         except (TypeError, ValueError, OverflowError):
@@ -1647,6 +1650,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         model: str | None = None,
         provider: str | None = None,
     ) -> bool:
+        if isinstance(context_length, bool):
+            logger.debug("LCM ignored boolean %s context_length", source)
+            return False
         try:
             parsed_context_length = int(context_length)
         except (TypeError, ValueError, OverflowError):
