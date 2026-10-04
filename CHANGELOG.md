@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Persisted-output replay lookup — 2026-10-04
+
+- Adapt [upstream #655](https://github.com/stephenschoettler/hermes-lcm/pull/655): index session/tool-call candidate paths so warm replay lookups avoid reparsing unrelated outputs. Fresh candidate reads, marker checks, external in-place change detection, bounded directory-cache cardinality and unstable-scan handling are retained.
+- Skip malformed UTF-8 and non-object JSON artifacts instead of aborting the entire lookup; files remain intact. Fourteen focused cases and 3496 full-suite tests pass; full release-validation gates pass, including low-FD and release stress.
+- Correct the maintained fork's README badges, managed install route and dependency statement. No schema, dependency, provider, threshold or history migration change. See [scope and evidence](docs/maintenance-20261004-output-index.md).
+
 ### Partial compaction visibility — 2026-10-03
 
 - Preserve committed leaf progress when later condensation or active-context assembly raises: record one compression event, `partial`, and the failed stage while re-raising the original error. Adapted from [upstream #656](https://github.com/stephenschoettler/hermes-lcm/pull/656), retaining this fork's sanitation-claim lock and automatic deadline behavior. A prior invocation's partial status never masks a new pre-publication failure.

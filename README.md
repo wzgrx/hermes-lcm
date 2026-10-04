@@ -2,9 +2,9 @@
   <img src="docs/banner.png" alt="HERMES-LCM" width="800">
 </p>
 
-[![CI](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/stephenschoettler/hermes-lcm)](https://github.com/stephenschoettler/hermes-lcm/releases)
-[![Python 3.11-3.14](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml)
+[![CI](https://github.com/wzgrx/hermes-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/wzgrx/hermes-lcm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/wzgrx/hermes-lcm)](https://github.com/wzgrx/hermes-lcm/releases)
+[![Python 3.11-3.14](https://img.shields.io/badge/Python-3.11--3.14-3776AB?logo=python&logoColor=white)](https://github.com/wzgrx/hermes-lcm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Lossless Context Management plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
@@ -20,6 +20,10 @@ Based on the [LCM paper](https://papers.voltropy.com/LCM) by Ehrlich & Blackman
 [lossless-claw](https://github.com/martian-engineering/lossless-claw) for
 OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
+
+> **Maintained fork:** `wzgrx/hermes-lcm` main. Use the [managed installation guide](INSTALL.md).
+> The 2026-10-04 maintenance improves persisted-output replay lookup and skips damaged
+> JSON artifacts without deleting history. See [review, tests and deployment scope](docs/maintenance-20261004-output-index.md).
 
 ## Table of contents
 
@@ -126,7 +130,7 @@ claim that Hermes core has no persisted record of pre-compression history.
 
 - Hermes Agent
 - Python 3.11+
-- No required third-party runtime dependencies
+- Hermes PM synchronizes this fork's declared runtime dependencies from `pyproject.toml`: numpy, tiktoken, PyYAML, fastembed, huggingface-hub and regex.
 
 `tiktoken` is used if available; otherwise LCM falls back to character-based
 token estimates. `regex` is used if available to apply timeouts to message ignore
@@ -140,17 +144,30 @@ that the host's resolved environment is free of known vulnerabilities.
 
 ### Install the plugin
 
-Canonical install path: clone `hermes-lcm` as a general user plugin.
+For the maintained fork on current Hermes, prefer the managed workflow:
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+hermes plugins install wzgrx/hermes-lcm --enable --force
+hermes pm install
+hermes plugins doctor hermes-lcm --ci
+```
+
+Approve the declared dependencies interactively; `--enable` alone does not grant
+dependency consent. Preserve existing context/provider settings, and review
+[update provenance, pins and rollback](INSTALL.md) before replacing a live plugin.
+
+The manual clone/symlink steps below are for legacy hosts or development only,
+not instructions to raw-pull or relink a running managed installation.
+
+```bash
+git clone https://github.com/wzgrx/hermes-lcm \
   ~/.hermes/plugins/hermes-lcm
 ```
 
 For a profile-specific install:
 
 ```bash
-git clone https://github.com/stephenschoettler/hermes-lcm \
+git clone https://github.com/wzgrx/hermes-lcm \
   ~/.hermes/profiles/myprofile/plugins/hermes-lcm
 ```
 
