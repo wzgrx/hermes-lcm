@@ -1534,11 +1534,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         per-turn AttributeError that breaks live compression-config sync.
 
         Accepts None / str / int (as delivered from config). Non-numeric or
-        non-positive values yield None (no cap).
+        non-positive/non-finite values yield None (no cap).
         """
         try:
             ivalue = int(value) if value is not None else 0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
         return ivalue if ivalue > 0 else None
 
@@ -1552,7 +1552,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> bool:
         try:
             parsed_context_length = int(context_length)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             logger.debug("LCM ignored invalid %s context_length: %r", source, context_length)
             return False
         if parsed_context_length <= 0:

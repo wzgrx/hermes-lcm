@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Reject non-finite context inputs — 2026-10-04
+
+- Treat infinite host threshold-cap values as invalid instead of raising OverflowError.
+- Reject non-finite provider context lengths before changing current runtime state.
+- Keep finite conversion, positive-cap semantics, 500ms scoped finalization and existing storage safeguards unchanged. See [maintenance review](docs/maintenance-20261004-nonfinite-context.md).
+
 ### Bounded session-end contention tolerance — 2026-10-04
 
 - Address [upstream issue #662](https://github.com/stephenschoettler/hermes-lcm/issues/662): increase the scoped SQLite busy wait during final raw ingest/lifecycle finalization from 50ms to 500ms. Original connection timeouts are restored.
