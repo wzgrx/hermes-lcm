@@ -22,10 +22,10 @@ OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
 
 > **Maintained fork:** `wzgrx/hermes-lcm` main. Use the [managed installation guide](INSTALL.md).
-> Latest 2026-10-04 maintenance consumes host-assigned absolute compression trigger
-> caps immediately, restores the prior trigger on cap removal and isolates profile/clone
-> policy. Ratio inheritance and context-pin hot reload are separate outstanding work;
-> this is not full native live-config equivalence. See [review](docs/maintenance-20261004-live-cap.md).
+> Latest 2026-10-05 maintenance adopts inherited live compression ratios and
+> provider-scoped model overrides, while preserving explicit LCM policy, clone/profile
+> isolation and stricter budgets. Context-pin removal/re-inference remains separate;
+> see the [scope and host-contract tests](docs/maintenance-20261005-live-ratio.md).
 
 ## Table of contents
 

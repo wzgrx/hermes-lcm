@@ -9,9 +9,11 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import weakref
@@ -828,6 +830,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._update_model_pending_session_start = False
         # Optional live host trigger cap, distinct from the assembly hard cap.
         self.threshold_tokens_cap: int | None = None
+        self._host_compression_ratio: float | None = None
+        self._host_model_thresholds: dict[str, float] = {}
         self.threshold_tokens = 0
         self.context_threshold = self._config.context_threshold
         self.threshold_percent = self.context_threshold
@@ -1018,6 +1022,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             clone.provider = self.provider
             clone.api_mode = self.api_mode
             clone.threshold_tokens_cap = self.threshold_tokens_cap
+            clone._host_compression_ratio = self._host_compression_ratio
+            clone._host_model_thresholds = dict(self._host_model_thresholds)
             if self._context_length_source:
                 clone._set_context_length(
                     self.raw_context_length,
@@ -1332,6 +1338,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
         self.threshold_tokens_cap = None
+        self._host_compression_ratio = None
+        self._host_model_thresholds = {}
+        # A sibling profile must not revive stale values via a later cache
+        # invalidation. Preserve LCM's baseline config; host live inputs are
+        # separate per-runtime state, not durable configuration.
+        for key in ("_config_threshold_percent", "_configured_threshold_percent",
+                    "_base_threshold_percent", "model_thresholds"):
+            self.__dict__.pop(key, None)
         self._invalidate_sanitation_operation()
         adaptive_retrieval = object.__getattribute__(self, "__dict__").get("_adaptive_retrieval")
         if adaptive_retrieval is not None:
@@ -1379,6 +1393,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_import_warning_logged = False
         self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
+        self._refresh_live_compression_trigger()
 
     def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
         """Serialize profile storage rebinding with engine shutdown."""
@@ -1451,6 +1466,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "env:LCM_CONTEXT_THRESHOLD",
             "config_yaml:lcm.context_threshold",
         }
+        if source in {"default", "config_yaml:compression.threshold"} and self._host_compression_ratio is not None:
+            configured = self._host_compression_ratio
+            source = "host_live_compression"
+            # The live host already imported its resolver. Do not bootstrap
+            # host/provider modules from a standalone plugin operation.
+            resolver = getattr(sys.modules.get("agent.context_compressor"), "resolve_model_threshold", None)
+            if callable(resolver):
+                candidate = resolver(
+                    self.model if model is None else model, self._host_model_thresholds,
+                    None, self.provider if provider is None else provider,
+                )
+                normalized = self._coerce_live_ratio(candidate)
+                if normalized is not None:
+                    configured = normalized
+                    source = "host_live_compression:model_threshold"
+                    # A matched per-model rule is explicit operator intent;
+                    # retain the fresh-tail guard, not the Codex default raise.
+                    explicit_lcm_override = True
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
         if (
@@ -1507,6 +1540,45 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "codex_oauth_context_cap",
             )
         return raw_context_length, None, ""
+
+    @staticmethod
+    def _coerce_live_ratio(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return ratio if math.isfinite(ratio) and 0 < ratio <= 1 else None
+
+    @property
+    def _threshold_tokens(self) -> None:
+        """Compatibility invalidation slot, not a second cached trigger."""
+        return None
+
+    @_threshold_tokens.setter
+    def _threshold_tokens(self, value: Any) -> None:
+        # Hermes writes all live fields before invalidating this cache. Adopt
+        # only at that boundary, so a ratio and its model overrides stay paired.
+        if value is not None or not hasattr(self, "_config"):
+            return
+        ratio = self._coerce_live_ratio(getattr(self, "_config_threshold_percent", None))
+        if ratio is not None:
+            self._host_compression_ratio = ratio
+            raw = getattr(self, "model_thresholds", {})
+            self._host_model_thresholds = {
+                str(k): parsed for k, v in raw.items()
+                if (parsed := self._coerce_live_ratio(v)) is not None
+            } if isinstance(raw, dict) else {}
+        self._refresh_live_compression_trigger()
+
+    def _refresh_live_compression_trigger(self) -> None:
+        self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
+            self._runtime_context_threshold()
+        )
+        self.threshold_percent = self.context_threshold
+        window = self._coerce_threshold_tokens_cap(self.context_length)
+        self.threshold_tokens = self._effective_threshold_tokens(int(window * self.context_threshold)) if window else 0
 
     @property
     def threshold_tokens(self) -> int:

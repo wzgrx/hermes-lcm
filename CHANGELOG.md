@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Live inherited ratios and model overrides — 2026-10-05
+
+- Consume the host's final live-config invalidation boundary rather than leaving ratio edits as passive attributes. Recompute LCM's own trigger and status; invalid/non-finite ratios preserve the last valid policy.
+- Preserve explicit environment/YAML LCM thresholds and manually supplied policy. Reuse the already-loaded official resolver for provider-scoped model overrides; clone copies are independent and profile rebinds discard stale live inputs.
+- Keep absolute/assembly caps, fresh-tail guards, rejection backoff and unknown-window behavior. No schema/dependency/provider changes. Scope excludes context-pin removal/re-inference and full profile config reload; see [maintenance review](docs/maintenance-20261005-live-ratio.md).
+
 ### Honor live absolute trigger caps — 2026-10-04
 
 - Consume host-assigned `threshold_tokens_cap` on every threshold read, so both host preflight and LCM decisions see it. Preserve the uncapped trigger for removal; model switches recompute it.
