@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Atomic active tool context — 2026-10-04
+
+- Adapt [upstream #657](https://github.com/stephenschoettler/hermes-lcm/pull/657): budget each assistant tool-call occurrence with its contiguous results as a unit; never keep just part of a real multi-tool exchange. Preserve existing objective scaffolding/restart reconciliation and a sole irreducible user request.
+- Dropping the newest protected tool occurrence keeps overflow recovery unsuccessful even if the shorter result fits. Diagnostics distinguish lost tool context from remaining token overflow. Each new assembly resets the operation flag.
+- Fourteen focused cases include all-budget boundary checks, subsequent-assembly reset, raw/DAG immutability, repeated tool IDs and real SQLite close/reopen ingestion without duplicate user rows. Raw history, thresholds, provider settings, schema and dependencies are unchanged. See [maintenance evidence](docs/maintenance-20261004-atomic-tools.md).
+
 ### Persisted-output replay lookup — 2026-10-04
 
 - Adapt [upstream #655](https://github.com/stephenschoettler/hermes-lcm/pull/655): index session/tool-call candidate paths so warm replay lookups avoid reparsing unrelated outputs. Fresh candidate reads, marker checks, external in-place change detection, bounded directory-cache cardinality and unstable-scan handling are retained.
