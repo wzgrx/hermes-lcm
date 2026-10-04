@@ -12958,7 +12958,9 @@ class TestSessionRollover:
             locker.execute("ROLLBACK")
             locker.close()
 
-        assert elapsed < 0.3
+        # The bounded lock allowance is now 500ms (upstream issue #662), still
+        # below the connection's normal timeout with modest scheduler headroom.
+        assert elapsed < 0.9
         assert engine._store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text

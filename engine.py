@@ -437,7 +437,10 @@ class _RollupMaintenanceScheduler:
 
 _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
-_SESSION_END_BUSY_TIMEOUT_MS = 50
+# A brief competing writer should not discard the final raw tail or leave a
+# session bound. This remains a scoped SQLite per-lock wait, not an unbounded
+# retry or a 500ms deadline for the entire hook; original timeouts are restored.
+_SESSION_END_BUSY_TIMEOUT_MS = 500
 _HOST_REJECTION_BACKOFF_SECONDS = 300.0
 _HOST_REJECTION_BACKOFF_LOCK = threading.RLock()
 # Agent cache evictions can clone a new engine for the same session inside the

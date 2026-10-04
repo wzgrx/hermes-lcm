@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Bounded session-end contention tolerance — 2026-10-04
+
+- Address [upstream issue #662](https://github.com/stephenschoettler/hermes-lcm/issues/662): increase the scoped SQLite busy wait during final raw ingest/lifecycle finalization from 50ms to 500ms. Original connection timeouts are restored.
+- Real SQLite regressions reproduce lost tail/finalization under a 150ms competing writer, verify bounded persistent-lock failure, idempotent later finalization and timeout restoration after errors.
+- No background retry, global timeout change, schema migration or historical-session rewrite. See [maintenance scope](docs/maintenance-20261004-session-end-contention.md).
+
 ### Guarded atomic summary publication — 2026-10-04
 
 - Adapt [upstream PR #658](https://github.com/stephenschoettler/hermes-lcm/pull/658): capture exact source rows, existing parents and lifecycle ownership before model work; reject changed sources/runtime before publishing.

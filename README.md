@@ -22,9 +22,9 @@ OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
 
 > **Maintained fork:** `wzgrx/hermes-lcm` main. Use the [managed installation guide](INSTALL.md).
-> The latest 2026-10-04 maintenance guards summary publication against changed source
-> rows and commits summaries/frontiers together; existing replay and whole-tool-context
-> fixes remain included. See [review, tests and deployment scope](docs/maintenance-20261004-summary-publication.md).
+> The latest 2026-10-04 maintenance tolerates brief SQLite writer contention during
+> session-end flushing with a scoped 500ms busy wait, while retaining guarded atomic
+> summary publication. See [review and verification](docs/maintenance-20261004-session-end-contention.md).
 
 ## Table of contents
 
