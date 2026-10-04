@@ -107,3 +107,30 @@ lookup contracts. Zero provider calls, zero messages and zero live database
 writes were made by that check. This is not a new model turn or native-client
 visual acceptance. Private rollback refs, plugin copies and PM inputs remain
 local. This receipt is a documentation-only follow-up to the tested code.
+
+## Final audit — 2026-10-04 04:03 UTC
+
+The exact deployed plugin code and both documentation-tip CI runs are green.
+Gateway reports running, zero active agents and Feishu connected. Both plugin
+doctors, Card hook verification/smoke, selected-PM-runtime partial-resource
+rendering and all three read-only database quick checks pass. Source trees are
+clean; configuration and credential-file hashes remain unchanged. Original
+full-suite/release evidence hashes still match the deployment manifest.
+
+The subsequent Hermes snapshot
+[`ea81748579ee`](https://github.com/NousResearch/hermes-agent/commit/ea81748579ee1732d214ccb75f91d22208ed623d)
+is 13 commits beyond the deployed official base. Its 26-file diff adds local
+model/PM engine support and WhatsApp ownership fixes; it does not change the
+gateway/agent/cron plugin hook files. This is a source-impact review, not a test
+of that new core runtime or a claim that it is deployed. Keep the tested core
+`0764e9165721` for this bounded plugin release; a core upgrade has separate PM,
+overlay and service acceptance gates.
+
+The desktop client was opened without sending messages: the existing 0.20.8
+acceptance card's footer expands/folds and its expected terminal failure has a
+readable multiline excerpt. That historical observation is not relabelled as a
+new 0.20.11 real-turn/visual acceptance. Current 0.20.11 partial-data states have
+automated native-JSON and managed-runtime coverage. Idle `metrics_stale` and the
+old `delivery_unknown` warning remain visible rather than being cleared to make
+the audit look green. No additional restart, provider call or message send was
+needed for this final audit.
