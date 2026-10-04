@@ -2330,12 +2330,13 @@ def test_session_end_does_not_block_behind_unclaimed_summarization(
     monkeypatch.setattr(lcm_engine, "summarize_with_escalation", gated_summarization)
 
     results = {}
-    compressor = threading.Thread(
-        target=lambda: results.setdefault(
-            "compress",
-            engine.compress(deepcopy(messages), current_tokens=100_000),
-        )
-    )
+    def compress_after_end():
+        try:
+            results["compress"] = engine.compress(deepcopy(messages), current_tokens=100_000)
+        except RuntimeError as error:
+            results["publication_error"] = error
+
+    compressor = threading.Thread(target=compress_after_end)
     compressor.start()
     assert summarize_started.wait(5)
 
@@ -2365,8 +2366,15 @@ def test_session_end_does_not_block_behind_unclaimed_summarization(
     )
     assert not compressor.is_alive()
     assert not ender.is_alive()
-    assert isinstance(results["compress"], list)
-    assert engine.last_compression_status == "compacted"
+    # The session end still wins without waiting on model work. Its released
+    # lifecycle binding now also prevents the stale in-flight summary publishing.
+    assert "compress" not in results
+    assert "session binding changed" in str(results["publication_error"])
+    assert engine.last_compression_status == "error"
+    assert engine._dag.get_session_nodes(engine.bound_session_id) == []
+    assert engine._last_compacted_store_id == 0
+    stored_contents = [row["content"] for row in engine._store.get_session_messages(engine.bound_session_id)]
+    assert all(message["content"] in stored_contents for message in messages)
 
 
 def test_claimed_sanitation_stays_serialized_with_bound_session_end(

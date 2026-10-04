@@ -22,8 +22,9 @@ OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
 
 > **Maintained fork:** `wzgrx/hermes-lcm` main. Use the [managed installation guide](INSTALL.md).
-> The 2026-10-04 maintenance improves persisted-output replay lookup and skips damaged
-> JSON artifacts without deleting history. See [review, tests and deployment scope](docs/maintenance-20261004-output-index.md).
+> The latest 2026-10-04 maintenance guards summary publication against changed source
+> rows and commits summaries/frontiers together; existing replay and whole-tool-context
+> fixes remain included. See [review, tests and deployment scope](docs/maintenance-20261004-summary-publication.md).
 
 ## Table of contents
 

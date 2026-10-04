@@ -1611,6 +1611,21 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            # Freeze lineage before model work, including fork-only hidden-store
+            # rows. Re-resolving after a slow call could silently lose a changed
+            # source from the published node's IDs.
+            active_selected = [m for m in selected_raw_chunk if id(m) not in hidden_direct_ids]
+            selected_active_ids = self._get_store_id_map_for_messages(active_selected) if active_selected else {}
+            source_map = dict(selected_active_ids)
+            source_map.update({id(m): hidden_direct_ids[id(m)] for m in selected_raw_chunk
+                               if id(m) in hidden_direct_ids})
+            publication_snapshot, validate_publication = self._prepare_summary_publication(
+                list(source_map.values()), "messages",
+            )
+            if active_selected and selected_active_ids != self._get_store_id_map_for_messages(active_selected):
+                raise RuntimeError("summary source changed before model preparation")
+            if len(active_selected) != len(selected_raw_chunk):
+                self._validate_hidden_publication_sources(publication_snapshot, selected_raw_chunk, hidden_direct_ids)
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
@@ -1690,11 +1705,6 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            if all(id(message) in hidden_direct_ids for message in source_lookup_chunk):
-                source_map = hidden_direct_ids
-            else:
-                source_map = self._get_store_id_map_for_messages(source_lookup_chunk)
-                source_map.update(hidden_direct_ids)
             source_store_ids = [
                 source_map[id(message)] for message in source_lineage_chunk
                 if id(message) in source_map
@@ -1739,21 +1749,19 @@ class CompactionMixin:
                     raise RuntimeError(
                         "store-backed leaf rescue stopped inside an assistant tool group"
                     )
-                self._dag.add_node_with_frontier(
-                    node,
-                    conversation_id=self._conversation_id,
-                    session_id=self._session_id,
-                    frontier_store_id=max(consumed_store_ids),
-                )
-            else:
-                self._dag.add_node(node)
+            # Preserve the fork's gap rule: a newer active node must not move
+            # the cursor past an older unrepresented durable prefix.
+            frontier = (max(consumed_store_ids) if consumed_store_ids else 0) if (
+                store_backed_leaf or not hidden_gap_bounds
+            ) else None
+            self._dag.publish_node(
+                node, publication_snapshot, frontier_store_id=frontier,
+                validate_runtime=validate_publication,
+            )
+            if frontier is not None:
+                self._last_compacted_store_id = frontier
             self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            if store_backed_leaf:
-                self._last_compacted_store_id = max(consumed_store_ids)
-            elif not hidden_gap_bounds:
-                self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-                self._persist_frontier_marker()
             # An active D0 node can cover newer rows, but the monotonic cursor
             # remains before an older hidden gap until that prefix is actually
             # published. The DAG source IDs prevent a later store pass from

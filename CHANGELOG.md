@@ -4,6 +4,13 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Guarded atomic summary publication — 2026-10-04
+
+- Adapt [upstream PR #658](https://github.com/stephenschoettler/hermes-lcm/pull/658): capture exact source rows, existing parents and lifecycle ownership before model work; reject changed sources/runtime before publishing.
+- Commit summary, FTS/rollup invalidation triggers and eligible frontier progress in one SQLite transaction; rollback on failure or cancellation. Concurrent parents recheck their captured ownership.
+- Preserve fork-only hidden-backlog selection, complete tool groups, rescue shrinking and gaps that must not advance the frontier. Validate materialized hidden rows against the captured source snapshot.
+- Nineteen targeted cases cover upstream races plus hidden-loader timing, runtime rebinding and cancellation after insertion. No schema, provider, dependency or raw-history migration. See [maintenance evidence](docs/maintenance-20261004-summary-publication.md).
+
 ### Atomic active tool context — 2026-10-04
 
 - Adapt [upstream #657](https://github.com/stephenschoettler/hermes-lcm/pull/657): budget each assistant tool-call occurrence with its contiguous results as a unit; never keep just part of a real multi-tool exchange. Preserve existing objective scaffolding/restart reconciliation and a sole irreducible user request.
