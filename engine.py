@@ -826,6 +826,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.effective_context_length_reason = ""
         self._context_length_source = ""
         self._update_model_pending_session_start = False
+        # Optional live host trigger cap, distinct from the assembly hard cap.
+        self.threshold_tokens_cap: int | None = None
         self.threshold_tokens = 0
         self.context_threshold = self._config.context_threshold
         self.threshold_percent = self.context_threshold
@@ -1015,6 +1017,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             clone.api_key = self.api_key
             clone.provider = self.provider
             clone.api_mode = self.api_mode
+            clone.threshold_tokens_cap = self.threshold_tokens_cap
             if self._context_length_source:
                 clone._set_context_length(
                     self.raw_context_length,
@@ -1328,6 +1331,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        self.threshold_tokens_cap = None
         self._invalidate_sanitation_operation()
         adaptive_retrieval = object.__getattribute__(self, "__dict__").get("_adaptive_retrieval")
         if adaptive_retrieval is not None:
@@ -1503,6 +1507,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "codex_oauth_context_cap",
             )
         return raw_context_length, None, ""
+
+    @property
+    def threshold_tokens(self) -> int:
+        """Apply host cap assignments live without losing the uncapped trigger.
+
+        Hermes writes threshold_tokens_cap and invalidates its private cache.
+        LCM has no such cache: deriving the min here covers both host preflight
+        and LCM's own should_compress path, including cap removal. Ratio, route
+        floor guards and assembly policy remain owned by _set_context_length.
+        """
+        base = getattr(self, "_lcm_uncapped_threshold_tokens", 0)
+        cap = self._effective_threshold_cap(getattr(self, "context_length", 0))
+        return min(base, cap) if base > 0 and cap is not None else base
+
+    @threshold_tokens.setter
+    def threshold_tokens(self, value: int) -> None:
+        self._lcm_uncapped_threshold_tokens = value
+
+    def _effective_threshold_cap(self, context_length: int) -> int | None:
+        cap = self._coerce_threshold_tokens_cap(getattr(self, "threshold_tokens_cap", None))
+        return min(cap, context_length) if cap is not None and context_length > 0 else None
 
     def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
         """Return the host-visible preflight trigger token count.

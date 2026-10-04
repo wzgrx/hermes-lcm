@@ -4,6 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Honor live absolute trigger caps — 2026-10-04
+
+- Consume host-assigned `threshold_tokens_cap` on every threshold read, so both host preflight and LCM decisions see it. Preserve the uncapped trigger for removal; model switches recompute it.
+- Keep stricter assembly policy, ratio/fresh-tail guards and cooldowns. The cap is a trigger, not a new hard assembly limit. Clone within the same profile; clear live cap when rebinding profiles.
+- Scope is intentionally narrower than [the3asic PR #7](https://github.com/the3asic/hermes-lcm/pull/7), whose review identifies context-pin/profile bugs. No wholesale patch adoption or full live-ratio/pin claim. See [maintenance evidence](docs/maintenance-20261004-live-cap.md).
+
 ### Reject non-finite context inputs — 2026-10-04
 
 - Treat infinite host threshold-cap values as invalid instead of raising OverflowError.

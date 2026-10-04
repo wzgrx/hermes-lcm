@@ -22,9 +22,10 @@ OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
 
 > **Maintained fork:** `wzgrx/hermes-lcm` main. Use the [managed installation guide](INSTALL.md).
-> Latest 2026-10-04 maintenance rejects non-finite host/provider numeric inputs without
-> overwriting a valid context window. Existing bounded session-end flushes, replay
-> and SQLite lock protections remain. See [review](docs/maintenance-20261004-nonfinite-context.md).
+> Latest 2026-10-04 maintenance consumes host-assigned absolute compression trigger
+> caps immediately, restores the prior trigger on cap removal and isolates profile/clone
+> policy. Ratio inheritance and context-pin hot reload are separate outstanding work;
+> this is not full native live-config equivalence. See [review](docs/maintenance-20261004-live-cap.md).
 
 ## Table of contents
 
