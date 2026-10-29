@@ -1,9 +1,11 @@
 from pathlib import Path
 
+import yaml
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
-RELEASE_VERSION = "1.0.0-rc.3"
+RELEASE_VERSION = str(yaml.safe_load((REPO_ROOT / "plugin.yaml").read_text())["version"])
 RELEASE_NOTES = REPO_ROOT / ".github" / "release-notes" / f"v{RELEASE_VERSION}.md"
 
 

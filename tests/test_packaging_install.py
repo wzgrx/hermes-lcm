@@ -50,6 +50,25 @@ def test_pyproject_declares_virtual_workspace_runtime_dependencies():
     }
 
 
+
+def test_fastembed_dependency_keeps_native_hosts_and_excludes_android():
+    """PM resolves Android too, where fastembed's ONNX wheels are unavailable."""
+    from packaging.requirements import Requirement
+
+    document = tomllib.loads(
+        (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+    )
+    requirement = next(
+        Requirement(spec)
+        for spec in document["project"]["dependencies"]
+        if Requirement(spec).name == "fastembed"
+    )
+    assert requirement.marker is not None
+    for platform in ("linux", "win32", "darwin"):
+        assert requirement.marker.evaluate({"sys_platform": platform})
+    assert not requirement.marker.evaluate({"sys_platform": "android"})
+
+
 def _load_plugin_entrypoint_module(module_name: str):
     repo_root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
@@ -445,7 +464,9 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     identity = engine.get_status()["runtime_identity"]
     repo_root = Path(__file__).resolve().parent.parent
     assert identity["plugin_name"] == "hermes-lcm"
-    assert identity["plugin_version"] == "1.0.0-rc.3"
+    import yaml
+    manifest = yaml.safe_load((Path(__file__).resolve().parent.parent / "plugin.yaml").read_text())
+    assert identity["plugin_version"] == manifest["version"]
     assert Path(identity["plugin_path"]) == repo_root
     assert identity["database_path_source"] in {"config.database_path", "hermes_home", "default_home"}
     assert identity["plugin_git_commit"]

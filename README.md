@@ -133,7 +133,7 @@ claim that Hermes core has no persisted record of pre-compression history.
 
 - Hermes Agent
 - Python 3.11+
-- Hermes PM synchronizes this fork's declared runtime dependencies from `pyproject.toml`: numpy, tiktoken, PyYAML, fastembed, huggingface-hub and regex.
+- Hermes PM synchronizes this fork's declared runtime dependencies from `pyproject.toml`: numpy, tiktoken, PyYAML, fastembed, huggingface-hub and regex. Fastembed is excluded only on Android, where its ONNX wheel is unavailable; supported desktop/server platforms retain it.
 
 `tiktoken` is used if available; otherwise LCM falls back to character-based
 token estimates. `regex` is used if available to apply timeouts to message ignore
@@ -230,7 +230,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v1.0.0-rc.3 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.4 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm

@@ -32,14 +32,14 @@ hermes pm install
 hermes plugins doctor hermes-lcm --ci
 ```
 
-Current official `plugins update` has neither `--force` nor `--expected-revision`.
-Do not add an old core overlay to restore those flags. `--force` in the initial
-installation example belongs to **install**, not **update**. Updates may request
-new dependency/capability consent. Inspect scanner findings before approving;
-never disable scanning globally. If update has no confirmation path for reviewed
-CAUTION findings, retain the backup and use the official interactive same-source
-`plugins install wzgrx/hermes-lcm --enable --force`, then recheck configuration,
-provenance and worktree registrations. The two commands have different semantics.
+Read the installed CLI help: recent official Hermes (verified on main ef75bc70886)
+supports `plugins update --force hermes-lcm` for a reviewed CAUTION scan verdict;
+a DANGEROUS verdict still blocks. Without that option, a terminal asks first.
+There is no `--expected-revision` flag. Older hosts without update confirmation
+can use the official interactive same-source install procedure above. New
+requirements and capabilities still need their own consent. Inspect scan findings
+before approving; never disable scanning globally or restore a core overlay.
+Recheck provenance, custom settings and Git worktree registrations after either path.
 
 4. Verify the installed SHA equals the reviewed SHA **before starting Gateway**.
    Remote checks are not an atomic pin: if main moved during publication, keep
@@ -54,7 +54,7 @@ non-serving development checkout may use its legacy Git pull/link workflow.
 Adopt a self-cloned install through `hermes plugins adopt hermes-lcm` only when
 install provenance is missing. Preserve Git worktree registrations and user files.
 
-## Card 1.5.x coexistence
+## Card 1.x coexistence
 
 Read the installed Card's INSTALL.md before changing Hermes core. Current Card
 owns reversible source injections and plugin compatibility code. Do not replay
@@ -71,7 +71,9 @@ installer metadata to pretend a pin has disappeared.
 
 Root `pyproject.toml` is intentionally a virtual PM dependency project. Its
 placeholder version is not the plugin version, which is declared in `plugin.yaml`.
-Do not remove that metadata or pip-install the tool-only directory.
+Do not remove that metadata or pip-install the tool-only directory. Fastembed
+has an Android-only environment exclusion so Hermes's universal PM resolution does
+not request unavailable ONNX wheels there; Linux, macOS and Windows retain it.
 
 Version 1.0.0-rc.3 adds a nullable reasoning column without rewriting historical
 messages. Preserve backups and prior PM generations. For rollback, keep all

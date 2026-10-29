@@ -2,6 +2,21 @@
 
 This repo also publishes GitHub Releases. This file is the repo-root release surface for operators who want the recent release arc without leaving the checkout.
 
+## v1.0.0-rc.4 - 2026-10-29
+
+### Upstream synchronization and managed installation
+
+- Merge upstream main `a13e709` (PRs #632, #623 and #624). The fork already had the
+  corresponding virtual-project metadata, scanner-safe fixture and flat tool schema;
+  retain those implementations plus all fork-only storage and scoped-runtime fixes.
+- Move the reviewed Android-only fastembed dependency marker into the maintained
+  source, preventing universal Hermes PM resolution from requesting unsupported
+  Android ONNX wheels. Linux, macOS and Windows keep the embedding dependency.
+- Add a dependency-marker regression and document the current official plugin
+  update/CAUTION confirmation path without reviving private updater overlays.
+- Preserve database layout, compaction thresholds, provider selection and existing
+  conversations. This maintenance does not enable experimental async compaction.
+
 ## v1.0.0-rc.3 - 2026-10-11
 
 ### Reasoning accounting and profile-scoped configuration

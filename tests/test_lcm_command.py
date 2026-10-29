@@ -8,6 +8,12 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import yaml
+
+
+def _manifest_version() -> str:
+    manifest = yaml.safe_load((Path(__file__).resolve().parent.parent / "plugin.yaml").read_text())
+    return str(manifest["version"])
 
 from hermes_lcm import tools as lcm_tools
 import hermes_lcm.command as command_mod
@@ -31,6 +37,11 @@ def engine(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(command_mod, "inspect_orphaned_sqlite_handles", lambda path: clean_handles)
     monkeypatch.setattr(lcm_tools, "inspect_orphaned_sqlite_handles", lambda path: clean_handles)
+    # Baseline diagnostics use an explicit default; journal-error cases override this seam.
+    def clean_journal(mode):
+        return {"status": "default", "requested_mode": "wal", "actual_mode": mode}
+    monkeypatch.setattr(command_mod, "journal_config_diagnostic", clean_journal)
+    monkeypatch.setattr(lcm_tools, "journal_config_diagnostic", clean_journal)
     config = LCMConfig()
     config.database_path = str(tmp_path / "lcm_test.db")
     hermes_home = tmp_path / "hermes_home"
@@ -491,7 +502,7 @@ def test_lcm_status_reports_runtime_identity(engine):
     repo_root = Path(__file__).resolve().parent.parent
 
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 1.0.0-rc.3" in result
+    assert f"plugin_version: {_manifest_version()}" in result
     assert f"plugin_path: {repo_root}" in result
     assert "module_path:" in result
     assert "database_path_source: config.database_path" in result
@@ -531,7 +542,7 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "messages_fts: ok" in result
     assert "nodes_fts: ok" in result
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 1.0.0-rc.3" in result
+    assert f"plugin_version: {_manifest_version()}" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
     assert "triage_guidance:\n- none" in result

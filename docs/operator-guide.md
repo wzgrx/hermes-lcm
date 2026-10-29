@@ -79,6 +79,17 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
+## Upgrade to v1.0.0-rc.4
+
+This maintenance synchronizes upstream main through `a13e709`, retaining the
+fork's existing schema, storage and profile-scoped fixes. The Android fastembed
+exclusion now ships in the repository, so a managed reinstall no longer needs a
+local packaging edit. Desktop/server embedding behavior is unchanged.
+
+Follow [INSTALL.md](../INSTALL.md) for current Hermes update/scan confirmation.
+Back up the database with SQLite's backup API and record the old code/PM generation.
+There is no new schema migration, threshold change or experimental async mode.
+
 ## Upgrade to v1.0.0-rc.3
 
 Use the maintained [managed installation procedure](../INSTALL.md). Take a
@@ -173,7 +184,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v1.0.0-rc.3 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.4 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm
